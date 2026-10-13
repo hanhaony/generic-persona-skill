@@ -1,0 +1,43 @@
+# ============================================================
+# generic-persona-skill —— 项目元信息与依赖声明（P2.1）
+#
+# ⚠️ 本文件**不是运行前置条件**。
+#    当前阶段不需要安装任何东西，也不需要构建：
+#       python -m persona --help        # 直接跑 CLI
+#       python -m unittest discover -s tests -t .   # 直接跑测试
+#
+# 本文件的作用只有两个：
+#   1. 声明 Python 版本下限（requires-python = ">=3.12"）
+#   2. 声明「运行时零第三方依赖」（D-004、D-068）
+# ============================================================
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "generic-persona-skill"
+version = "0.1.0.dev0"
+description = "通用人物与关系模拟：输入两个或更多人名，自动构建人物与关系档案并模拟对话（本地 CLI）"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+
+# 运行时依赖：**故意留空**。只用标准库（unittest / sqlite3 / dataclasses / argparse）
+# 新增任何依赖都必须先在 docs/DECISIONS.md 记录理由（D-004）。
+dependencies = []
+
+[project.optional-dependencies]
+# 测试同样只用标准库 unittest，暂时无需额外依赖
+dev = []
+
+[tool.setuptools]
+packages = [
+    "persona",
+    "persona.cli",
+    "persona.core",
+    "persona.modules",
+    "persona.orchestrator",
+    "persona.providers",
+    "persona.storage",
+]
