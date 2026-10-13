@@ -8,11 +8,29 @@
   - CLI **不绕过 Orchestrator**：源码里不 import 业务模块（见 test_dependency_rules.py）
 """
 
+import contextlib
 import io
+import os
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 
 from persona.cli.main import EXIT_NOT_IMPLEMENTED, EXIT_OK, build_parser, main
+
+
+@contextlib.contextmanager
+def _temp_data_dir():
+    """让 CLI 把数据库写到临时目录（D-070：测试不得在项目里留 .db）。"""
+    with tempfile.TemporaryDirectory(prefix="gps-cli-") as tmp:
+        previous = os.environ.get("PERSONA_DATA_DIR")
+        os.environ["PERSONA_DATA_DIR"] = tmp
+        try:
+            yield tmp
+        finally:
+            if previous is None:
+                os.environ.pop("PERSONA_DATA_DIR", None)
+            else:
+                os.environ["PERSONA_DATA_DIR"] = previous
 
 
 class TestCliStartup(unittest.TestCase):
@@ -41,7 +59,6 @@ class TestCliStartup(unittest.TestCase):
             code = main(["info"])
         text = out.getvalue()
         self.assertEqual(code, EXIT_OK)
-        self.assertIn("P1.2-B", text)
         self.assertIn("persona.core", text)
         self.assertIn("PENDING", text)
         self.assertIn("PUBLIC_SOURCE", text)
@@ -59,14 +76,67 @@ class TestCliStartup(unittest.TestCase):
 
 class TestCliPlaceholderCommands(unittest.TestCase):
     def test_business_commands_are_honest_placeholders(self):
-        for argv in (["new", "--names", "甲,乙"], ["status", "tsk_1"], ["resume", "tsk_1"],
-                     ["pause", "tsk_1"], ["cancel", "tsk_1"], ["chat", "prj_1"],
+        """研究 / 对话 / 记忆 / 评测**仍**是占位，不假装能用。"""
+        for argv in (["new", "--names", "甲,乙"], ["chat", "prj_1"],
                      ["sources", "prj_1"], ["memory", "prj_1"], ["eval"]):
             with self.subTest(argv=argv):
                 with redirect_stdout(io.StringIO()) as out:
                     code = main(argv)
                 self.assertEqual(code, EXIT_NOT_IMPLEMENTED)
                 self.assertIn("尚未实现", out.getvalue())
+
+    def test_unknown_task_id_is_a_friendly_message(self):
+        """P2.3：status / resume / pause / cancel 已接通任务服务。
+        给了不存在的 ID 应当**友好报错**，而不是抛堆栈。"""
+        with _temp_data_dir():
+            for argv in (["status", "tsk_" + "0" * 32, "--project", "prj_cli"],
+                         ["resume", "tsk_" + "0" * 32, "--project", "prj_cli"]):
+                with self.subTest(argv=argv):
+                    with redirect_stdout(io.StringIO()) as out:
+                        code = main(argv)
+                    self.assertEqual(code, 1)
+                    self.assertIn("失败", out.getvalue())
+                    self.assertNotIn("Traceback", out.getvalue())
+
+
+class TestCliTaskLifecycle(unittest.TestCase):
+    """`persona task ...` 端到端冒烟（用临时数据目录，不碰项目里的 var/）。"""
+
+    def test_create_start_pause_via_cli(self):
+        with _temp_data_dir():
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = main(["task", "create", "--project", "prj_cli",
+                             "--stages", "A,B", "--key", "cli-1"])
+            self.assertEqual(code, EXIT_OK)
+            created = out.getvalue()
+            self.assertIn("PENDING", created)
+            task_id = [line.split(":", 1)[1].strip()
+                       for line in created.splitlines()
+                       if line.strip().startswith("任务 ")][0]
+            self.assertTrue(task_id.startswith("tsk_"), created)
+
+            with redirect_stdout(io.StringIO()) as out2:
+                self.assertEqual(main(["task", "start", task_id, "--project", "prj_cli"]),
+                                 EXIT_OK)
+            self.assertIn("RUNNING", out2.getvalue())
+
+            with redirect_stdout(io.StringIO()) as out3:
+                self.assertEqual(
+                    main(["task", "pause", task_id, "--project", "prj_cli",
+                          "--reason", "USER"]),
+                    EXIT_OK)
+            self.assertIn("PAUSED", out3.getvalue())
+
+            with redirect_stdout(io.StringIO()) as out4:
+                self.assertEqual(main(["task", "list", "--project", "prj_cli"]), EXIT_OK)
+            self.assertIn(task_id, out4.getvalue())
+
+    def test_task_without_action_prints_help(self):
+        with redirect_stdout(io.StringIO()) as out:
+            code = main(["task"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("create", out.getvalue())
 
 
 if __name__ == "__main__":

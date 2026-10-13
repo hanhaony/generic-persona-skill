@@ -1,7 +1,7 @@
 # INTERFACES —— 模块接口契约
 
-- **版本**：v0.1.1（P1.2-A 契约 + P1.2-B 验收同步）
-- **状态**：主体待人工验收；§1.8 闸门说明按 R-3 已同步为「双层闸门」
+- **版本**：v0.1.2（P1.2-A 契约 + P1.2-B 验收同步 + P2.3 实现状态）
+- **状态**：主体待人工验收；§1.8 闸门说明按 R-3 已同步为「双层闸门」；**§12.6 为 P2.3 新增**
 - **运行环境**：Python 3.12+ / 本地 CLI / 模块化单体 / SQLite
 - **相关文档**：`ARCHITECTURE.md`、`DATA_MODEL.md`、`ERROR_HANDLING.md`、`DECISIONS.md`、`PROJECT_SPEC.md`
 
@@ -1031,6 +1031,21 @@ class Checkpoint:
 
 写入时机：**每个可划分单元完成后立刻写**（阶段级 + 阶段内批次级），不等整个阶段结束。
 
+### 12.6 P2.3 实现状态与边界（**新增，诚实声明**）
+
+| 契约里的操作 | 实现位置 | 状态 |
+| --- | --- | --- |
+| `create_task` / `get_task_status` / `list_tasks` | `orchestrator/tasks.py::TaskService` | ✅ 已实现（含 `TS-V4` 幂等去重） |
+| `start` / `pause` / `resume` / `cancel` / `complete` / `fail` | `TaskService`（转换规则复用 `orchestrator/state.py`） | ✅ 已实现 |
+| `run_step` / `run_to_completion` | `orchestrator/executor.py::TaskRunner` | ✅ 已实现，**但只驱动抽象的 `WorkUnit`** |
+| 预算四段式闸门 | `orchestrator/budget.py::BudgetGate` | ✅ 已实现（次数 / token / 金额）；**墙钟时间未接** |
+| 检查点持久化 | `Storage.save_checkpoint` / `load_checkpoint` | ✅ 已实现并**经子进程验证可跨重启读取** |
+| 崩溃回退 `RUNNING → PAUSED(DEPENDENCY)` | `TaskService.sweep_interrupted` | ✅ 已实现（只回退状态，**不自动补做业务**） |
+| `create_project` / `get_progress` / 阶段编排的业务语义 | — | ⛔ **未实现**（属 P2 之后的业务阶段） |
+
+**边界**：`TaskRunner` 的 `UnitHandler` 本阶段**只有 `MockUnitHandler`**（D-093）。
+它推进的是"抽象工作单元"，**不是**真实的人物研究 / 证据提取 / 人格蒸馏 / 对话。
+
 ---
 
 ## 13. 模块依赖图与禁止依赖
@@ -1156,3 +1171,5 @@ L6 {CLI, Evaluation}  →  L5 {Orchestrator}  →  L4 {Research, Persona, Relati
 | 日期 | 版本 | 变更 |
 | --- | --- | --- |
 | 2026-10-13 | v0.1 | 初稿：11 个模块接口契约、公共 `Result` 信封、任务六态机、依赖禁止清单、SQLite + 关键词检索约定 |
+| 2026-10-13 | v0.1.1 | 新增 §1.8.1：命名空间闸门是**双层**的（模块接口层解释原因 + `Storage.put` 结构层保证拦住），按 R-3 拍板同步（D-064） |
+| 2026-10-13 | v0.1.2 | 新增 **§12.6 P2.3 实现状态与边界**：标明 `TaskService` / `TaskRunner` / `BudgetGate` 已实现到什么程度，以及「只驱动抽象 `WorkUnit`、不实现真实业务」的边界 |

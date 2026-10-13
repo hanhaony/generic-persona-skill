@@ -123,6 +123,20 @@ class TaskRef:
 
 
 @dataclass
+class Progress:
+    """任务进度（DATA_MODEL §4.12 的 `progress`）。`percent` 由总数与完成数算出。"""
+
+    items_total: int = 0
+    items_done: int = 0
+
+    @property
+    def percent(self) -> float:
+        if self.items_total <= 0:
+            return 0.0
+        return round(self.items_done * 100.0 / self.items_total, 2)
+
+
+@dataclass
 class TaskStatusView:
     """`Orchestrator.get_task_status` 的返回（INTERFACES §12.3）。"""
 
@@ -131,6 +145,7 @@ class TaskStatusView:
     current_stage: str = ""
     completed_stages: list[str] = field(default_factory=list)
     budget_used: BudgetUsage = field(default_factory=BudgetUsage)
+    progress: "Progress | None" = None
     last_error: str | None = None
     paused_reason: PausedReason | None = None
 

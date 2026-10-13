@@ -46,7 +46,8 @@ class TestImports(unittest.TestCase):
         import persona
 
         self.assertTrue(persona.__version__)
-        self.assertIn("P1.2-B", persona.STAGE)
+        # 阶段号随开发推进而变，这里只要求"声明了阶段"，不钉死具体编号
+        self.assertTrue(persona.STAGE.startswith("P"), persona.STAGE)
 
 
 if __name__ == "__main__":

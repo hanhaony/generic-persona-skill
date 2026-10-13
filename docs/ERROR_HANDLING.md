@@ -58,7 +58,11 @@
 | `VALIDATION.query_empty` | VALIDATION | ⛔ | 无 | 空查询不会发起请求 |
 | `VALIDATION.unknown_kind` | VALIDATION | ⛔ | 无（单次调用失败） | 实体种类不在注册表内（P1.2-B 实现后回填） |
 | `VALIDATION.unknown_filter` | VALIDATION | ⛔ | 无（单次调用失败） | 查询过滤键不在白名单内（P1.2-B 实现后回填） |
-| `VALIDATION.config_invalid` | VALIDATION | ⛔ | 失败（改完重开） | 配置项取值非法或超出允许范围（P2.2 新增，详见 `CONFIG.md` §6） |
+| `VALIDATION.config_invalid` | VALIDATION | ⛔ | 失败（改完重开） | 配置项取值非法或超出允许范围（P2.2 新增 → **D-083 已批准**，详见 `CONFIG.md` §6） |
+| `VALIDATION.checkpoint_missing` | VALIDATION | ⛔ | 无（拒绝恢复） | 任务没有可续跑的检查点（P2.3 新增，T-1 已批准 → D-095） |
+| `VALIDATION.artifact_missing` | VALIDATION | ⛔ | 无（拒绝恢复） | 检查点引用的产出已丢失，不许"假装没做过"（P2.3 新增，T-1 已批准 → D-095） |
+| `VALIDATION.unknown_task_type` | VALIDATION | ⛔ | 无（单次调用失败） | 任务类型不在 `TaskType` 枚举内（P2.3 新增，T-1 已批准 → D-095） |
+| `VALIDATION.stage_sequence_empty` | VALIDATION | ⛔ | 无（单次调用失败） | 阶段序列为空，无从推进（P2.3 新增，T-1 已批准 → D-095） |
 | `NOT_FOUND.task` / `.project` / `.source` / `.entity` / `.version` | NOT_FOUND | ⛔ | FAILED | 找不到指定对象 |
 | `STATE_CONFLICT.not_pending` | STATE_CONFLICT | ⛔ | 无 | 任务已启动，不能重复启动 |
 | `STATE_CONFLICT.not_running` | STATE_CONFLICT | ⛔ | 无 | 任务未在运行中，无法暂停 |
@@ -424,3 +428,4 @@ Checkpoint = {
 | --- | --- | --- |
 | 2026-10-13 | v0.1 | 初稿：错误分类与错误码表、重试规则、预算四段式闸门、六态转换表、检查点与 resume 算法、隔离违规处置、测试要求 |
 | 2026-10-13 | v0.1.2 | §2.2 补两个 P1.2-B 实现后回填的错误码（`VALIDATION.unknown_kind` / `VALIDATION.unknown_filter`，R-2）与一个 P2.2 新增错误码（`VALIDATION.config_invalid`，配置取值非法/超范围） |
+| 2026-10-13 | v0.1.3 | §2.2 补 4 个 P2.3 新增错误码：`VALIDATION.checkpoint_missing` / `VALIDATION.artifact_missing` / `VALIDATION.unknown_task_type` / `VALIDATION.stage_sequence_empty`（INTERFACES §12.3 已点名这些失败原因，只是原表没列；T-1 已批准 → D-095，"待确认"标记已去除） |

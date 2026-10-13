@@ -5,10 +5,16 @@
     EH-2 只有 `INTERNAL` 与不变式被破坏时允许抛 Python 异常，且必须带 trace_ref；
     EH-3 禁止吞错。
 
-⚠️ 与文档的差异（**已记录，待人工确认后回填 ERROR_HANDLING.md §2.2**）：
-    实现需要，新增了两个文档里没有的错误码：
-      - `VALIDATION.unknown_kind`   实体种类不在 `ENTITY_KINDS` 里
-      - `VALIDATION.unknown_filter` 查询条件用了未登记的过滤键
+⚠️ 与文档的差异（**已记录，须回填 ERROR_HANDLING.md §2.2**）：
+    实现需要，新增了若干文档里没有的错误码：
+      - `VALIDATION.unknown_kind`           实体种类不在 `ENTITY_KINDS` 里（P1.2-B，R-2 已批准）
+      - `VALIDATION.unknown_filter`         查询条件用了未登记的过滤键（P1.2-B，R-2 已批准）
+      - `VALIDATION.config_invalid`         配置取值非法/超范围（P2.2，**C-1 已批准** → D-083）
+      - `VALIDATION.checkpoint_missing`     任务没有可续跑的检查点（P2.3，待确认）
+      - `VALIDATION.artifact_missing`       检查点引用的产出已丢失（P2.3，待确认）
+      - `VALIDATION.unknown_task_type`      未知的任务类型（P2.3，待确认）
+      - `VALIDATION.stage_sequence_empty`   阶段序列为空（P2.3，待确认）
+    后四个是 `INTERFACES.md` §12.3 已经点名的失败原因，只是 §2.2 的表格里原先没列。
 """
 
 from __future__ import annotations
@@ -53,7 +59,13 @@ class ErrorCode(_StrEnum):
     VALIDATION_QUERY_EMPTY = "VALIDATION.query_empty"
     VALIDATION_UNKNOWN_KIND = "VALIDATION.unknown_kind"        # 新增，待回填文档
     VALIDATION_UNKNOWN_FILTER = "VALIDATION.unknown_filter"    # 新增，待回填文档
-    VALIDATION_CONFIG_INVALID = "VALIDATION.config_invalid"    # P2.2 新增：配置值非法/超范围
+    VALIDATION_CONFIG_INVALID = "VALIDATION.config_invalid"    # P2.2 新增：配置值非法/超范围（D-083）
+
+    # P2.3 新增：任务生命周期需要的 4 个码（INTERFACES §12.3 已点名，见模块顶部说明）
+    VALIDATION_CHECKPOINT_MISSING = "VALIDATION.checkpoint_missing"
+    VALIDATION_ARTIFACT_MISSING = "VALIDATION.artifact_missing"
+    VALIDATION_UNKNOWN_TASK_TYPE = "VALIDATION.unknown_task_type"
+    VALIDATION_STAGE_SEQUENCE_EMPTY = "VALIDATION.stage_sequence_empty"
 
     # —— 找不到 ——
     NOT_FOUND_TASK = "NOT_FOUND.task"
@@ -137,6 +149,10 @@ for _code, _category, _hint in [
     (ErrorCode.VALIDATION_UNKNOWN_KIND, ErrorCategory.VALIDATION, "未知的实体种类"),
     (ErrorCode.VALIDATION_UNKNOWN_FILTER, ErrorCategory.VALIDATION, "查询条件里有未登记的过滤键"),
     (ErrorCode.VALIDATION_CONFIG_INVALID, ErrorCategory.VALIDATION, "配置项取值非法或超出允许范围"),
+    (ErrorCode.VALIDATION_CHECKPOINT_MISSING, ErrorCategory.VALIDATION, "该任务没有可续跑的检查点"),
+    (ErrorCode.VALIDATION_ARTIFACT_MISSING, ErrorCategory.VALIDATION, "检查点引用的产出已丢失"),
+    (ErrorCode.VALIDATION_UNKNOWN_TASK_TYPE, ErrorCategory.VALIDATION, "未知的任务类型"),
+    (ErrorCode.VALIDATION_STAGE_SEQUENCE_EMPTY, ErrorCategory.VALIDATION, "阶段序列不能为空"),
     (ErrorCode.NOT_FOUND_TASK, ErrorCategory.NOT_FOUND, "找不到指定任务"),
     (ErrorCode.NOT_FOUND_PROJECT, ErrorCategory.NOT_FOUND, "找不到指定项目"),
     (ErrorCode.NOT_FOUND_SOURCE, ErrorCategory.NOT_FOUND, "找不到指定来源"),

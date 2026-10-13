@@ -3,7 +3,9 @@
 **职责**：解析命令、调用 `Orchestrator`、把状态讲成人话。
 **非职责**（D-059）：⛔ **不绕过 `Orchestrator`** 直接驱动业务模块；⛔ 不写业务数据。
 
-本阶段（P1.2-B）只有：`--help`、`--version`、`info`、`selftest`。
+本阶段（P2.3）可用：`--help`、`--version`、`info`、`selftest`、`config`、**`task`（任务生命周期）**。
+`task run` 用的是 **Mock 执行器**：它推进的是抽象"工作单元"，
+**不是**真实的人物研究 / 证据提取 / 对话——那些业务尚未实现。
 其余业务命令**保留占位**，执行时明确提示"尚未实现"，**不会假装能用**。
 
 输出约定：面向非技术用户——一句话原因 + 一句话建议 + `trace_ref`，不堆堆栈。
@@ -22,18 +24,17 @@ from ..core.enums import NAMESPACE_WRITE_GATE, ProvenanceNamespace, TaskStatus
 EXIT_OK = 0
 EXIT_NOT_IMPLEMENTED = 2
 
-# INTERFACES §11.2 里列出的命令；本阶段全部为占位
+# INTERFACES §11.2 里列出的命令；**仍为占位**的部分（P2.3 只接通了任务生命周期）
 PLACEHOLDER_COMMANDS = (
     "new",
-    "status",
-    "resume",
-    "pause",
-    "cancel",
     "chat",
     "sources",
     "memory",
     "eval",
 )
+
+# 已接通 `TaskService` 的命令（status/pause/resume/cancel 是 `task` 组的快捷方式）
+TASK_ALIASES = ("status", "pause", "resume", "cancel")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -57,13 +58,69 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-dotenv", action="store_true", help="忽略 .env 文件，只看默认值与环境变量",
     )
 
+    p_task = sub.add_parser("task", help="任务生命周期（创建 / 查询 / 推进 / 暂停 / 恢复 / 取消）")
+    tsub = p_task.add_subparsers(dest="task_action", metavar="{create,show,list,...}")
+
+    t_create = tsub.add_parser("create", help="建一个 PENDING 任务（不自动开跑）")
+    t_create.add_argument("--project", default="prj_local", help="项目 ID（默认 prj_local）")
+    t_create.add_argument("--type", default="RESEARCH", help="任务类型，见 info 输出")
+    t_create.add_argument("--stages", default="RESEARCH,EVIDENCE_EXTRACT",
+                          help="阶段序列，逗号分隔")
+    t_create.add_argument("--key", default="", help="幂等键：同项目下重复提交会返回原任务")
+    t_create.add_argument("--budget-requests", type=int, default=0,
+                          help="调用次数上限（0 = 用配置默认值）")
+
+    t_show = tsub.add_parser("show", help="查看任务状态与进度")
+    t_show.add_argument("task_id")
+    t_show.add_argument("--project", default="prj_local")
+
+    t_list = tsub.add_parser("list", help="列出某项目下的任务")
+    t_list.add_argument("--project", default="prj_local")
+
+    t_start = tsub.add_parser("start", help="PENDING → RUNNING")
+    t_start.add_argument("task_id")
+    t_start.add_argument("--project", default="prj_local")
+
+    t_run = tsub.add_parser(
+        "run",
+        help="用 **Mock 执行器**推进任务（只推抽象工作单元，不是真实业务，不联网）",
+    )
+    t_run.add_argument("task_id")
+    t_run.add_argument("--project", default="prj_local")
+    t_run.add_argument("--steps", type=int, default=50, help="最多推进多少步")
+
+    t_pause = tsub.add_parser("pause", help="RUNNING → PAUSED（保留检查点，可续跑）")
+    t_pause.add_argument("task_id")
+    t_pause.add_argument("--project", default="prj_local")
+    t_pause.add_argument("--reason", default="USER", choices=("USER", "BUDGET", "DEPENDENCY"))
+
+    t_resume = tsub.add_parser("resume", help="PAUSED → RUNNING（必须有检查点）")
+    t_resume.add_argument("task_id")
+    t_resume.add_argument("--project", default="prj_local")
+
+    t_cancel = tsub.add_parser("cancel", help="取消任务（**不可**续跑，与暂停不同）")
+    t_cancel.add_argument("task_id")
+    t_cancel.add_argument("--project", default="prj_local")
+
+    t_sweep = tsub.add_parser("sweep", help="把上次中断的 RUNNING 任务安全回退为 PAUSED")
+    t_sweep.add_argument("--project", default="prj_local")
+
+    for name in TASK_ALIASES:
+        help_text = {
+            "status": "查看任务状态（`task show` 的快捷方式）",
+            "pause": "暂停任务（`task pause` 的快捷方式）",
+            "resume": "恢复暂停的任务（`task resume` 的快捷方式）",
+            "cancel": "取消任务（`task cancel` 的快捷方式）",
+        }[name]
+        p = sub.add_parser(name, help=help_text)
+        p.add_argument("task_id", nargs="?", default="")
+        p.add_argument("--project", default="prj_local")
+        if name == "pause":
+            p.add_argument("--reason", default="USER", choices=("USER", "BUDGET", "DEPENDENCY"))
+
     for name in PLACEHOLDER_COMMANDS:
         help_text = {
             "new": "新建项目（尚未实现）",
-            "status": "查看任务状态（尚未实现）",
-            "resume": "恢复暂停的任务（尚未实现）",
-            "pause": "暂停任务（尚未实现）",
-            "cancel": "取消任务（尚未实现）",
             "chat": "运行多人对话（尚未实现）",
             "sources": "查看来源清单（可选追溯，尚未实现）",
             "memory": "查看或清理记忆（尚未实现）",
@@ -72,8 +129,6 @@ def build_parser() -> argparse.ArgumentParser:
         p = sub.add_parser(name, help=help_text)
         if name == "new":
             p.add_argument("--names", default="", help="两个或更多人物名，用逗号分隔")
-        if name == "status" or name == "resume" or name == "pause" or name == "cancel":
-            p.add_argument("task_id", nargs="?", default="")
         if name in ("chat", "sources", "memory"):
             p.add_argument("project_id", nargs="?", default="")
         if name == "chat":
@@ -94,7 +149,7 @@ def _print_info() -> None:
     print("    persona.core         公共契约（枚举 / ID / 时间 / 错误码 / Result / 上下文）")
     print("    persona.storage      SQLite 最小读写（不做业务判断）")
     print("    persona.providers    外部服务统一接口 + Mock（全程离线，不需要 API Key）")
-    print("    persona.orchestrator 六态任务状态机 + 检查点（尚无任务引擎）")
+    print("    persona.orchestrator 六态状态机 + 任务服务 + 预算闸门 + Mock 执行器（P2.3）")
     print("    persona.modules      各业务模块的端口协议（只声明，不实现）")
     print("    persona.cli          命令行入口（本命令）")
     print("  任务六态    : " + " / ".join(s.value for s in TaskStatus))
@@ -210,6 +265,167 @@ def _print_config(action: str, *, use_dotenv: bool) -> int:
     return EXIT_OK
 
 
+def _open_task_service(project_id: str) -> tuple[Any, Any] | None:
+    """打开任务服务。**失败返回 None 并已打印原因**（不抛异常给命令层）。"""
+    from ..core.result import error_of, is_ok, unwrap
+    from ..config import load_settings
+    from ..orchestrator import TaskService
+    from ..storage.sqlite import SqliteStorage
+
+    result = load_settings()
+    if not is_ok(result):
+        error = error_of(result)
+        print(f"配置无法加载：{error}")
+        print("  提示：先跑 `persona config check`，或参考 .env.example")
+        return None
+    settings = unwrap(result)
+    storage = SqliteStorage(settings.ensure_data_dir())
+    return TaskService(storage, settings), storage
+
+
+def _ctx_for(project_id: str, task_id: str | None = None):
+    from ..core.context import new_call_context
+
+    return new_call_context(project_id=project_id, actor="cli", task_id=task_id)
+
+
+def _print_task(record: Any) -> None:
+    status = record.status.value
+    extra = f"（原因：{record.paused_reason.value}）" if record.paused_reason else ""
+    print(f"  任务        : {record.id}")
+    print(f"  类型 / 项目  : {record.task_type.value} / {record.project_id}")
+    print(f"  状态        : {status}{extra}")
+    print(f"  阶段        : {record.current_stage}（已完成 "
+          f"{len(record.completed_stages)}/{len(record.stage_sequence)}）")
+    print(f"  进度        : {record.progress.items_done}/{record.progress.items_total}"
+          f"  ({record.progress.percent}%)")
+    print(f"  预算        : 已用 {record.budget_used.requests} 次调用"
+          f"（上限 {record.budget_limit.max_requests}）")
+    if record.checkpoint.resume_token:
+        print(f"  检查点      : stage={record.checkpoint.stage or '-'} "
+              f"cursor={record.checkpoint.cursor or '-'} "
+              f"token={record.checkpoint.resume_token[:16]}…")
+    else:
+        print("  检查点      : 无")
+    if record.last_error:
+        print(f"  最近错误    : [{record.last_error.code}] {record.last_error.message}")
+
+
+def _run_task_action(args: Any) -> int:
+    """执行 `persona task <action>`。全部经 `TaskService`，CLI 不直接写业务表。"""
+    from ..core.enums import PausedReason
+    from ..core.result import error_of, is_err, is_ok, unwrap
+    from ..orchestrator import BudgetSpec, MockUnitHandler, TaskDraft, TaskRunner
+
+    opened = _open_task_service(args.project)
+    if opened is None:
+        return 1
+    service, storage = opened
+    action = getattr(args, "task_action", "")
+    ctx = _ctx_for(args.project)
+
+    try:
+        if not is_ok(storage.init_schema(ctx)):
+            print("数据库初始化失败")
+            return 1
+
+        if action == "create":
+            stages = [s.strip() for s in str(args.stages).split(",") if s.strip()]
+            budget = BudgetSpec(max_requests=args.budget_requests or None)
+            outcome = service.create_task(
+                ctx,
+                TaskDraft(
+                    task_type=args.type,
+                    stage_sequence=stages,
+                    idempotency_key=args.key or None,
+                    budget_limit=budget if args.budget_requests else None,
+                ),
+            )
+            if is_err(outcome):
+                print(f"创建失败：{error_of(outcome)}")
+                return 1
+            record = unwrap(outcome)
+            print("任务已创建（状态 PENDING，未自动开跑）")
+            _print_task(record)
+            print("  下一步      : persona task start <task_id> "
+                  "（或 persona task run <task_id> 直接用 Mock 执行器推进）")
+            return EXIT_OK
+
+        if action == "list":
+            outcome = service.list_tasks(ctx)
+            if is_err(outcome):
+                print(f"查询失败：{error_of(outcome)}")
+                return 1
+            items = unwrap(outcome).items
+            if not items:
+                print(f"项目 {args.project} 下还没有任务。")
+                return EXIT_OK
+            print(f"共 {len(items)} 个任务：")
+            for record in items:
+                print(f"  {record.id}  {record.status.value:<10}"
+                      f"{record.task_type.value:<22}{record.progress.items_done}"
+                      f"/{record.progress.items_total}")
+            return EXIT_OK
+
+        if action == "sweep":
+            outcome = service.sweep_interrupted(ctx)
+            if is_err(outcome):
+                print(f"扫描失败：{error_of(outcome)}")
+                return 1
+            fixed = unwrap(outcome)
+            print(f"已把 {len(fixed)} 个中断任务安全回退为 PAUSED(DEPENDENCY)：{fixed}")
+            return EXIT_OK
+
+        # 以下动作都需要 task_id
+        task_id = getattr(args, "task_id", "")
+        if not task_id:
+            print("缺少 task_id。用法见 `persona task --help`")
+            return 1
+
+        if action == "show":
+            outcome = service.get(ctx, task_id)
+            if is_err(outcome):
+                print(f"查询失败：{error_of(outcome)}")
+                return 1
+            _print_task(unwrap(outcome))
+            return EXIT_OK
+
+        if action == "start":
+            outcome = service.start(ctx, task_id)
+        elif action == "pause":
+            outcome = service.pause(ctx, task_id, PausedReason(args.reason))
+        elif action == "resume":
+            outcome = service.resume(ctx, task_id)
+        elif action == "cancel":
+            outcome = service.cancel(ctx, task_id, "用户取消")
+        elif action == "run":
+            # 说明：这不是真实业务，只是把抽象工作单元往前推（D-093）
+            runner = TaskRunner(service, MockUnitHandler())
+            result = runner.run_to_completion(ctx, task_id, max_steps=int(args.steps))
+            if is_err(result):
+                print(f"推进失败：{error_of(result)}")
+            outcome = service.get(ctx, task_id)
+            if is_ok(outcome):
+                record = unwrap(outcome)
+                print("Mock 执行器推进结束（**不是**真实研究/蒸馏业务）")
+                _print_task(record)
+                if record.status.value == "PAUSED":
+                    print("  提示        : 已达预算上限，进度已保存。"
+                          "提高额度后可 resume 继续。")
+            return 0 if is_ok(result) else 1
+        else:
+            print(f"未知的 task 动作：{action}")
+            return 1
+
+        if is_err(outcome):
+            print(f"操作失败：{error_of(outcome)}")
+            return 1
+        print(f"任务状态已更新：{unwrap(outcome).status.value}")
+        return EXIT_OK
+    finally:
+        storage.close()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
@@ -227,10 +443,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             getattr(args, "action", "show"),
             use_dotenv=not getattr(args, "no_dotenv", False),
         )
+    if args.command == "task":
+        if not getattr(args, "task_action", ""):
+            # 没有子动作时打印 task 的帮助（argparse 的 --help 会走 SystemExit）
+            try:
+                build_parser().parse_args(["task", "--help"])
+            except SystemExit:
+                pass
+            return EXIT_OK
+        return _run_task_action(args)
+
+    # status / pause / resume / cancel 是 `task` 组的快捷方式（INTERFACES §11.2）
+    if args.command in TASK_ALIASES:
+        alias = {"status": "show", "pause": "pause", "resume": "resume", "cancel": "cancel"}
+        return _run_task_action(
+            argparse.Namespace(
+                project=getattr(args, "project", "prj_local"),
+                task_action=alias[args.command],
+                task_id=getattr(args, "task_id", ""),
+                reason=getattr(args, "reason", "USER"),
+            )
+        )
 
     print(f"命令 `persona {args.command}` 尚未实现。")
     print(f"当前阶段：{STAGE}")
-    print("可用命令：persona info / persona selftest")
+    print("可用命令：persona info / persona selftest / persona config / persona task")
     return EXIT_NOT_IMPLEMENTED
 
 

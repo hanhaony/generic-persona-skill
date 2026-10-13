@@ -820,6 +820,15 @@ PENDING ──start──► RUNNING ──► COMPLETED
 - 每完成一个**可划分单元**立刻写 `checkpoint`（阶段级 + 阶段内单元级），不等整个阶段结束。
 - 状态转换表与 resume 算法见 `ERROR_HANDLING.md` §6。
 
+> **P2.3 实现说明（补充，非改动）**：
+> ① 完整的检查点存在 **`checkpoints` 表**（`Storage.save_checkpoint` / `load_checkpoint`），
+> 本对象里的 `checkpoint` 字段只镜像 `resume_token` / `saved_at` / `stage` / `cursor` 四个摘要（D-090），
+> 避免两处数据打架。
+> ② `budget_limit` 的默认值来自 `persona.config`（`BudgetLimits → BudgetSpec`），
+> 执行器不自己读配置（D-077）。
+> ③ 校验 `TS-V1 / TS-V5 / TS-V6` 已在 `orchestrator/records.py::TaskRecord.validate()` 落地；
+> `TS-V3 / TS-V7` 在 `TaskService.resume()` 与 `TaskRunner.run_step()` 中落地。
+
 **校验规则**：
 
 - `TS-V1`：`completed_stages` 必须与 `stage_sequence` 的推进顺序一致（不允许跳过、乱序）。
