@@ -1,7 +1,7 @@
 # INTERFACES —— 模块接口契约
 
-- **版本**：v0.1.2（P1.2-A 契约 + P1.2-B 验收同步 + P2.3 实现状态）
-- **状态**：主体待人工验收；§1.8 闸门说明按 R-3 已同步为「双层闸门」；**§12.6 为 P2.3 新增**
+- **版本**：v0.1.6（P1.2-A 契约 + P1.2-B 验收同步 + P2.3 实现状态 + P4 集成回填 + H-11A Research 实现状态 + H-10A 业务编排器 + G-2 自动抽取）
+- **状态**：主体待人工验收；§1.8 闸门说明按 R-3 已同步为「双层闸门」；**§12.6 为 P2.3 新增**；**§8.1 的 `MemoryReader` 端口与 §8.2 的写入/检索触发规则为 P4 集成回填（D-185）**；**§5.3 为 H-11A Research 实现状态回填（D-196）**；**§5.4 为 G-2 自动抽取新增（D-221）**；**§12.7 为 H-10A 业务编排器新增（D-206）**
 - **运行环境**：Python 3.12+ / 本地 CLI / 模块化单体 / SQLite
 - **相关文档**：`ARCHITECTURE.md`、`DATA_MODEL.md`、`ERROR_HANDLING.md`、`DECISIONS.md`、`PROJECT_SPEC.md`
 
@@ -547,6 +547,69 @@ class UsageDelta:
 | `EXTERNAL_*` 全部查询均失败 | 上报；由 Orchestrator 决定是否 FAILED |
 | 单个查询失败 | **记录并继续其他查询**，进入 `warnings`，任务不失败 |
 
+### 5.3 实现状态与边界（H-11A 回填，2026-10-14）
+
+> `persona/modules/research.py` 已由「只有 Protocol」推进为**可执行、可测试的最小实现**
+> （`ResearchService`）。本节记录**实现相对契约的取舍**，供人工验收（D-191 ~ D-205）。
+
+| 项 | 实现口径 |
+| --- | --- |
+| **已实现** | `plan_queries`（确定性模板，不调模型）/ `collect`（经 `Provider.search`）/ `filter_and_rank`（去无效 + 批内去重 + 确定性排序）/ `register`（经 `Evidence.register_source`）/ `run`（串起四步，聚合计数与 `warnings`） |
+| **未实现** | 真实检索接入（仍是 `Provider` 抽象 + Mock）、检索词语义改写/多语言扩展、相关性语义排序、正文抓取与切分（`content_ref` / `snapshot_ref` 留空）、`SourceEvent` 产出（交 `Evidence`） |
+| **写权限** | 只注入 `SourceRegistrarPort`（**只有 `register_source`**），模块内**无** `Storage` / 无 `sqlite3` / 无 `add_evidence`——F-10「Research → Evidence 表直接写入」在类型层面被堵死 |
+| **不承担的职责** | 任务六态机、预算账本、检查点（**均为 Orchestrator 职责**）。`run(ctx, targets, budget=None)` 的 `budget` 仅为签名兼容而保留，**不查询、不扣减**；返回的 `budget_used` 是 Provider 如实回报的用量之和 |
+| **签名扩展** | `filter_and_rank(ctx, results, *, target_entity_ids=None)` 增加一个**可选关键字参数**，用于把对象边界（候选属于哪个 `PersonEntity`）带到 `Evidence`；不传时行为与原签名一致 |
+| **`fetch_status=NO_RESULT`** | `FetchStatus` 枚举只有 OK/PARTIAL/FAILED/BLOCKED，**不含 `NO_RESULT`**。实现用模块级常量 `FETCH_NO_RESULT`（`"NO_RESULT"`）表达「检索成功但 0 条」，**不改动已审枚举** |
+| **`VALIDATION.empty_targets`** | 契约把 `plan_queries` 空目标列为该码，但 `ERROR_HANDLING §2.2` / `ErrorCode` **未登记**；实现复用 `VALIDATION.required_field`，不新增错误码 |
+| **校验下沉** | Research 只做**形状校验**（目标非空、`entity_id` / 名字齐备、查询非空）；「实体是否真实存在」由 `Evidence.register_source` 兜底（`VALIDATION.entity_missing`） |
+| **G-2 追加：材料输出** | `ResearchOutput` / `ResearchRegisterOutcome` 新增 `materials: list[SourceMaterial]`（含检索摘要 `snippet`）。此前只返回 `source_ids`——来源元数据里没有材料正文，下游无从抽取 claim。**`SourceMaterial` 放在 `persona/core/types.py`**，以便 `L4 Research`（产出方）与 `L4 抽取器`（消费方）都能引用而不破同层互不调用的规则（ARCHITECTURE §3）。⚠️ `snippet` 只是检索摘要，**不是正文全文**（正文抓取未实现，H-17） |
+
+### 5.4 来源材料 → 候选 claim 的抽取（G-2 新增，2026-10-14）
+
+> `persona/modules/extraction.py`。⚠️ 仓库里有**两个** G-2：本节是
+> `RUNNING.md` §5.12 那条（H-10A 遗留「源→证据自动抽取」）；`RUNNING.md` §5.8 的
+> G-2 是 P3.3 遗留「群体子结构关系无法表达」，两者无关（Q-37 第十轮）。
+
+**唯一入口**：
+
+```python
+class ClaimExtractorPort(Protocol):
+    def extract(self, ctx, materials: list[SourceMaterial], *,
+                targets: list[Any] | None = None) -> Result[ExtractionOutcome]: ...
+```
+
+| 数据形状 | 字段 |
+| --- | --- |
+| `SourceMaterial`（`core/types.py`） | `source_id` / `title` / `url` / `canonical_key` / **`snippet`** / `published_at` / `source_kind` / `subject_entity_ids` / `target_display_names` / `query_text` |
+| `CandidateClaim` | `key` / `source_id` / `claim` / `tier` / `dimension` / `subject_entity_ids` / `confidence` / `verbatim_quote` / `locator` / `stated_at` / `stability` / `canon_level` / `derivation_keys` / `tags` / `note` |
+| `RejectedClaim` | `reason` / `message` / `key` / `source_id` / `claim` |
+| `ExtractionOutcome` | `claims` / `rejected` / `warnings` / `method` / `usage` |
+
+**三种 claim 的机械区分**（推断不得伪装成原文引用）：
+
+| 类型 | `tier` | 登记入口 | 硬约束 |
+| --- | --- | --- | --- |
+| 原文直接支持 | `VERBATIM`（带 `verbatim_quote`） | `Evidence.add_evidence` | 摘录必须能在材料的 `snippet` 里逐字找到，否则 `QUOTE_NOT_IN_MATERIAL` 拒收 |
+| 对材料的归纳 | `PROFILE_BACKGROUND` / `THIRD_PARTY` | `Evidence.add_evidence` | 不得带 `verbatim_quote` 冒充原话 |
+| 系统推断 | `INFERENCE` | `Evidence.record_inference` | 必须解析出 `derivation_keys` 对应的根证据，否则**丢弃**（EV-V3）；带摘录 → `INFERENCE_WITH_QUOTE` 拒收 |
+
+**拒收原因**（全部进 `rejected`，**不静默丢弃**）：
+`EMPTY_MATERIAL` / `EMPTY_CLAIM` / `NO_SUBJECT` / `QUOTE_NOT_IN_MATERIAL` /
+`UNKNOWN_TIER` / `UNKNOWN_DIMENSION` / `CONFIDENCE_OUT_OF_RANGE` / `INFERENCE_WITH_QUOTE`。
+
+**红线**：
+- ⛔ 抽取器**拿不到** `Evidence`（不 import `evidence` 模块、无 `add_evidence` /
+  `record_inference` 调用），结构上无法把候选直接标记成"已验证证据"；
+- ⛔ 不裁决、不合并冲突：说法不同就各自保留成独立候选（AC-15）；
+- ⛔ `tier` 沿用既有 `EvidenceTier` 定义，**等级不等于真实性**（D-009 / D-010）。
+
+**实现**：
+
+| 实现 | 说明 |
+| --- | --- |
+| `MockClaimExtractor` | 确定性离线查表（按 `canonical_key` 取 fixture），产出一律打 `mock-fixture` 标签，**清楚标识为测试材料** |
+| `ProviderClaimExtractor` | **模型抽取的契约与错误处理**（本阶段不接真实模型）：`Provider.chat` 失败**原样传播**；返回非约定 JSON → `Err(EXTERNAL_UNAVAILABLE)`（不谎报"抽取成功但零结果"）；单条取值非法 → 记 `rejected` 并继续；缺 `material_key` → 无法溯源，拒收 |
+
 ---
 
 ## 6. Persona —— 人物档案蒸馏
@@ -644,6 +707,26 @@ class UsageDelta:
 - `perspectives` 是字典而非合并后的结论；系统不生成"综合定论"字段。
 - ≥3 人时 `group_dynamics` 必填；2 人时必须为 `N/A`。
 
+### 7.4 关系语义分析端口（G-4 新增，2026-10-15）
+
+> 与 §5.4（G-2）同口径：`Relationship` 模块本身**不实现 `distill` 的 AI 蒸馏主体**
+> （§7.2 的 `distill` 仍要调 `Provider.chat`，本阶段不接）；关系研判由**可注入**的
+> `RelationshipAnalyzerPort` 承担，由 `BusinessOrchestrator._step_relationship` 调用。
+
+#### `RelationshipAnalyzerPort.analyze(ctx, request) -> Result[RelationshipAnalysisOutcome]`
+
+| 项 | 内容 |
+| --- | --- |
+| 输入 | `RelationshipAnalysisRequest{ participant_entity_ids, relation_evidence: list[EvidenceView], cardinality }`；`relation_evidence` 由编排器预先过滤为 `dimension=RELATION` 的**已登记**证据（分析器不反向依赖 `Evidence` / `Relationship`，不启动研究流程） |
+| 输出 | `RelationshipAnalysisOutcome{ perspectives(双向分块), shared_experiences, interaction_patterns, emotional_expression_habits, temporal_changes, group_dynamics(≥3), asymmetry_notes, conflict_ids, open_questions, notes, method, is_semantic_model }` |
+| 失败 | `VALIDATION.required_field`（参与者 < 2）；产出里每条目必须带 `evidence_refs` 且指向已登记 `EvidenceItem`（RL-V4 / RL-V6） |
+| 实现 | `RuleRelationshipAnalyzer`（离线确定性规则，**非语义模型**）、`MockRelationshipAnalyzer`（确定性查表，测试材料）、`ProviderRelationshipAnalyzer`（仅契约占位，本阶段不接真实模型） |
+| 红线 | 群体互动三板块仅接受**明确标记**（结盟 / 排斥 / 传话）；共同出现 / 共同活动**不足以下结论**（D-215）；从不产出 `score` / `closeness` / `intimacy`（RL-V2）；绝不把系统推断伪装成来源原话；`is_semantic_model` 对规则 / Mock 恒为 `False` |
+
+> **能力边界**：`RuleRelationshipAnalyzer` 是确定性规则，**不是语义模型**。它能做维度归类、
+> 关键字信号识别、证据追踪、不伪造；**做不了**读懂潜台词、判定关系稳定性、区分礼貌性疏远与真实敌对。
+> 这些留给未来真实语义模型替换 `RelationshipAnalyzerPort` 实现（接口与产出形状不变）。
+
 ---
 
 ## 8. Dialogue —— 多人多轮对话
@@ -654,7 +737,7 @@ class UsageDelta:
 | --- | --- |
 | **职责** | 会话管理、动态发言人选择（含理由）、生成发言、轮次落盘、触发模拟记忆写入 |
 | **非职责** | ⛔⛔ **绝不写 `EvidenceItem` / `SourceEvent` / `PersonaProfile` / `RelationshipProfile`**（INV-1）；⛔ 不自行持久化记忆（交给 `Memory`）；⛔ 不裁决冲突；⛔ 不做研究 |
-| **可调用** | ✅ `Storage`（仅会话/轮次表） ✅ `Provider.chat` 👁 `PersonaReader` 👁 `RelationshipReader` 👁 `EvidenceReader` ✅ `MemoryWriter`（**只能走模拟记忆流程**） ⛔ 其他一切 |
+| **可调用** | ✅ `Storage`（仅会话/轮次表） ✅ `Provider.chat` 👁 `PersonaReader` 👁 `RelationshipReader` 👁 `EvidenceReader` 👁 `MemoryReader`（**只读检索**，为上下文取模拟记忆） ✅ `MemoryWriter`（**只能走模拟记忆流程**） ⛔ 其他一切 |
 
 **注入端口（类型层面阻断误用）**：
 
@@ -667,7 +750,13 @@ class DialogueDeps:
     memory: MemoryWriter               # write_simulated() 等，namespace 恒为 SIMULATED
     storage: ConversationStore         # 只能写 Conversation* 两张表
     provider: Provider
+    memory_reader: MemoryReader | None = None   # 只读检索（仅 search），默认不注入则不检索记忆
 ```
+
+> `MemoryReader` 与 `MemoryWriter` 是**两个独立协议**（P4 集成新增，见 `DECISIONS.md` §2.22 D-176 / §2.22.1）：
+> `MemoryReader` 只有 `search` 一个方法（供 `draft_turn` 取上下文记忆）；
+> `MemoryWriter` 只有 `write_simulated` 一个方法（供 `commit_turn` 写模拟记忆）。
+> 二者**互不包含**，因此"能读"不等于"能写"，反之亦然——写权限不会被读取需求悄悄放大。
 
 > `EvidenceReader` 协议里**没有写方法**——即使有人想改也调用不到。这是"模拟不得污染现实证据"的**技术**保证，而不只是约定。
 
@@ -722,6 +811,10 @@ class DialogueDeps:
 | 隔离 | `namespace` 强制 `SIMULATED`，不接受外部传入；生成的记忆 `source_type=SIMULATED_DIALOGUE` |
 
 > **注意顺序**：先写 `ConversationTurn` → 再写 `MemoryItem` → 最后写 `AuditRecord`，**全部在同一事务内**。任一步失败整体回滚，避免"有对话无记忆"或"有记忆无出处"的中间态。
+
+> **写入触发规则（P4 集成补充，见 `DECISIONS.md` §2.22 D-179 / D-180）**：`commit_turn(ctx, session_id, draft, *, memory_candidates=None)`。**默认不写长期记忆**——只有会话创建时显式选择 `memory_write_policy="explicit"` **且** 调用方在 `commit_turn` 显式传入 `memory_candidates` 时才写；两者缺一即不写，有候选但策略为 `none` → `VALIDATION.gate_rejected`（拒绝而非静默忽略）。候选 `scope` 必须是 `SESSION`（`ENTITY` / `RELATIONSHIP` / `PROJECT` 一律拒绝，防止单轮对话内容被升级为稳定人格特征）。`scope_id` / `source_turn_id` / `related_entity_ids` 由 Dialogue 补齐；`namespace` / `source_type` 由 `MemoryWriter.write_simulated` 内部锁定。
+>
+> **上下文记忆检索（P4 集成补充）**：`draft_turn` 经 `memory_reader.search` 按 **R1 本会话**（`scope=SESSION` 且 `scope_id=本会话`）与 **R2 跨会话**（`related_entity_ids` ∩ 参与者，且会话有 `topic` 时须命中话题关键词）两条规则检索，**两条都硬限 `namespace=SIMULATED` + `lifecycle=ACTIVE`**；检出结果原样带出 `namespace` 标记后注入 prompt。检索失败**传播 `Err`**，不降级为"无记忆继续生成"。
 
 #### `run_round(ctx, session_id) -> Result[TurnView]`
 
@@ -1046,6 +1139,37 @@ class Checkpoint:
 **边界**：`TaskRunner` 的 `UnitHandler` 本阶段**只有 `MockUnitHandler`**（D-093）。
 它推进的是"抽象工作单元"，**不是**真实的人物研究 / 证据提取 / 人格蒸馏 / 对话。
 
+### 12.7 业务编排器（H-10A 新增，**诚实声明**）
+
+`orchestrator/business.py::BusinessOrchestrator` 是**业务编排器**，填补 §12.6 留下的
+"有人记账、没人干活"的缺口。它与 §12 的既有能力是**复用**关系，不是并列关系。
+
+| 项 | 口径 |
+| --- | --- |
+| **与 `TaskRunner` 的关系** | 实现 `executor.UnitHandler`（`plan` / `execute`）→ 由既有 `TaskRunner` 驱动。六态机、预算预占与记账、检查点落盘、重试与 `FAILED` 置位**全部由既有代码完成**，业务编排器不复制第二套 |
+| **阶段划分** | 五个 `WorkUnit`，`stage` 与 `TaskType` 同名：`RESEARCH` → `EVIDENCE_EXTRACT` → `PERSONA_DISTILL` → `RELATIONSHIP_DISTILL` → `DIALOGUE_RUN`（`stage_sequence` 承载真实语义） |
+| **阶段间传数据** | **只经已落盘的检查点** `artifact_ids`（`source_ids` / `evidence_ids` / `persona_profile_ids` / `relationship_profile_ids` / `session_ids` / `turn_ids`）；不用内存私有通道，因此 `resume` 也能接着用 |
+| **入口** | `run(ctx, BusinessRequest)`（新建任务并跑到底）；`resume(ctx, task_id, BusinessRequest)`（从检查点续跑） |
+| **结果** | `BusinessRunResult{status, task_status, steps[], ...}`。`status ∈ {SUCCEEDED, PARTIAL, PAUSED, FAILED}`；**只有五步全部执行且任务 `COMPLETED` 才算 `SUCCEEDED`** |
+| **依赖注入** | `BusinessDeps{research, evidence, persona, relationship, dialogue, task_service, storage, claim_extractor}` 全部注入；`storage` **只读**（只取 `PersonEntity.entity_type`，供 `PF-V5`/`D-115` 判定），编排器不选择任何 `Provider`、不硬编码任何抽取器 |
+| **G-2 之后的最小输入** | **只要目标人物 + 研究目标**：`evidence_seeds` 变为**可选**。不传时走 `Research → Claim Extraction → Evidence Registration`（§5.4） |
+| **不做的事** | ⛔ 不自己写 claim（交给注入的 `ClaimExtractorPort`）⛔ 不做语义相关性判断 ⛔ 不蒸馏人格 ⛔ 不直接写业务表 ⛔ 不持 API Key |
+
+| 新增数据形状 | 说明 |
+| --- | --- |
+| `BusinessRequest` | `targets` / `topic` / `max_rounds` / `evidence_seeds` / `task_type` / `budget_limit` / `retry_policy` / `idempotency_key` |
+| `EvidenceSeed` | `source_ref`（来源定位符 `canonical_key` / `url`）+ `draft`。研究阶段跑在证据阶段之前，调用方发请求时拿不到 `src_` ID，故由编排器在绑定阶段填入 `draft.source_id` |
+| `BusinessStepResult` | `name` / `status`（`EXECUTED` / `ALREADY_CURRENT` / `SKIPPED` / `FAILED` / `NOT_REACHED`）/ `artifact_ids` / `warnings` / `message` |
+| `BusinessRunResult` | 五步结果 + 各类产出 ID + **`conflict_ids`** + `budget_used` + `error`；`is_complete()` 只在 `SUCCEEDED` 为真 |
+| `EvidenceSeed` 的定位 | **保留为显式覆盖通道**：给出时跳过自动抽取，原样登记（回归测试 / 人工校准）。两种路径都强制"证据必须绑定到本次研究登记的来源" |
+
+**已报告的契约缺口**：
+- **G-1**：`TaskType` 没有"全流程"成员 → 最小兼容：用 `TaskType.RESEARCH` 作跨阶段任务类型（可由请求覆盖），语义由 `stage_sequence` 承载。
+- ~~**G-2**：「来源 → 证据」自动抽取未实现~~ → **已于 2026-10-14 关闭**（§5.4 + D-221 ~ D-235）：`Research` 现在随产出返回 `materials`，编排器调注入的 `ClaimExtractorPort` 抽取候选，再经 `Evidence` 校验 / 去重 / 登记；`INFERENCE` 走 `record_inference` 且无根即丢弃。
+- **G-3**：检查点只存产出 ID，不存业务请求 → `resume` 需调用方重新提供 `BusinessRequest`。
+- **G-4（新增）**：研究材料（`SourceMaterial`，含正文摘要）**无法落进检查点**——`TaskService.resume` 会把 `artifact_ids` 的**每一项**当实体引用校验（`VALIDATION.artifact_missing`），材料不是 ID，塞进去会让续跑失败。现改为**进程内**缓存（按 `task_id`），缓存失效时以**幂等重跑研究**回补（`register_source` 会去重，不产生重复来源）。跨进程续跑因此会多消耗一次检索预算。
+- **H-17（仍开）**：材料**正文全文**抓取未实现，抽取只能基于检索摘要 `snippet`。
+
 ---
 
 ## 13. 模块依赖图与禁止依赖
@@ -1173,3 +1297,7 @@ L6 {CLI, Evaluation}  →  L5 {Orchestrator}  →  L4 {Research, Persona, Relati
 | 2026-10-13 | v0.1 | 初稿：11 个模块接口契约、公共 `Result` 信封、任务六态机、依赖禁止清单、SQLite + 关键词检索约定 |
 | 2026-10-13 | v0.1.1 | 新增 §1.8.1：命名空间闸门是**双层**的（模块接口层解释原因 + `Storage.put` 结构层保证拦住），按 R-3 拍板同步（D-064） |
 | 2026-10-13 | v0.1.2 | 新增 **§12.6 P2.3 实现状态与边界**：标明 `TaskService` / `TaskRunner` / `BudgetGate` 已实现到什么程度，以及「只驱动抽象 `WorkUnit`、不实现真实业务」的边界 |
+| 2026-10-14 | v0.1.3 | **§8.1 回填 `MemoryReader` 端口**（用户验收同意，D-185）：`DialogueDeps` 新增 `memory_reader: MemoryReader \| None`，与 `MemoryWriter` 分为两个独立只读/只写协议；§8.2 补记 `commit_turn(..., memory_candidates=...)` 的写入触发规则与 `draft_turn` 的 R1/R2 记忆检索规则（原 §8.2 已要求"记忆检索只读"，但 §8.1 端口表漏列 `search` 入口，本次按最小改动补齐） |
+| 2026-10-14 | v0.1.6 | 新增 **§5.4 来源材料 → 候选 claim 的抽取（G-2）**：`modules/extraction.py` 的 `ClaimExtractorPort` 唯一入口、`SourceMaterial` 下沉到 `core/types.py`（避免 L4↔L4 同层调用）；三种 claim 的机械区分（VERBATIM 带可逐字核对的摘录 / 归纳不带摘录 / INFERENCE 走 `record_inference` 且无根即丢弃）；8 种拒收原因全部进 `rejected` 不静默丢弃；`MockClaimExtractor` 打 `mock-fixture` 标签、`ProviderClaimExtractor` 只定义契约与错误处理（不接真实模型）；抽取器**拿不到** Evidence（AST 断言）。同时更新 §5.3（Research 新增 `materials` 输出）与 §12.7（`evidence_seeds` 变可选、新增 `conflict_ids`、登记新缺口 G-4「材料无法落检查点」）（D-221 ~ D-235） |
+| 2026-10-14 | v0.1.5 | 新增 **§12.7 业务编排器（H-10A）**：`orchestrator/business.py::BusinessOrchestrator` 实现 `UnitHandler` 接入既有 `TaskRunner`（复用六态机/预算/检查点，不复制第二套）；阶段间数据**只经检查点** `artifact_ids` 传递；新增 `BusinessRequest` / `EvidenceSeed` / `BusinessStepResult` / `BusinessRunResult`，`status ∈ {SUCCEEDED, PARTIAL, PAUSED, FAILED}` 且只有五步全执行才报 `SUCCEEDED`；登记缺口 G-1（`TaskType` 无全流程成员）/ G-2（源→证据自动抽取未实现）/ G-3（检查点不存业务请求）（D-206 ~ D-220） |
+| 2026-10-14 | v0.1.4 | 新增 **§5.3 Research 实现状态与边界（H-11A）**：`Research` 由 Protocol-only 推进为可执行实现（`ResearchService`），并逐条登记对契约的取舍——只注入 `SourceRegistrarPort`（仅 `register_source`，堵死 F-10）、不承担预算/检查点（Orchestrator 职责）、`filter_and_rank` 增加可选关键字 `target_entity_ids`（对象边界）、`fetch_status=NO_RESULT` 用模块常量表达（不改已审 `FetchStatus`）、`VALIDATION.empty_targets` 未登记故复用 `required_field`（D-191 ~ D-205） |

@@ -1,7 +1,7 @@
 # ERROR_HANDLING —— 错误分类、重试、暂停与恢复
 
-- **版本**：v0.1.2（P1.2-A 契约 + P1.2-B 验收回填 + P2.2 配置错误码）
-- **状态**：主体待人工验收；§2.2 中 `unknown_kind` / `unknown_filter`（R-2 回填）、`config_invalid`（P2.2 新增）为**实现后补录**，均待人工确认
+- **版本**：v0.1.14（P1.2-A 契约 + P1.2-B 验收回填 + P2.2 配置错误码 + P2 证据管线错误码 + P3 两步错误码核对 + P4 对话第一步 3 码**已批准** + P4 记忆第二步 4 码**已批准** + P4 第三步零新增码 + P5 零新增码 + H-11A 零新增码 + H-10A 零新增码 + G-2 零新增码）
+- **状态**：主体待人工验收；§2.2 中 `unknown_kind` / `unknown_filter`（R-2 回填）、`config_invalid`（P2.2 新增）为**实现后补录**，均待人工确认；P2 证据管线新增 6 个码（`tier_namespace_mismatch` / `source_missing` / `entity_missing` / `dangling_reference` / `empty_evidence` / `granularity_unsupported`）同为**实现后补录，待人工确认**（`RUNNING.md` §5.4 E-1 → D-107）；P3 第二步新增 1 个码（`group_dynamics_missing`，INTERFACES §7.2 已点名）**已批准**（P3.3 验收，2026-10-14，E-6 → D-129）；P4 对话第一步新增 3 个码（`speaker_not_participant` / `profile_mismatch` / `NOT_FOUND.session`）**已批准**（P3.6 遗留验收，2026-10-14，H-1 → D-186）；P4 记忆第二步新增 4 个码（`namespace_mismatch` / `confidence_means_missing` / `reference_missing` / `self_reference`）**已批准**（P3.5 验收，2026-10-14，H-3 → D-171）；**P4 第三步（对话↔记忆集成）零新增错误码**——闸门复用 `VALIDATION.gate_rejected` / `VALIDATION.required_field`（D-183）；**P5「评测与加固」同样零新增错误码**——`Evaluation` 核心只读断言、失败复用 `INTERNAL` / `NOT_FOUND.project`（D-190）；**H-10A 业务编排器同样零新增错误码**——证据来源绑定失败复用 `VALIDATION.dangling_reference`、请求校验失败复用 `VALIDATION.required_field`、缺少请求复用 `INTERNAL`（D-211 / D-218）；**G-2 自动抽取同样零新增错误码**——候选来源绑定失败复用 `VALIDATION.dangling_reference`、无根推断由 `Evidence.record_inference` 以 `VALIDATION.no_derivation` 兜底、模型返回非法 JSON 复用 `EXTERNAL_UNAVAILABLE`、其余取值非法走**拒收记录**（`ExtractionOutcome.rejected`）而非报错（D-225 / D-227 / D-232）
 - **相关文档**：`INTERFACES.md`、`ARCHITECTURE.md`、`DATA_MODEL.md`、`DECISIONS.md`
 
 > 本阶段只定义规则。不实现代码、不安装依赖、不调用真实服务。
@@ -54,6 +54,7 @@
 | `VALIDATION.gate_rejected` | VALIDATION | ⛔ | FAILED | 单次行为不得写入稳定性格 |
 | `VALIDATION.evidence_refs_insufficient` | VALIDATION | ⛔ | FAILED | 关系缺少证据支撑 |
 | `VALIDATION.too_few_participants` | VALIDATION | ⛔ | FAILED | 至少需要两个对象 |
+| `VALIDATION.group_dynamics_missing` | VALIDATION | ⛔ | 无（单次调用失败） | ≥3 人的关系档案缺少群体互动描述（`group_dynamics`）（P3 第二步新增，**已批准**，E-6 → D-129） |
 | `VALIDATION.limit_too_large` | VALIDATION | ⛔ | 无（单次调用失败） | 查询条数超限 |
 | `VALIDATION.query_empty` | VALIDATION | ⛔ | 无 | 空查询不会发起请求 |
 | `VALIDATION.unknown_kind` | VALIDATION | ⛔ | 无（单次调用失败） | 实体种类不在注册表内（P1.2-B 实现后回填） |
@@ -63,6 +64,19 @@
 | `VALIDATION.artifact_missing` | VALIDATION | ⛔ | 无（拒绝恢复） | 检查点引用的产出已丢失，不许"假装没做过"（P2.3 新增，T-1 已批准 → D-095） |
 | `VALIDATION.unknown_task_type` | VALIDATION | ⛔ | 无（单次调用失败） | 任务类型不在 `TaskType` 枚举内（P2.3 新增，T-1 已批准 → D-095） |
 | `VALIDATION.stage_sequence_empty` | VALIDATION | ⛔ | 无（单次调用失败） | 阶段序列为空，无从推进（P2.3 新增，T-1 已批准 → D-095） |
+| `VALIDATION.tier_namespace_mismatch` | VALIDATION | ⛔ | 无（单次调用失败） | 证据级别与命名空间不匹配（如非推断证据标 `SYSTEM_DERIVED`）（P2 证据管线新增，**待人工确认**，见 `RUNNING.md` §5.4 E-1 → D-107） |
+| `VALIDATION.source_missing` | VALIDATION | ⛔ | 无（单次调用失败） | 非 INFERENCE 证据必须带 `source_id`（P2 证据管线新增，**待人工确认**，见 E-1 → D-107） |
+| `VALIDATION.entity_missing` | VALIDATION | ⛔ | 无（单次调用失败） | 引用的对象实体不存在（P2 证据管线新增，**待人工确认**，见 E-1 → D-107） |
+| `VALIDATION.dangling_reference` | VALIDATION | ⛔ | 无（单次调用失败） | 引用的记录不存在或指向不一致（事件不属于该来源 / `derived_from` 指向不存在的证据等）（P2 证据管线新增，**待人工确认**，见 E-1 → D-107） |
+| `VALIDATION.empty_evidence` | VALIDATION | ⛔ | 无（单次调用失败） | 稳定性判定至少需要一条证据（P2 证据管线新增，**待人工确认**，见 E-1 → D-107） |
+| `VALIDATION.granularity_unsupported` | VALIDATION | ⛔ | 无（单次调用失败） | 不支持的来源切分粒度（P2 证据管线新增，**待人工确认**，见 E-1 → D-107） |
+| `VALIDATION.speaker_not_participant` | VALIDATION | ⛔ | 无（单次调用失败） | 发言人不在会话参与者内（P4 对话第一步新增，**已批准**，2026-10-14，H-1 → D-186 / INTERFACES §8.2） |
+| `VALIDATION.profile_mismatch` | VALIDATION | ⛔ | 无（单次调用失败） | 会话引用的档案不属于同一批参与者（SS-V3；P4 对话第一步新增，**已批准**，2026-10-14，H-1 → D-186） |
+| `NOT_FOUND.session` | NOT_FOUND | ⛔ | 无（单次调用失败） | 找不到指定会话（`session_id` 非 ConversationSession 前缀或不存在）（P4 对话第一步新增，**已批准**，2026-10-14，H-1 → D-186） |
+| `VALIDATION.namespace_mismatch` | VALIDATION | ⛔ | 无（单次调用失败） | 记忆 `namespace` 与 `source_type` 不自洽（如 `source_type=SIMULATED_DIALOGUE` 但 `namespace≠SIMULATED`，ME-V1；P4 记忆第二步新增，**已批准**（P3.5 验收，2026-10-14，H-3 → D-171 / INTERFACES §9.3）） |
+| `VALIDATION.confidence_means_missing` | VALIDATION | ⛔ | 无（单次调用失败） | 记忆缺少 `confidence_means`（置信度含义说明，防止被当成真实性，ME-V7；P4 记忆第二步新增，**已批准**（P3.5 验收，2026-10-14，H-3 → D-171 / INTERFACES §9.3）） |
+| `VALIDATION.reference_missing` | VALIDATION | ⛔ | 无（单次调用失败） | 记忆引用的证据不存在（`referenced_evidence_ids` 只能引用已存在证据，ME-V3；P4 记忆第二步新增，**已批准**（P3.5 验收，2026-10-14，H-3 → D-171 / INTERFACES §9.3）） |
+| `VALIDATION.self_reference` | VALIDATION | ⛔ | 无（单次调用失败） | 去重/冲突链接到记忆自身（P4 记忆第二步新增，**已批准**（P3.5 验收，2026-10-14，H-3 → D-171 / INTERFACES §9.3）） |
 | `NOT_FOUND.task` / `.project` / `.source` / `.entity` / `.version` | NOT_FOUND | ⛔ | FAILED | 找不到指定对象 |
 | `STATE_CONFLICT.not_pending` | STATE_CONFLICT | ⛔ | 无 | 任务已启动，不能重复启动 |
 | `STATE_CONFLICT.not_running` | STATE_CONFLICT | ⛔ | 无 | 任务未在运行中，无法暂停 |
@@ -429,3 +443,12 @@ Checkpoint = {
 | 2026-10-13 | v0.1 | 初稿：错误分类与错误码表、重试规则、预算四段式闸门、六态转换表、检查点与 resume 算法、隔离违规处置、测试要求 |
 | 2026-10-13 | v0.1.2 | §2.2 补两个 P1.2-B 实现后回填的错误码（`VALIDATION.unknown_kind` / `VALIDATION.unknown_filter`，R-2）与一个 P2.2 新增错误码（`VALIDATION.config_invalid`，配置取值非法/超范围） |
 | 2026-10-13 | v0.1.3 | §2.2 补 4 个 P2.3 新增错误码：`VALIDATION.checkpoint_missing` / `VALIDATION.artifact_missing` / `VALIDATION.unknown_task_type` / `VALIDATION.stage_sequence_empty`（INTERFACES §12.3 已点名这些失败原因，只是原表没列；T-1 已批准 → D-095，"待确认"标记已去除） |
+| 2026-10-13 | v0.1.4 | §2.2 补 6 个 P2 证据管线新增错误码：`VALIDATION.tier_namespace_mismatch` / `source_missing` / `entity_missing` / `dangling_reference` / `empty_evidence` / `granularity_unsupported`（INTERFACES §4.2 已点名这些失败原因，只是原表没列；**同 T-1 口径待人工确认** → D-107 / RUNNING §5.4 E-1） |
+| 2026-10-14 | v0.1.5 | P3 第一步（人格档案基础模块）**错误码核对：零新增**。档案模块全部失败路径复用已有码：`VALIDATION.gate_rejected`（PF-V2 稳定性闸门 / PE-V3 跨版本组）、`VALIDATION.evidence_refs_insufficient`（PF-V1 / D-020 无证据）、`VALIDATION.entity_missing` / `dangling_reference`（引用不存在 / 种类不符 / 证据版本不适用）、`VALIDATION.namespace_forbidden`（PF-V6 模拟隔离）、`VALIDATION.required_field`（形状/枚举/change_reason）、`STATE_CONFLICT.no_new_evidence`（重复创建 / 空转修订）、`NOT_FOUND.entity` / `NOT_FOUND.version`。沿用 T-1 口径：不新增可避免的错误码 |
+| 2026-10-14 | v0.1.6 | P3 第二步（关系档案基础模块）新增 1 个错误码：`VALIDATION.group_dynamics_missing`（≥3 人关系档案缺少群体互动描述；INTERFACES §7.2 已点名、原表未列，**同 T-1 口径待人工确认** → RUNNING §5.6 E-6 / D-128）。其余失败路径全部复用已有码（RL-V1~V6 映射见 RUNNING §5.6） |
+| 2026-10-14 | v0.1.7 | E-6 验收通过：`VALIDATION.group_dynamics_missing` 由"待人工确认"改为**已批准**（D-129）；写入 ERR_HANDLING §2.2 与 DECISIONS §2.19。P3 第二步其余遗留 G-1~G-5 处置：G-1 接受未实现（下一阶段接 AI 再补）、G-2 接受当前表达边界（群体子结构关系的最小建议记后续待办）、G-4 与 Persona 一致全版本保留、G-5 确认刻意不为（符合红线） |
+| 2026-10-14 | v0.1.8 | §2.2 补 3 个 P4 对话第一步新增错误码：`VALIDATION.speaker_not_participant` / `VALIDATION.profile_mismatch` / `NOT_FOUND.session`（INTERFACES §8.2 已点名这些失败原因，只是原表没列；**同 T-1 口径待人工确认** → H-1 / DECISIONS §2.20 D-145） |
+| 2026-10-14 | v0.1.9 | §2.2 补 4 个 P4 记忆第二步新增错误码：`VALIDATION.namespace_mismatch` / `VALIDATION.confidence_means_missing` / `VALIDATION.reference_missing` / `VALIDATION.self_reference`（INTERFACES §9.3 已点名这些失败原因，只是原表没列；**同 T-1 口径待人工确认** → H-3 / DECISIONS §2.21 D-158） |
+| 2026-10-14 | v0.1.10 | ① P3.5 验收：4 个记忆错误码（`VALIDATION.namespace_mismatch` / `confidence_means_missing` / `reference_missing` / `self_reference`）由"待人工确认"改为**已批准**（H-3 → D-171）。② P4 第三步（对话↔记忆集成，用户称 P3.6）**零新增错误码**：写入触发闸门复用既有 `VALIDATION.gate_rejected`（策略未授权 / 候选 scope 非 SESSION）与 `VALIDATION.required_field`（候选缺必填 / 未注入写入端口），见 D-183 | 已实现，**待人工验收** |
+| 2026-10-14 | v0.1.11 | §2.2 中 3 个 P4 对话第一步错误码（`VALIDATION.speaker_not_participant` / `VALIDATION.profile_mismatch` / `NOT_FOUND.session`）由"待人工确认"改为**已批准**（H-1 → D-186，2026-10-14 人工拍板）；补记 P5「评测与加固」零新增错误码（`Evaluation` 核心只读，失败复用 `INTERNAL` / `NOT_FOUND.project`，D-190） | 已实现，**待人工验收** |
+| 2026-10-14 | v0.1.12 | H-11A（Research 最小可运行实现）**零新增错误码**：`plan_queries` 空目标复用 `VALIDATION.required_field`（INTERFACES §5.2 写的 `VALIDATION.empty_targets` 未在本表登记）、空查询复用 `VALIDATION.query_empty`、"实体是否存在"下沉 `Evidence`（`VALIDATION.entity_missing`）；`fetch_status=NO_RESULT` 是业务状态而非错误（用模块常量表达，不改 `FetchStatus`） | 已实现，**待人工验收** |

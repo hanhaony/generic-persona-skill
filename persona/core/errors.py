@@ -10,11 +10,22 @@
       - `VALIDATION.unknown_kind`           实体种类不在 `ENTITY_KINDS` 里（P1.2-B，R-2 已批准）
       - `VALIDATION.unknown_filter`         查询条件用了未登记的过滤键（P1.2-B，R-2 已批准）
       - `VALIDATION.config_invalid`         配置取值非法/超范围（P2.2，**C-1 已批准** → D-083）
-      - `VALIDATION.checkpoint_missing`     任务没有可续跑的检查点（P2.3，待确认）
-      - `VALIDATION.artifact_missing`       检查点引用的产出已丢失（P2.3，待确认）
-      - `VALIDATION.unknown_task_type`      未知的任务类型（P2.3，待确认）
-      - `VALIDATION.stage_sequence_empty`   阶段序列为空（P2.3，待确认）
-    后四个是 `INTERFACES.md` §12.3 已经点名的失败原因，只是 §2.2 的表格里原先没列。
+      - `VALIDATION.checkpoint_missing`     任务没有可续跑的检查点（P2.3，**T-1 已批准** → D-095）
+      - `VALIDATION.artifact_missing`       检查点引用的产出已丢失（P2.3，**T-1 已批准** → D-095）
+      - `VALIDATION.unknown_task_type`      未知的任务类型（P2.3，**T-1 已批准** → D-095）
+      - `VALIDATION.stage_sequence_empty`   阶段序列为空（P2.3，**T-1 已批准** → D-095）
+      - `VALIDATION.tier_namespace_mismatch` 等 6 个证据模块错误码（P2 证据管线，
+        INTERFACES §4.2 已点名，**待人工确认**，见 RUNNING.md §5.4 E-1）
+      - `VALIDATION.group_dynamics_missing`   ≥3 人关系档案缺少群体互动描述
+        （P3.3，INTERFACES §7.2 已点名，**待人工确认**，见 RUNNING.md §5.6 E-6）
+    - `VALIDATION.speaker_not_participant`  发言人不在会话参与者内（P3.4，INTERFACES §8.2 已点名，**待人工确认**，见 RUNNING.md §5.7 H-1）
+    - `VALIDATION.profile_mismatch`          会话引用的档案不属于同一批参与者（P3.4，INTERFACES §8.2 已点名，**待人工确认**，见 RUNNING.md §5.7 H-1）
+    - `NOT_FOUND.session`                    会话不存在（P3.4，INTERFACES §8.2 已点名，**待人工确认**，见 RUNNING.md §5.7 H-1）
+    - `VALIDATION.namespace_mismatch`        记忆 namespace 与 source_type 不自洽（P3.5，INTERFACES §9.3 已点名，**待人工确认**）
+    - `VALIDATION.confidence_means_missing`  记忆缺少 confidence_means（P3.5，INTERFACES §9.3 已点名，**待人工确认**）
+    - `VALIDATION.reference_missing`          记忆引用的证据不存在（P3.5，INTERFACES §9.3 已点名，**待人工确认**）
+    - `VALIDATION.self_reference`            去重/冲突链接到自身（P3.5，INTERFACES §9.3 已点名，**待人工确认**）
+    后四组是 `INTERFACES.md` 已经点名的失败原因，只是 §2.2 的表格里原先没列。
 """
 
 from __future__ import annotations
@@ -55,6 +66,13 @@ class ErrorCode(_StrEnum):
     VALIDATION_GATE_REJECTED = "VALIDATION.gate_rejected"
     VALIDATION_EVIDENCE_REFS_INSUFFICIENT = "VALIDATION.evidence_refs_insufficient"
     VALIDATION_TOO_FEW_PARTICIPANTS = "VALIDATION.too_few_participants"
+    VALIDATION_GROUP_DYNAMICS_MISSING = "VALIDATION.group_dynamics_missing"  # P3.3 新增，待人工确认（INTERFACES §7.2 已点名，见模块顶部说明）
+    VALIDATION_SPEAKER_NOT_PARTICIPANT = "VALIDATION.speaker_not_participant"  # P3.4 新增，待人工确认（INTERFACES §8.2 已点名）
+    VALIDATION_PROFILE_MISMATCH = "VALIDATION.profile_mismatch"  # P3.4 新增，待人工确认（INTERFACES §8.2 已点名）
+    VALIDATION_NAMESPACE_MISMATCH = "VALIDATION.namespace_mismatch"  # P3.5 新增，待人工确认（INTERFACES §9.3 已点名）
+    VALIDATION_CONFIDENCE_MEANS_MISSING = "VALIDATION.confidence_means_missing"  # P3.5 新增，待人工确认（INTERFACES §9.3 已点名）
+    VALIDATION_REFERENCE_MISSING = "VALIDATION.reference_missing"  # P3.5 新增，待人工确认（INTERFACES §9.3 已点名）
+    VALIDATION_SELF_REFERENCE = "VALIDATION.self_reference"  # P3.5 新增，待人工确认（INTERFACES §9.3 已点名）
     VALIDATION_LIMIT_TOO_LARGE = "VALIDATION.limit_too_large"
     VALIDATION_QUERY_EMPTY = "VALIDATION.query_empty"
     VALIDATION_UNKNOWN_KIND = "VALIDATION.unknown_kind"        # 新增，待回填文档
@@ -67,12 +85,21 @@ class ErrorCode(_StrEnum):
     VALIDATION_UNKNOWN_TASK_TYPE = "VALIDATION.unknown_task_type"
     VALIDATION_STAGE_SEQUENCE_EMPTY = "VALIDATION.stage_sequence_empty"
 
+    # P2 证据管线新增：INTERFACES §4.2 已点名的失败原因（T-1 同口径，**待人工确认**）
+    VALIDATION_TIER_NAMESPACE_MISMATCH = "VALIDATION.tier_namespace_mismatch"
+    VALIDATION_SOURCE_MISSING = "VALIDATION.source_missing"
+    VALIDATION_ENTITY_MISSING = "VALIDATION.entity_missing"
+    VALIDATION_DANGLING_REFERENCE = "VALIDATION.dangling_reference"
+    VALIDATION_EMPTY_EVIDENCE = "VALIDATION.empty_evidence"
+    VALIDATION_GRANULARITY_UNSUPPORTED = "VALIDATION.granularity_unsupported"
+
     # —— 找不到 ——
     NOT_FOUND_TASK = "NOT_FOUND.task"
     NOT_FOUND_PROJECT = "NOT_FOUND.project"
     NOT_FOUND_SOURCE = "NOT_FOUND.source"
     NOT_FOUND_ENTITY = "NOT_FOUND.entity"
     NOT_FOUND_VERSION = "NOT_FOUND.version"
+    NOT_FOUND_SESSION = "NOT_FOUND.session"  # P3.4 新增，待人工确认（INTERFACES §8.2 已点名）
 
     # —— 状态冲突 ——
     STATE_CONFLICT_NOT_PENDING = "STATE_CONFLICT.not_pending"
@@ -144,6 +171,13 @@ for _code, _category, _hint in [
     (ErrorCode.VALIDATION_GATE_REJECTED, ErrorCategory.VALIDATION, "单次行为不得写入稳定性格"),
     (ErrorCode.VALIDATION_EVIDENCE_REFS_INSUFFICIENT, ErrorCategory.VALIDATION, "关系缺少证据支撑"),
     (ErrorCode.VALIDATION_TOO_FEW_PARTICIPANTS, ErrorCategory.VALIDATION, "至少需要两个对象"),
+    (ErrorCode.VALIDATION_GROUP_DYNAMICS_MISSING, ErrorCategory.VALIDATION, "三人及以上的关系档案缺少群体互动描述"),
+    (ErrorCode.VALIDATION_SPEAKER_NOT_PARTICIPANT, ErrorCategory.VALIDATION, "发言人不在会话参与者内"),
+    (ErrorCode.VALIDATION_PROFILE_MISMATCH, ErrorCategory.VALIDATION, "会话引用的档案不属于同一批参与者"),
+    (ErrorCode.VALIDATION_NAMESPACE_MISMATCH, ErrorCategory.VALIDATION, "记忆 namespace 与 source_type 不自洽"),
+    (ErrorCode.VALIDATION_CONFIDENCE_MEANS_MISSING, ErrorCategory.VALIDATION, "记忆缺少 confidence_means（置信度含义说明）"),
+    (ErrorCode.VALIDATION_REFERENCE_MISSING, ErrorCategory.VALIDATION, "记忆引用的证据不存在"),
+    (ErrorCode.VALIDATION_SELF_REFERENCE, ErrorCategory.VALIDATION, "不允许链接到记忆自身"),
     (ErrorCode.VALIDATION_LIMIT_TOO_LARGE, ErrorCategory.VALIDATION, "查询条数超限"),
     (ErrorCode.VALIDATION_QUERY_EMPTY, ErrorCategory.VALIDATION, "空查询不会发起请求"),
     (ErrorCode.VALIDATION_UNKNOWN_KIND, ErrorCategory.VALIDATION, "未知的实体种类"),
@@ -153,11 +187,18 @@ for _code, _category, _hint in [
     (ErrorCode.VALIDATION_ARTIFACT_MISSING, ErrorCategory.VALIDATION, "检查点引用的产出已丢失"),
     (ErrorCode.VALIDATION_UNKNOWN_TASK_TYPE, ErrorCategory.VALIDATION, "未知的任务类型"),
     (ErrorCode.VALIDATION_STAGE_SEQUENCE_EMPTY, ErrorCategory.VALIDATION, "阶段序列不能为空"),
+    (ErrorCode.VALIDATION_TIER_NAMESPACE_MISMATCH, ErrorCategory.VALIDATION, "证据级别与命名空间不匹配"),
+    (ErrorCode.VALIDATION_SOURCE_MISSING, ErrorCategory.VALIDATION, "非推断证据必须带来源"),
+    (ErrorCode.VALIDATION_ENTITY_MISSING, ErrorCategory.VALIDATION, "引用的对象实体不存在"),
+    (ErrorCode.VALIDATION_DANGLING_REFERENCE, ErrorCategory.VALIDATION, "引用的记录不存在或指向不一致"),
+    (ErrorCode.VALIDATION_EMPTY_EVIDENCE, ErrorCategory.VALIDATION, "稳定性判定至少需要一条证据"),
+    (ErrorCode.VALIDATION_GRANULARITY_UNSUPPORTED, ErrorCategory.VALIDATION, "不支持的切分粒度"),
     (ErrorCode.NOT_FOUND_TASK, ErrorCategory.NOT_FOUND, "找不到指定任务"),
     (ErrorCode.NOT_FOUND_PROJECT, ErrorCategory.NOT_FOUND, "找不到指定项目"),
     (ErrorCode.NOT_FOUND_SOURCE, ErrorCategory.NOT_FOUND, "找不到指定来源"),
     (ErrorCode.NOT_FOUND_ENTITY, ErrorCategory.NOT_FOUND, "找不到指定对象"),
     (ErrorCode.NOT_FOUND_VERSION, ErrorCategory.NOT_FOUND, "找不到指定版本"),
+    (ErrorCode.NOT_FOUND_SESSION, ErrorCategory.NOT_FOUND, "找不到指定会话"),
     (ErrorCode.STATE_CONFLICT_NOT_PENDING, ErrorCategory.STATE_CONFLICT, "任务已启动，不能重复启动"),
     (ErrorCode.STATE_CONFLICT_NOT_RUNNING, ErrorCategory.STATE_CONFLICT, "任务未在运行中，无法暂停"),
     (ErrorCode.STATE_CONFLICT_NOT_PAUSED, ErrorCategory.STATE_CONFLICT, "只有暂停中的任务能恢复"),

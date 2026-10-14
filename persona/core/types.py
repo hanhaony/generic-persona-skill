@@ -183,6 +183,30 @@ class Checkpoint:
 
 
 @dataclass
+class SourceMaterial:
+    """一份**检索到的原始材料**（候选 claim 的原料）。
+
+    放在 `core` 而不是某个业务模块里，是为了让 `L4 Research`（产出方）与
+    `L4 抽取器`（消费方）都能引用它——ARCHITECTURE §3 规定**同层之间互不调用**，
+    把共享形状下沉到 core 才能在不出循环依赖的前提下传递材料。
+
+    ⚠️ 这是"材料"不是"证据"：未校验、未分级、未登记为 `EvidenceItem`。
+    `snippet` 是检索返回的摘要，**不是正文全文**（正文抓取未实现，H-17）。
+    """
+
+    source_id: str = ""                 # 本次研究登记 / 去重命中的来源 ID
+    title: str = ""
+    url: str = ""
+    canonical_key: str = ""
+    snippet: str = ""                   # 检索摘要（非全文）
+    published_at: str | None = None     # 原文字符串，未做日期推断
+    source_kind: str = ""
+    subject_entity_ids: list[str] = field(default_factory=list)
+    target_display_names: list[str] = field(default_factory=list)
+    query_text: str = ""
+
+
+@dataclass
 class NamespaceGateReport:
     """命名空间闸门检查结果（用于 P1.2-B 的自检展示）。"""
 

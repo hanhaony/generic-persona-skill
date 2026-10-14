@@ -149,15 +149,32 @@ def _print_info() -> None:
     print("    persona.core         公共契约（枚举 / ID / 时间 / 错误码 / Result / 上下文）")
     print("    persona.storage      SQLite 最小读写（不做业务判断）")
     print("    persona.providers    外部服务统一接口 + Mock（全程离线，不需要 API Key）")
-    print("    persona.orchestrator 六态状态机 + 任务服务 + 预算闸门 + Mock 执行器（P2.3）")
-    print("    persona.modules      各业务模块的端口协议（只声明，不实现）")
+    print("    persona.orchestrator 六态状态机 + 任务服务 + 预算闸门 + Mock 执行器（P2.3）\n"
+          "                        + BusinessOrchestrator（业务编排：Research→Evidence→\n"
+          "                        Persona→Relationship→Dialogue，复用既有任务能力）")
+    print("    persona.modules      业务模块端口协议；ResearchService（资料搜集：检索计划/检索/")
+    print("                        过滤排序/经 Evidence 登记来源；不写证据表）已实现、")
+    print("                        EvidenceService（来源/事件/证据管理）、")
+    print("                        PersonaService（人格档案：创建/版本/证据关联/闸门）、")
+    print("                        RelationshipService（关系档案：双向视角/共同经历/群体互动）、")
+    print("                        DialogueService（对话：会话/轮次/动态发言/模拟隔离，")
+    print("                        已接入 Memory：按规则检索模拟记忆 + 显式授权才写入）、")
+    print("                        MemoryService（长期记忆：写入/检索/去重/冲突/更新/过期/删除）、")
+    print("                        EvaluationService（只读评测：INV-1~4 不变式/依赖检查/结构指标）已实现")
     print("    persona.cli          命令行入口（本命令）")
     print("  任务六态    : " + " / ".join(s.value for s in TaskStatus))
     print("  命名空间    : " + " / ".join(n.value for n in ProvenanceNamespace))
     print("  写入闸门    :")
     for kind, allowed in sorted(NAMESPACE_WRITE_GATE.items()):
         print(f"    {kind:<22} 仅允许 " + ", ".join(sorted(n.value for n in allowed)))
-    print("  说明        : 本阶段只有骨架，研究/蒸馏/对话/记忆等业务逻辑**尚未实现**。")
+    print("  说明        : **真实检索接入**与 AI 蒸馏尚未实现；`task run` 推进的是"
+          "抽象工作单元，不是真实业务；"
+          "`ResearchService` 只经 `Provider` 抽象检索（当前全是 Mock），不接真实搜索 API；"
+          "`BusinessOrchestrator` 已可一条命令跑完五阶段业务链，但**证据 claim 仍需调用方显式提供**"
+          "（源→证据自动抽取未实现），故 AC-1/AC-2 仅为部分满足；"
+          "对话/记忆只做本地基础能力，不调真实模型、不接入外网检索；"
+          "对话与记忆已打通闭环，但**默认不把对话写入长期记忆**"
+          "（须显式授权 + 显式候选）。`EvaluationService` 提供只读不变式与依赖检查。")
 
 
 def _print_selftest() -> int:

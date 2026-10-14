@@ -104,6 +104,33 @@ class SourceEventType(_StrEnum):
     OTHER = "OTHER"
 
 
+class Reliability(_StrEnum):
+    """来源可靠度（DATA_MODEL §4.3）。**是"可信度参考"，不等于真伪**（D-010）。"""
+
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+    UNKNOWN = "UNKNOWN"
+
+
+class FetchStatus(_StrEnum):
+    """来源抓取状态（DATA_MODEL §4.3）。"""
+
+    OK = "OK"
+    PARTIAL = "PARTIAL"
+    FAILED = "FAILED"
+    BLOCKED = "BLOCKED"
+
+
+class EvidenceStatus(_StrEnum):
+    """证据状态（DATA_MODEL §4.5）。**永不物理删除**，只改状态（D-025）。"""
+
+    ACTIVE = "ACTIVE"
+    SUPERSEDED = "SUPERSEDED"   # 被更完整的证据取代
+    DISPUTED = "DISPUTED"       # 卷入冲突（冲突本身不裁决，D-013）
+    WITHDRAWN = "WITHDRAWN"     # 撤回（保留记录并说明原因）
+
+
 class CanonLevel(_StrEnum):
     """虚构内容的"正式程度"：官方设定 / 非官方解读，不可混为一谈。"""
 
@@ -149,6 +176,42 @@ class DivergenceKind(_StrEnum):
     VERSION_DIFFERENCE = "VERSION_DIFFERENCE"  # 版本差异（不同改编/时间线）
 
 
+class ReviewStatus(_StrEnum):
+    """冲突记录的人工审阅状态（DATA_MODEL §4.6）。
+
+    ⚠️ 枚举里**故意没有 RESOLVED**（D-013）：一旦结构上允许"已解决"，
+    未解决的冲突就会被下游当成确定事实。最彻底的防止办法是这个选项压根不存在。
+    """
+
+    UNREVIEWED = "UNREVIEWED"
+    ACKNOWLEDGED = "ACKNOWLEDGED"
+
+
+class Cardinality(_StrEnum):
+    """关系档案的参与者规模（DATA_MODEL §4.8，P3.3 关系档案基础模块补入代码）。
+
+    `PAIR` = 两人关系；`GROUP` = 三人及以上的群体关系。
+    群体关系**存储为一份完整档案**（`participant_entity_ids` ≥ 3），
+    不拆成互不相关的两人关系（用户目标 6 / D-017）。
+    """
+
+    PAIR = "PAIR"
+    GROUP = "GROUP"
+
+
+class ProfileStatus(_StrEnum):
+    """人物档案状态（DATA_MODEL §4.7，P3.2 人格档案基础模块补入代码）。
+
+    `INSUFFICIENT_EVIDENCE` **不是失败**（D-008）：资料不足时如实标记、
+    继续流程，剩下的缺口进 `open_questions`（D-020）。
+    """
+
+    OK = "OK"
+    INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
+    AMBIGUOUS = "AMBIGUOUS"
+    CONFLICTED = "CONFLICTED"
+
+
 class MemorySourceType(_StrEnum):
     """记忆是从哪儿来的。"""
 
@@ -172,6 +235,52 @@ class MemoryStatus(_StrEnum):
     EXPIRED = "EXPIRED"
     ARCHIVED = "ARCHIVED"
     DELETED = "DELETED"         # 软删除（D-025：永不物理删除）
+
+
+# --------------------------------------------------------------------------
+# 3b. 对话会话（DATA_MODEL §4.9）
+# --------------------------------------------------------------------------
+
+
+class SessionStatus(_StrEnum):
+    """对话会话状态（DATA_MODEL §4.9）。"""
+
+    ACTIVE = "ACTIVE"
+    PAUSED = "PAUSED"
+    ENDED = "ENDED"
+
+
+class MemoryScope(_StrEnum):
+    """记忆作用域（DATA_MODEL §4.9 / §4.10）。"""
+
+    SESSION = "SESSION"
+    ENTITY = "ENTITY"
+    RELATIONSHIP = "RELATIONSHIP"
+    PROJECT = "PROJECT"
+
+
+class DerivedKind(_StrEnum):
+    """派生产物种类（DATA_MODEL §4.11 / §5.1）。"""
+
+    SUMMARY = "SUMMARY"    # 摘要压缩
+    INDEX = "INDEX"        # 检索索引
+    CACHE = "CACHE"        # 缓存
+
+
+class DerivedStatus(_StrEnum):
+    """派生产物生命周期（DATA_MODEL §4.11 / §5.1）。"""
+
+    FRESH = "FRESH"                # 基于仍 ACTIVE 的记忆，可用
+    STALE = "STALE"                # 来源部分过期，待重建
+    INVALIDATED = "INVALIDATED"    # 来源已删/过期，必须失效
+
+
+class PurgeState(_StrEnum):
+    """记忆物理清理状态（DATA_MODEL §4.10 / §5.1，Q-21）。"""
+
+    NONE = "NONE"
+    PENDING_PURGE = "PENDING_PURGE"    # 软删除后进入 30 天宽限期
+    PURGED = "PURGED"                  # 宽限期满，逻辑不可达（记录行保留，D-025）
 
 
 # --------------------------------------------------------------------------

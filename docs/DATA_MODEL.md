@@ -638,6 +638,22 @@ flowchart LR
 
 **关联方式**：外键 `participant_entity_ids`（多对多）；字段级 `evidence_refs`。
 
+**`GroupDynamics`（≥3 人时的群体互动结构，D-121 定形）**：
+
+> DATA_MODEL 原 §4.8 只声明了 `group_dynamics: GroupDynamics | None` 字段，未定义其内嵌结构。
+> 该结构在关系模块实现时定形（见 `persona/modules/relationship.py` 的 `GroupDynamics`），
+> 此处补为权威描述，避免文档与代码长期对不上。
+
+| 字段 | 类型 | 必填 | 含义 |
+| --- | --- | --- | --- |
+| `alliances` | `list[ProfileItem]` | ⭕ | 联盟 / 抱团（谁和谁更亲近） |
+| `exclusion` | `list[ProfileItem]` | ⭕ | 站队 / 冷落（谁被边缘化） |
+| `relay` | `list[ProfileItem]` | ⭕ | 传话 / 信息中转（谁在中间传话） |
+| `note` | `str` | ⭕ | 自由文本备注；群体互动三个板块全空时**必须**写 note 说明缺口（D-020 / RL-V3 同口径） |
+
+- `alliances` / `exclusion` / `relay` 的每一项都是 `ProfileItem`（带 `evidence_refs`，与关系其他板块一致，RL-V4）；`note` 是唯一的非条目字段。
+- 校验（RL-V3）：`participant_entity_ids` 长度 ≥ 3 时 `group_dynamics` 必填——三个板块至少一项有内容，**或** `note` 非空说明缺口；长度 = 2 时 `group_dynamics` 必须为 `None`。
+
 **数据来源**：`Relationship` 模块蒸馏（`namespace = SYSTEM_DERIVED`）。
 
 **生命周期**：版本化更新。
