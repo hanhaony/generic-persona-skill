@@ -307,10 +307,35 @@ class TestCollect(FixtureTestCase):
         self.assertEqual(result.error.code, ErrorCode.BUDGET_EXCEEDED)
 
     def test_search_metadata_is_passed_through_verbatim(self):
+        """调用方的 metadata **原样**透传（业务代码不猜 `fixture_key`）。
+
+        P4.5 起本模块会**额外**附一个 `idempotency_key`（逐笔用量账本需要它
+        把"预留"和"结算"对上），因此断言从"完全相等"细化为：
+        调用方的键原样在 + 只多了这一个键。
+        """
         provider = MockResearchProvider({"阿雾": [MATERIAL_A]})
         svc = self.fx.service(provider, search_metadata={"fixture_key": "identity"})
         unwrap(svc.collect(self.fx.ctx, PlannedQuery(query_text="阿雾")))
-        self.assertEqual(provider.last_metadata, {"fixture_key": "identity"})
+        self.assertEqual(provider.last_metadata["fixture_key"], "identity")
+        self.assertEqual(
+            set(provider.last_metadata) - {"fixture_key"}, {"idempotency_key"})
+
+    def test_idempotency_key_is_stable_for_same_request(self):
+        """同一请求意图 → 同一幂等键（这是账本不重复记账的前提）。"""
+        provider = MockResearchProvider({"阿雾": [MATERIAL_A]})
+        svc = self.fx.service(provider)
+        unwrap(svc.collect(self.fx.ctx, PlannedQuery(query_text="阿雾")))
+        first = provider.last_metadata["idempotency_key"]
+        unwrap(svc.collect(self.fx.ctx, PlannedQuery(query_text="阿雾")))
+        self.assertEqual(first, provider.last_metadata["idempotency_key"])
+
+    def test_idempotency_key_differs_for_different_requests(self):
+        provider = MockResearchProvider({"阿雾": [MATERIAL_A], "雾港": [MATERIAL_A]})
+        svc = self.fx.service(provider)
+        unwrap(svc.collect(self.fx.ctx, PlannedQuery(query_text="阿雾")))
+        a = provider.last_metadata["idempotency_key"]
+        unwrap(svc.collect(self.fx.ctx, PlannedQuery(query_text="雾港")))
+        self.assertNotEqual(a, provider.last_metadata["idempotency_key"])
 
 
 # --------------------------------------------------------------------------

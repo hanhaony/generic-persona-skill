@@ -73,6 +73,40 @@ DDL_STATEMENTS: tuple[str, ...] = (
     """
     CREATE INDEX IF NOT EXISTS idx_usage_scope ON usage_records (scope)
     """,
+    # 外部调用**逐笔**用量账本（P4.5 任务一）
+    #
+    # 与既有 `usage_records` 的区别：`usage_records` 记的是**聚合增量**
+    # （requests / tokens / cost_estimate），无法区分操作类型、请求成败、
+    # 费用是"估算"还是"实际"。本表逐笔记录，供追溯、幂等与人工核对。
+    #
+    # 采用**新增表**而不是改既有表：既 `CREATE TABLE IF NOT EXISTS` 的语义
+    # 决定既有库不会自动获得新列，新增表才能对旧库平滑生效（不删数据、不迁移）。
+    """
+    CREATE TABLE IF NOT EXISTS external_usage_records (
+        idempotency_key   TEXT PRIMARY KEY,   -- 幂等主键：同一请求只记一笔
+        provider          TEXT NOT NULL,      -- 如 tavily
+        operation         TEXT NOT NULL,      -- SEARCH / EXTRACT
+        outcome           TEXT NOT NULL,      -- SUCCEEDED / FAILED
+        requested_at      TEXT NOT NULL,
+        request_id        TEXT,               -- 服务端 request_id（失败时为 NULL）
+        unit_count        INTEGER NOT NULL DEFAULT 0,
+        success_unit_count INTEGER,           -- 成功单元数（extract 成功 URL 数）
+        cost_estimate     REAL,               -- 估算（按官方费率），未知为 NULL
+        cost_confirmed    REAL,               -- 实际（响应 usage.credits），未知为 NULL
+        currency          TEXT NOT NULL DEFAULT 'UNKNOWN',
+        cost_source       TEXT NOT NULL,      -- PROVIDER_USAGE / OFFICIAL_RATE / NONE
+        cost_status       TEXT NOT NULL,      -- CONFIRMED / UNKNOWN / NOT_CHARGED
+        task_id           TEXT,
+        run_id            TEXT,
+        trace_ref         TEXT
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_ext_usage_task ON external_usage_records (task_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_ext_usage_status ON external_usage_records (cost_status)
+    """,
     # 审计日志：只增不改不删
     """
     CREATE TABLE IF NOT EXISTS audit_records (

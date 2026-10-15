@@ -92,6 +92,7 @@ class ErrorCode(_StrEnum):
     VALIDATION_DANGLING_REFERENCE = "VALIDATION.dangling_reference"
     VALIDATION_EMPTY_EVIDENCE = "VALIDATION.empty_evidence"
     VALIDATION_GRANULARITY_UNSUPPORTED = "VALIDATION.granularity_unsupported"
+    VALIDATION_COMPLIANCE_DENIED = "VALIDATION.compliance_denied"  # 合规钩子拒绝（不可重试）
 
     # —— 找不到 ——
     NOT_FOUND_TASK = "NOT_FOUND.task"
@@ -115,6 +116,7 @@ class ErrorCode(_StrEnum):
     EXTERNAL_UNAVAILABLE = "EXTERNAL_UNAVAILABLE"
     EXTERNAL_AUTH = "EXTERNAL_AUTH"
     EXTERNAL_QUOTA = "EXTERNAL_QUOTA"
+    EXTERNAL_RESPONSE_INVALID = "EXTERNAL_RESPONSE_INVALID"  # 响应格式错误（不可重试）
 
     # —— 存储 ——
     STORAGE_READ_FAILED = "STORAGE.read_failed"
@@ -193,6 +195,7 @@ for _code, _category, _hint in [
     (ErrorCode.VALIDATION_DANGLING_REFERENCE, ErrorCategory.VALIDATION, "引用的记录不存在或指向不一致"),
     (ErrorCode.VALIDATION_EMPTY_EVIDENCE, ErrorCategory.VALIDATION, "稳定性判定至少需要一条证据"),
     (ErrorCode.VALIDATION_GRANULARITY_UNSUPPORTED, ErrorCategory.VALIDATION, "不支持的切分粒度"),
+    (ErrorCode.VALIDATION_COMPLIANCE_DENIED, ErrorCategory.VALIDATION, "合规检查未通过，操作被拒绝"),
     (ErrorCode.NOT_FOUND_TASK, ErrorCategory.NOT_FOUND, "找不到指定任务"),
     (ErrorCode.NOT_FOUND_PROJECT, ErrorCategory.NOT_FOUND, "找不到指定项目"),
     (ErrorCode.NOT_FOUND_SOURCE, ErrorCategory.NOT_FOUND, "找不到指定来源"),
@@ -210,6 +213,7 @@ for _code, _category, _hint in [
     (ErrorCode.EXTERNAL_UNAVAILABLE, ErrorCategory.EXTERNAL_UNAVAILABLE, "外部服务暂时不可用"),
     (ErrorCode.EXTERNAL_AUTH, ErrorCategory.EXTERNAL_AUTH, "凭据无效，请检查配置"),
     (ErrorCode.EXTERNAL_QUOTA, ErrorCategory.EXTERNAL_QUOTA, "供应商配额已用尽"),
+    (ErrorCode.EXTERNAL_RESPONSE_INVALID, ErrorCategory.EXTERNAL_UNAVAILABLE, "外部服务返回了无法解析的响应"),
     (ErrorCode.STORAGE_READ_FAILED, ErrorCategory.STORAGE, "读取本地数据失败"),
     (ErrorCode.STORAGE_WRITE_FAILED, ErrorCategory.STORAGE, "写入本地数据失败"),
     (ErrorCode.STORAGE_CONFLICT, ErrorCategory.STORAGE, "并发写冲突"),

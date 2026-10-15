@@ -161,7 +161,8 @@ class TestOfflineGuarantee(unittest.TestCase):
 class TestRegistry(unittest.TestCase):
     def test_default_registry_names(self):
         registry = default_registry()
-        self.assertEqual(registry.names(), ["failing", "fake", "recording"])
+        # P4.2 起注册表新增真实 Provider "tavily"（仅注册、不被离线护栏包裹）
+        self.assertEqual(registry.names(), ["failing", "fake", "recording", "tavily"])
 
     def test_get_unknown_name_fails(self):
         registry = default_registry()

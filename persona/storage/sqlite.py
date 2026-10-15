@@ -27,9 +27,13 @@ from ..core.ids import new_id
 from ..core.result import Err, Ok, Result, UsageDelta
 from ..core.temporal import utc_now, to_iso
 from ..core.types import (
+    COST_UNKNOWN,
     MAX_QUERY_LIMIT,
+    OUTCOME_FAILED,
     BudgetUsage,
     Checkpoint,
+    ExternalUsageRecord,
+    ExternalUsageTotals,
     Page,
     Query,
     ReferenceReport,
@@ -482,6 +486,96 @@ class SqliteStorage:
             return Err(new_error(ErrorCode.STORAGE_WRITE_FAILED, f"记录用量失败：{exc}",
                                  trace_ref=ctx.trace_ref))
         return Ok(None)
+
+    def record_external_usage(
+        self,
+        ctx: CallContext,
+        record: ExternalUsageRecord,
+    ) -> Result[bool]:
+        """记一笔**外部调用**的逐笔用量。**幂等**：主键冲突视为已记过，不重复计。
+
+        返回 `Ok(True)` = 真的写入了；`Ok(False)` = 同一 `idempotency_key` 已存在，
+        忽略（重试/任务恢复靠这个保证不重复计费——这是账本幂等性的**存储层兜底**，
+        内存账本之外再上数据库主键，双保险）。
+        """
+        if ctx.dry_run:
+            return Ok(False)
+        try:
+            self.connect().execute(
+                "INSERT INTO external_usage_records (idempotency_key, provider, operation,"
+                " outcome, requested_at, request_id, unit_count, success_unit_count,"
+                " cost_estimate, cost_confirmed, currency, cost_source, cost_status,"
+                " task_id, run_id, trace_ref)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                record.to_row(),
+            )
+        except sqlite3.IntegrityError:
+            return Ok(False)          # 幂等键已存在 → 已记过，不再重复
+        except sqlite3.Error as exc:
+            return Err(new_error(ErrorCode.STORAGE_WRITE_FAILED,
+                                 f"记录外部用量失败：{exc}", trace_ref=ctx.trace_ref))
+        return Ok(True)
+
+    def external_usage_report(
+        self,
+        ctx: CallContext,
+        *,
+        task_id: str | None = None,
+    ) -> Result[ExternalUsageTotals]:
+        """汇总外部用量：估算、实际、未知三者分开报。"""
+        if task_id is not None:
+            sql = ("SELECT * FROM external_usage_records WHERE task_id = ?")
+            params: tuple = (task_id,)
+        else:
+            sql = "SELECT * FROM external_usage_records"
+            params = ()
+        try:
+            rows = self.connect().execute(sql, params).fetchall()
+        except sqlite3.Error as exc:
+            return Err(new_error(ErrorCode.STORAGE_READ_FAILED,
+                                 f"汇总外部用量失败：{exc}", trace_ref=ctx.trace_ref))
+
+        totals = ExternalUsageTotals()
+        for r in rows:
+            totals.requests += 1
+            if r["outcome"] == OUTCOME_FAILED:
+                totals.failed_requests += 1
+            if r["cost_status"] == COST_UNKNOWN:
+                totals.unknown_requests += 1
+            if r["cost_confirmed"] is not None:
+                totals.confirmed_cost = (totals.confirmed_cost or 0.0) + r["cost_confirmed"]
+            if r["cost_estimate"] is not None:
+                totals.estimated_cost += r["cost_estimate"]
+            totals.by_operation[r["operation"]] = (
+                totals.by_operation.get(r["operation"], 0) + 1)
+        return Ok(totals)
+
+    def external_usage_records(
+        self,
+        ctx: CallContext,
+        *,
+        task_id: str | None = None,
+        cost_status: str | None = None,
+    ) -> Result[list[ExternalUsageRecord]]:
+        """列出外部用量记录（供人工核对）。"""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if task_id is not None:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        if cost_status is not None:
+            clauses.append("cost_status = ?")
+            params.append(cost_status)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        try:
+            rows = self.connect().execute(
+                f"SELECT * FROM external_usage_records{where} ORDER BY requested_at",
+                tuple(params),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            return Err(new_error(ErrorCode.STORAGE_READ_FAILED,
+                                 f"读取外部用量失败：{exc}", trace_ref=ctx.trace_ref))
+        return Ok([ExternalUsageRecord.from_row(r) for r in rows])
 
     def usage_report(self, ctx: CallContext, scope: str) -> Result[UsageReport]:
         """汇总某个 scope（task_id / project_id）的用量。"""

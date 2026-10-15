@@ -291,7 +291,12 @@ class TestSecretSafety(unittest.TestCase):
                              ".env.example 不得写入任何密钥（哪怕是假的）")
 
     def test_no_getenv_outside_config_package(self):
-        """D-077：除了 persona/config，其它包不许自己读环境变量。"""
+        """D-077：除了 persona/config，其它包不许自己读环境变量。
+
+        用 AST 扫描真实代码节点（属性访问/名称引用），忽略文档字符串与注释，
+        因此 tavily.py 等模块里"本类从不读取 os.getenv"之类的说明文字不会误报。
+        """
+        import ast
         import pathlib
 
         package_root = pathlib.Path(__file__).resolve().parents[1] / "persona"
@@ -300,8 +305,19 @@ class TestSecretSafety(unittest.TestCase):
             if file_path.parent.name == "config":
                 continue
             text = file_path.read_text(encoding="utf-8")
-            if "getenv" in text or "os.environ" in text:
-                offenders.append(str(file_path.relative_to(package_root)))
+            try:
+                tree = ast.parse(text)
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                # os.getenv(...) / os.environ[...] / os.environ.get(...)
+                if isinstance(node, ast.Attribute) and node.attr in ("getenv", "environ"):
+                    offenders.append(str(file_path.relative_to(package_root)))
+                    break
+                # bare getenv(...) 引用
+                if isinstance(node, ast.Name) and node.id == "getenv":
+                    offenders.append(str(file_path.relative_to(package_root)))
+                    break
         self.assertEqual(offenders, [])
 
 

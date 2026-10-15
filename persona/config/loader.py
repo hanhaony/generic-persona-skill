@@ -46,6 +46,29 @@ WARNING_UNKNOWN_KEY = "CONFIG_UNKNOWN_KEY"
 # .env 里出现敏感变量（已忽略）
 WARNING_SECRET_IN_DOTENV = "CONFIG_SECRET_IN_DOTENV"
 
+# 用户更顺手的短名 → 集中配置字段（`PERSONA_*` 本体）。D-077 要求所有配置集中在
+# `persona.config` 且统一前缀；这里只做"别名映射"，最终仍以 `PERSONA_*` 为准、走同一校验。
+ENV_ALIASES: dict[str, str] = {
+    "SEARCH_PROVIDER": "PERSONA_PROVIDER",
+    "RESEARCH_MAX_QUERIES": "PERSONA_RESEARCH_MAX_QUERIES",
+    "RESEARCH_MAX_RESULTS": "PERSONA_RESEARCH_MAX_RESULTS",
+    "RESEARCH_MAX_EXTRACTS": "PERSONA_RESEARCH_MAX_EXTRACTS",
+    "RESEARCH_MAX_COST": "PERSONA_RESEARCH_MAX_COST",
+}
+# 密钥别名：TAVILY_API_KEY 映射到"搜索密钥"（与 PERSONA_SEARCH_API_KEY 等价）。
+ENV_SECRET_ALIASES: dict[str, str] = {
+    "TAVILY_API_KEY": ENV_SEARCH_API_KEY,
+}
+
+
+def _apply_aliases(raw: dict[str, str]) -> dict[str, str]:
+    """把用户短名键重命名为集中字段名（非 PERSONA_ 短名只在此消歧义）。"""
+    out: dict[str, str] = {}
+    for key, value in raw.items():
+        target = ENV_ALIASES.get(key, key)
+        out[target] = value
+    return out
+
 
 # ---------------------------------------------------------------------------
 # 极简 .env 解析（不引入 python-dotenv，D-079）
@@ -122,7 +145,7 @@ def load_settings(
         env_file = Path(dotenv_path) if dotenv_path is not None else (
             Path(cwd) if cwd is not None else Path.cwd()
         ) / DEFAULT_DOTENV_NAME
-        for key, raw in read_dotenv(env_file).items():
+        for key, raw in _apply_aliases(read_dotenv(env_file)).items():
             if not key.startswith(ENV_PREFIX):
                 continue                      # 非本项目的变量，与本项目无关
             if key in SECRET_ENV_KEYS:
@@ -140,7 +163,7 @@ def load_settings(
             sources[_spec_of(key)] = "dotenv"
 
     # ---------- 第 3 层：环境变量 ----------
-    for key, raw in environment.items():
+    for key, raw in _apply_aliases(environment).items():
         if not key.startswith(ENV_PREFIX):
             continue
         if key in SECRET_ENV_KEYS:
@@ -158,7 +181,7 @@ def load_settings(
         sources[_spec_of(key)] = "env"
 
     # ---------- 第 4 层：显式 overrides（只覆盖非敏感项） ----------
-    for key, value in dict(overrides or {}).items():
+    for key, value in _apply_aliases(dict(overrides or {})).items():
         if key in SECRET_ENV_KEYS:
             warnings.append(WarningNote(
                 code=WARNING_SECRET_IN_DOTENV,
@@ -180,9 +203,12 @@ def load_settings(
 
     # ---------- 敏感配置：只从环境变量来 ----------
     # 用**位置参数**构造：既避免写出字段名，也保证顺序固定
+    # 搜索密钥支持别名 TAVILY_API_KEY（与 PERSONA_SEARCH_API_KEY 等价）
+    search_key = _clean(environment.get(ENV_SEARCH_API_KEY)) \
+        or _clean(environment.get("TAVILY_API_KEY"))
     secrets = Secrets(
         _clean(environment.get(ENV_PROVIDER_API_KEY)),
-        _clean(environment.get(ENV_SEARCH_API_KEY)),
+        search_key,
     )
     settings = replace(settings, secrets=secrets, sources=dict(sources))
 

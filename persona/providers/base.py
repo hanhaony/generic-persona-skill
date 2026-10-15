@@ -24,6 +24,7 @@ class CapabilitySet:
     supports_chat: bool = False
     supports_search: bool = False
     supports_structured_output: bool = False
+    supports_extract: bool = False  # 是否支持"按 URL 抓取正文"（如 Tavily Extract）
     max_context_tokens: int | None = None
     max_output_tokens: int | None = None
     languages: list[str] = field(default_factory=lambda: ["zh", "en"])
@@ -96,6 +97,61 @@ class SearchResult:
 class SearchResponse:
     results: list[SearchResult] = field(default_factory=list)
     usage: UsageDelta | None = None
+
+
+@dataclass
+class ExtractResult:
+    """一次正文抓取的标准化结果（Tavily Extract 等接口的归一化形状）。
+
+    `raw_content` 是网页正文原文；为遵守"默认不永久保存全部网页全文"，
+    上层（如 `ResearchService`）只把它留在内存供下游抽取使用，**不会**写进
+    `Source.content_ref`（除非显式开启 retention 策略）。
+    """
+
+    url: str = ""
+    title: str = ""
+    raw_content: str = ""          # 网页正文（可能很长；默认不落库）
+    excerpt: str = ""              # 截断后的摘要（默认可用于落库）
+    content_type: str = ""         # 内容类型（如 text/html）
+    published_at: str | None = None
+    truncated: bool = False        # 是否因长度策略被截断
+    error: str | None = None       # 单条抓取失败原因（不影响其它 URL）
+
+
+@dataclass
+class ExtractResponse:
+    """正文抓取批处理响应。"""
+
+    results: list[ExtractResult] = field(default_factory=list)
+    usage: UsageDelta | None = None
+
+
+@dataclass
+class ExtractRequest:
+    """正文抓取请求：给一组 URL，取回网页正文（Tavily Extract 等）。
+
+    P4.5 新增的 4 个字段**全部来自 Tavily 官方文档确认过**的参数
+    （docs.tavily.com/documentation/api-reference/endpoint/extract，2026-10-15 核对）：
+
+    - `extract_depth`：`basic` / `advanced`（官方默认 basic）
+    - `format`：`markdown` / `text`（官方默认 markdown）
+    - `query`：内容块相关性重排依据
+    - `chunks_per_source`：每源返回的内容块数（1..5，**官方明确：仅在提供 `query` 时可用**）
+
+    默认值一律 `None` = **不发送该参数**，让服务端用官方默认；
+    这样既有调用方的行为完全不变（不重写已验收行为的底线）。
+    """
+
+    urls: list[str] = field(default_factory=list)
+    include_images: bool = False
+    timeout_ms: int = 30_000
+    metadata: dict[str, Any] = field(default_factory=dict)
+    # ---- 官方确认过的可选参数（None = 不发送，用服务端默认）----
+    extract_depth: str | None = None
+    format: str | None = None
+    query: str | None = None
+    chunks_per_source: int | None = None
+    include_favicon: bool = False
 
 
 @dataclass

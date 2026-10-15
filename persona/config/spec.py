@@ -153,6 +153,22 @@ class RetryLimits:
 
 
 @dataclass(frozen=True)
+class ResearchLimits:
+    """一次研究的量级上限（P4.2 第三步第 2 点）。
+
+    **权威定义放在配置层**：字段与 `CONFIG_FIELDS` 的 `research.*` 一一对应，
+    装配层把配置值写入这里，再注入 `ResearchDeps.limits`。这样做既避免
+    "重复定义配置字段"（P4.2 第二步：复用等效现有字段），也让"配置 → 运行限制"
+    的链路单一、可查。
+    """
+
+    max_queries: int = 5                 # 最多几次检索
+    max_results_per_query: int = 5       # 每次检索最多保留多少条结果
+    max_extracts: int = 3                # 最多抓取多少篇网页正文（0 = 不抓取）
+    max_cost: float | None = None        # 金额上限（None = 不限制）
+
+
+@dataclass(frozen=True)
 class AppSettings:
     """一次运行的完整配置（集中加载的结果）。
 
@@ -168,6 +184,7 @@ class AppSettings:
     offline_only: bool = True
     budget: BudgetLimits = field(default_factory=BudgetLimits)
     retry: RetryLimits = field(default_factory=RetryLimits)
+    research: ResearchLimits = field(default_factory=ResearchLimits)
     secrets: Secrets = field(default_factory=Secrets)
     sources: Mapping[str, str] = field(default_factory=dict)
 
@@ -216,6 +233,12 @@ class AppSettings:
                 "jitter": self.retry.jitter,
                 "per_call_timeout_ms": self.retry.per_call_timeout_ms,
                 "respect_retry_after": self.retry.respect_retry_after,
+            },
+            "research": {
+                "max_queries": self.research.max_queries,
+                "max_results_per_query": self.research.max_results_per_query,
+                "max_extracts": self.research.max_extracts,
+                "max_cost": self.research.max_cost,
             },
             "secrets": self.secrets.to_masked_dict(),
         }
@@ -281,7 +304,19 @@ CONFIG_FIELDS: tuple[FieldSpec, ...] = (
               "单次调用超时（毫秒）", minimum=100, maximum=600_000),
     FieldSpec("PERSONA_RETRY_RESPECT_RETRY_AFTER", "retry.respect_retry_after", "bool", True,
               "是否尊重服务端返回的 retry_after"),
+    FieldSpec("PERSONA_RESEARCH_MAX_QUERIES", "research.max_queries", "int", 5,
+              "一次研究最多发起多少次检索（默认 5）", minimum=1, maximum=100),
+    FieldSpec("PERSONA_RESEARCH_MAX_RESULTS", "research.max_results_per_query", "int", 5,
+              "每次检索最多保留多少条结果（默认 5）", minimum=1, maximum=50),
+    FieldSpec("PERSONA_RESEARCH_MAX_EXTRACTS", "research.max_extracts", "int", 3,
+              "一次研究最多抓取多少篇网页正文（0 = 不抓取正文，默认 3）", minimum=0, maximum=20),
+    FieldSpec("PERSONA_RESEARCH_MAX_COST", "research.max_cost", "float", None,
+              "一次研究的金额上限；留空表示不限制", minimum=0, nullable=True),
 )
+
+# 真实（联网）Provider 名称。装配前必须由 `validate_settings` 校验：
+# 它们只能在 `offline_only=false` 且密钥齐备时被构造，否则一律拒构造。
+NETWORK_PROVIDER_NAMES: tuple[str, ...] = ("tavily",)
 
 FIELD_BY_ENV_KEY: dict[str, FieldSpec] = {spec.env_key: spec for spec in CONFIG_FIELDS}
 
@@ -404,13 +439,26 @@ def validate_settings(settings: AppSettings) -> list[AppError]:
                 details={"env_key": env_key, "reason": "format"},
             ))
 
-    # —— 需要联网却没给密钥 ——
-    if not settings.offline_only and not settings.secrets.provider_api_key:
+    # —— 真实（联网）Provider 与离线开关互斥 ——
+    if settings.provider_name in NETWORK_PROVIDER_NAMES and settings.offline_only:
+        problems.append(new_error(
+            ErrorCode.VALIDATION_CONFIG_INVALID,
+            f"provider_name={settings.provider_name!r} 是真实联网 Provider，"
+            f"不能在 offline_only=true 下使用。"
+            f"请设 PERSONA_OFFLINE_ONLY=false 并提供搜索密钥，"
+            f"或把 PERSONA_PROVIDER 改回 fake 以使用 Mock Provider。",
+            details={"provider_name": settings.provider_name, "reason": "offline_conflict"},
+        ))
+
+    # —— 需要联网却没给任何密钥 ——
+    has_any_key = bool(settings.secrets.provider_api_key or settings.secrets.search_api_key)
+    if not settings.offline_only and not has_any_key:
         problems.append(new_error(
             ErrorCode.VALIDATION_REQUIRED_FIELD,
-            f"当前配置允许真实外部调用（offline_only=false），但未提供 {ENV_PROVIDER_API_KEY}。"
-            f"请设置该环境变量，或把 offline_only 设为 true 以使用 Mock Provider。",
-            details={"env_key": ENV_PROVIDER_API_KEY, "reason": "missing"},
+            f"当前配置允许真实外部调用（offline_only=false），但未提供任何密钥。"
+            f"需设置 {ENV_PROVIDER_API_KEY} 或 {ENV_SEARCH_API_KEY}，"
+            f"或把 PERSONA_OFFLINE_ONLY 设为 true 以使用 Mock Provider。",
+            details={"env_key": ENV_SEARCH_API_KEY, "reason": "missing"},
         ))
 
     return problems

@@ -108,12 +108,32 @@ class TestImportRules(unittest.TestCase):
         self.assertEqual(offenders, [])
 
     def test_no_api_key_literals(self):
+        import re
+
         offenders = []
+        # 精确匹配"字面量密钥赋值"（如 `api_key = "sk-..."` / `api_key='...'`），
+        # 不误伤：
+        #   - 环境变量名常量定义（`ENV_PROVIDER_API_KEY = "PERSONA_..."`，
+        #     其中 "api_key" 前面是下划线，构成 env_provider_api_key 整体标识符）；
+        #   - 合法形参传递（`TavilyProvider(api_key=key)`）；
+        #   - 实例属性赋值（`self.api_key = api_key or ""`，= 后无引号）；
+        #   - 文档/注释里对 Bearer **方案名**的说明（`Authorization: Bearer <api_key>`、
+        #     `f"Bearer {self.api_key}"`）—— 那是写法说明，不是硬编码密钥。
+        # 负向后查 `(?<![A-Za-z0-9_])` 确保 "api_key" 不是更长标识符的一部分。
+        # bearer 之后要求接一段"长得像真密钥"的长 token（≥16 位），
+        # 才能判定为硬编码密钥；占位符 `<api_key>` / `{self.api_key}` 不匹配。
+        patterns = (
+            re.compile(r"(?<![A-Za-z0-9_])api_key\s*=\s*['\"]"),
+            re.compile(r"sk-[A-Za-z0-9]{6,}"),          # 真实密钥前缀后接足够字符
+            re.compile(r"authorization\s*:\s*bearer\s+[A-Za-z0-9_\-]{16,}",
+                       re.IGNORECASE),
+        )
         for path in sorted(PACKAGE_ROOT.rglob("*.py")):
-            text = path.read_text(encoding="utf-8").lower()
-            for marker in ("api_key=", "sk-", "authorization: bearer"):
-                if marker in text:
-                    offenders.append((str(path.relative_to(PACKAGE_ROOT)), marker))
+            text = path.read_text(encoding="utf-8")
+            lowered = text.lower()
+            for pat in patterns:
+                if pat.search(lowered):
+                    offenders.append((str(path.relative_to(PACKAGE_ROOT)), pat.pattern))
         self.assertEqual(offenders, [])
 
 

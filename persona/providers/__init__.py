@@ -4,6 +4,9 @@ from .base import (
     CapabilitySet,
     ChatRequest,
     ChatResponse,
+    ExtractRequest,
+    ExtractResponse,
+    ExtractResult,
     HealthStatus,
     Message,
     Provider,
@@ -21,11 +24,15 @@ from .mock import (
     network_blocked,
 )
 from .registry import ProviderRegistry, default_registry
+from .tavily import TavilyProvider
 
 __all__ = [
     "CapabilitySet",
     "ChatRequest",
     "ChatResponse",
+    "ExtractRequest",
+    "ExtractResponse",
+    "ExtractResult",
     "HealthStatus",
     "Message",
     "Provider",
@@ -41,4 +48,5 @@ __all__ = [
     "network_blocked",
     "ProviderRegistry",
     "default_registry",
+    "TavilyProvider",
 ]
