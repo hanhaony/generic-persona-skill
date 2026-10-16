@@ -1,0 +1,946 @@
+"""P4.5-A 端到端集成测试（**全离线**：桩 Provider，零 socket、零真实请求、零费用）。
+
+覆盖 P4.5-A 设计稿的 A1–A8 / A10 / A11 / A12：
+
+| 断言 | 落在哪个测试 |
+| --- | --- |
+| A1 真实调用恰好 1 次 | `TestScriptSideChain.test_a1_*` |
+| A2 阶段语义（单人物） | `TestStageSemantics.*` |
+| A3 证据可追溯 | `TestScriptSideChain.test_a3_*` |
+| A4 摘录可独立复算 | `TestScriptSideChain.test_a4_*` |
+| A5 / A6 费用复算与记账语义 | `TestScriptSideChain.test_a5_*` / `test_a6_*` |
+| A7 档案引用可追溯 | `TestScriptSideChain.test_a7_*` |
+| A8 AC-7 单次事件不进 traits | `TestScriptSideChain.test_a8_*` |
+| A10 幂等 + 预算闸门 | `TestIdempotence.*` |
+| A11 门禁负样例（零调用） | `TestGateNegatives.*` |
+| A12 格式正确 ≠ 事实可信 | `TestScriptSideChain.test_a12_*` |
+| **G4/G5 修复回归锁** | `TestG4FixedMaterialFlow.*` / `TestG5WarningsPropagation.*` |
+| **编排器真实运行接线锁** | `TestOrchestratorRealRunWiring.*` |
+| **原始响应捕获 + 幂等重跑（0 真实调用）** | `TestRawCaptureAndIdempotentRerun.*` |
+| **G6 已知缺口锁（stability 未接线）** | `TestKnownGapStabilityNotWired.*` |
+
+设计纪律：
+- **不 import 被测校验逻辑**做断言：A4 的复算走 `scripts/verify_p4_5a_outputs.py`，
+  它是独立实现（自己切片、自己 `str.find`）；
+- 不联网：`StubChatProvider` 与 `StubSearchExtractProvider` 全部离线，
+  并用 `network_blocked` 兜底（既是断言也是护栏）；
+- 配置用 `load_settings(env=...)` **显式注入**，不依赖本机环境变量与 `.env`。
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+for extra in (_REPO_ROOT, _REPO_ROOT / "scripts"):
+    if str(extra) not in sys.path:
+        sys.path.insert(0, str(extra))
+
+import e2e_p4_5a as runner                                              # noqa: E402
+import verify_p4_5a_outputs as verifier                                 # noqa: E402
+
+from persona.config import load_settings                                # noqa: E402
+from persona.core.result import (                                       # noqa: E402
+    Ok,
+    WarningNote,
+    is_err,
+    unwrap,
+)
+from persona.core.usage_ledger import ExternalUsageLedger                # noqa: E402
+from persona.modules.extraction import (                                # noqa: E402
+    REJECT_MATERIAL_NOT_GATE_PASSED,
+    REJECT_MATERIAL_UNDECLARED,
+    REJECT_QUOTE_NOT_IN_MATERIAL,
+    WARNING_MATERIAL_QUALITY_UNDECLARED,
+    WARNING_MODEL_CALL_DUPLICATE_SKIPPED,
+    ExtractionOutcome,
+    RejectedClaim,
+)
+from persona.orchestrator import (                                      # noqa: E402
+    STAGE_DIALOGUE,
+    STAGE_EVIDENCE,
+    STAGE_PERSONA,
+    STAGE_RELATIONSHIP,
+    STAGE_RESEARCH,
+    RUN_PARTIAL,
+    RUN_SUCCEEDED,
+    STEP_EXECUTED,
+    STEP_SKIPPED,
+    BusinessOrchestrator,
+)
+from persona.providers.mock import network_blocked                      # noqa: E402
+
+#: **假**密钥占位值，仅用于验证"不会被打印"。不是任何真实凭据。
+SECRET_PLACEHOLDER = "placeholder-not-a-real-key-p45a"
+
+PROJECT = runner.PROJECT
+
+
+def settings_for() -> object:
+    """显式注入一份齐全配置（不读 `.env`、不依赖本机环境变量）。"""
+    env = dict(runner.E2E_CONFIG)
+    env["DEEPSEEK_API_KEY"] = SECRET_PLACEHOLDER
+    result = load_settings(use_dotenv=False, env=env)
+    if is_err(result):
+        raise AssertionError(f"测试配置本身不合法：{result.error.message}")
+    return unwrap(result)
+
+
+def payload_for(entity_id: str, material_key: str) -> str:
+    """构造一份**形状与真实模型一致**的载荷（离线扮演模型输出）。
+
+    5 条候选全部 VERBATIM，摘录都是 `E2E_TEXT` 的**逐字子串**（这样 locator 才核验得过）。
+    第 5 条刻意是 `TRAIT + SINGLE` —— AC-7 探针（单次事件不得进 `traits`）。
+    """
+    import json
+
+    def claim(key, claim_text, quote, dimension, stability):
+        return {
+            "key": key, "claim": claim_text, "tier": "VERBATIM",
+            "dimension": dimension, "subject_entity_ids": [entity_id],
+            "material_key": material_key, "verbatim_quote": quote,
+            "stability": stability, "canon_level": "CANON", "confidence": 0.9,
+        }
+
+    return json.dumps({"claims": [
+        claim("c1", "阿雾是雾港灯塔的常年值守者",
+              "阿雾是雾港灯塔的常年值守者", "BACKGROUND", "REPEATED"),
+        claim("c2", "阿雾偏爱在傍晚独自巡视堤坝",
+              "阿雾偏爱在傍晚独自巡视堤坝", "HABIT", "REPEATED"),
+        claim("c3", "阿雾向来沉默寡言",
+              "阿雾向来沉默寡言", "TRAIT", "PATTERN"),
+        claim("c4", "阿雾习惯在整点敲响灯塔的铜钟",
+              "阿雾习惯在整点敲响灯塔的铜钟", "HABIT", "PATTERN"),
+        claim("c5", "阿雾曾在一次夜雾中连续值守七十二小时",
+              "阿雾曾在一次夜雾中连续值守七十二小时", "TRAIT", "SINGLE"),
+    ]}, ensure_ascii=False)
+
+
+class ChainResult:
+    """一次脚本侧全链的运行结果（供各断言复用）。"""
+
+    def __init__(self, *, stack, ledger, out, entity_id, research_output,
+                 materials, outcome, evidence_ids, draft, profile_id,
+                 artifact, provider, recorder) -> None:
+        self.stack = stack
+        self.ledger = ledger
+        self.out = out
+        self.entity_id = entity_id
+        self.research_output = research_output
+        self.materials = materials
+        self.outcome = outcome
+        self.evidence_ids = evidence_ids
+        self.draft = draft
+        self.profile_id = profile_id
+        self.artifact = artifact
+        self.provider = provider
+        self.recorder = recorder
+
+    def teardown(self) -> None:
+        self.stack.teardown()
+
+
+def run_chain(*, payload: str | None = None, chat=None) -> ChainResult:
+    """跑一遍脚本侧全链（桩数据源 + 桩模型），返回全部中间产物。"""
+    settings = settings_for()
+    ledger = ExternalUsageLedger()
+    out = runner.Out(SECRET_PLACEHOLDER, quiet=True)   # 假密钥 → 顺便做泄漏自检
+    stack = runner.Stack(settings, ledger, out)
+
+    entity_id = stack.ensure_entity("阿雾")
+    research = stack.research.run(stack.ctx, [stack.target])
+    if is_err(research):
+        stack.teardown()
+        raise AssertionError(f"研究链路失败：{research.error.message}")
+    ro = research.value
+
+    materials, _rejected = runner.materials_from_research(stack, ro)
+
+    stub = chat if chat is not None else runner.StubChatProvider(
+        payload if payload is not None else payload_for(entity_id, runner.E2E_URL))
+    recorder = runner.CountingChatProvider(stub)
+    extractor = stack.use_real_extractor(recorder)
+
+    extracted = extractor.extract(stack.ctx, materials, targets=[stack.target])
+    if is_err(extracted):
+        stack.teardown()
+        raise AssertionError(f"抽取失败：{extracted.error.message}")
+    outcome = extracted.value
+
+    orch = stack.orchestrator()
+    step = orch._register_candidates(stack.ctx, outcome, list(ro.source_ids))
+    if is_err(step):
+        stack.teardown()
+        raise AssertionError(f"证据登记失败：{step.error.message}")
+    evidence_ids = list(step.artifact_ids.get("evidence_ids", []))
+
+    loaded = orch._load_evidence(stack.ctx, stack.request(), evidence_ids)
+    if is_err(loaded):
+        stack.teardown()
+        raise AssertionError("加载证据失败")
+    items = loaded.get(entity_id, [])
+    draft = BusinessOrchestrator._build_persona_draft(entity_id, items, "FICTIONAL_CHARACTER")
+    written = orch._write_persona(stack.ctx, entity_id, draft)
+    if is_err(written):
+        stack.teardown()
+        raise AssertionError(f"人格档案写入失败：{written.error.message}")
+    profile_id, _already = written
+
+    artifact = runner.build_artifact(
+        materials=materials, outcome=outcome, evidence_ids=evidence_ids,
+        source_ids=list(ro.source_ids), draft=draft, entity_id=entity_id,
+        ledger=ledger, limits=extractor.limits, recorder=recorder,
+        elapsed=0.0, target=stack.target)
+    artifact["persona"]["profile_id"] = profile_id
+
+    return ChainResult(
+        stack=stack, ledger=ledger, out=out, entity_id=entity_id,
+        research_output=ro, materials=materials, outcome=outcome,
+        evidence_ids=evidence_ids, draft=draft, profile_id=profile_id,
+        artifact=artifact, provider=stub, recorder=recorder)
+
+
+class TestScriptSideChain(unittest.TestCase):
+    """A1 / A3–A8 / A12：脚本侧全链（真实研究代码 + 真实门禁 + 桩模型）。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.r = run_chain()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.r.teardown()
+
+    # ---------------------------------------------------------- A1
+    def test_a1_model_called_exactly_once(self):
+        self.assertEqual(self.r.recorder.calls, 1, "真实调用必须恰好 1 次")
+        self.assertEqual(self.r.provider.chat_calls, 1)
+        self.assertEqual(self.r.out.leak, False, "输出里不得出现密钥")
+
+    def test_a1b_offline_guard_actually_blocks(self):
+        """断网护栏生效：护栏内任何真实连接都会抛 `OfflineViolation`。"""
+        import socket
+
+        from persona.providers.mock import OfflineViolation
+        with network_blocked():
+            with self.assertRaises(OfflineViolation):
+                socket.create_connection(("api.deepseek.com", 443), timeout=1)
+
+    # ---------------------------------------------------------- 材料与门禁
+    def test_materials_are_gate_valid_and_bound(self):
+        self.assertEqual(len(self.r.materials), 1)
+        m = self.r.materials[0]
+        self.assertEqual(m.quality_status, "VALID", "只有过门禁的正文才能进抽取器")
+        self.assertTrue(m.source_id, "材料必须绑定已登记来源 ID")
+        self.assertIn(m.source_id, list(self.r.research_output.source_ids))
+        self.assertEqual(m.snippet, runner.E2E_TEXT, "摘录就是门禁判定的那段正文")
+
+    def test_research_gate_judged_the_extract_not_the_fulltext(self):
+        """P4.5 方案 C：门禁判**摘录**（下游真正拿到的那段）。"""
+        extracts = self.r.research_output.extracted
+        self.assertEqual(len(extracts), 1)
+        item = extracts[0]
+        self.assertIsNotNone(item.quality)
+        self.assertEqual(item.quality.status, "VALID")
+        self.assertGreaterEqual(item.quality.prose_chars, 200)
+
+    # ---------------------------------------------------------- A3 / A4
+    def test_a3_every_candidate_traceable_to_this_run(self):
+        known = set(self.r.research_output.source_ids)
+        self.assertTrue(known, "本次研究必须登记了来源")
+        for c in self.r.outcome.claims:
+            self.assertIn(c.source_id, known, f"{c.key} 的来源越界")
+
+    def test_a4_verbatim_quotes_land_in_material_with_framework_locator(self):
+        """摘录必须能在材料里**逐字命中**，且 `locator` 由框架算出。"""
+        snippet = self.r.materials[0].snippet
+        for c in self.r.outcome.claims:
+            self.assertTrue(c.verbatim_quote, f"{c.key} 声称原话却没摘录")
+            self.assertIsNotNone(c.locator, f"{c.key} 缺 locator")
+            self.assertEqual(c.locator.get("field"), "snippet")
+            start, end = c.locator.get("start"), c.locator.get("end")
+            self.assertIsInstance(start, int)
+            self.assertIsInstance(end, int)
+            self.assertEqual(snippet[start:end], c.verbatim_quote,
+                             f"{c.key} 的 locator 与摘录不一致")
+
+    def test_a4b_all_claims_accepted_no_reject_no_pending(self):
+        self.assertEqual(self.r.outcome.verdict, "OK")
+        self.assertEqual(len(self.r.outcome.claims), 5)
+        self.assertEqual(self.r.outcome.rejected, [])
+        self.assertEqual(self.r.outcome.pending, [])
+
+    # ---------------------------------------------------------- A5 / A6
+    def test_a5_cost_is_recomputable_from_response_tokens(self):
+        """跨组件核对：Provider 响应报的 token × 配置单价 == 账本 cost_confirmed。"""
+        rec = [x for x in self.r.ledger.records() if x.operation == "CHAT"][0]
+        resp_usage = self.r.artifact["extraction"]["response_usage"]
+        expected = (resp_usage["tokens_in"] / 1000.0 * 0.0003
+                    + resp_usage["tokens_out"] / 1000.0 * 0.0012)
+        self.assertAlmostEqual(rec.cost_confirmed, expected, places=12)
+        self.assertLessEqual(self.r.ledger.occupied_cost(), 0.25)
+
+    def test_a6_ledger_semantics(self):
+        recs = self.r.ledger.records()
+        self.assertEqual(len(recs), 1, "只允许 1 笔外部调用")
+        rec = recs[0]
+        self.assertEqual(rec.operation, "CHAT")
+        self.assertEqual(rec.currency, "USD")
+        self.assertEqual(rec.cost_status, "CONFIRMED")
+        self.assertEqual(rec.cost_source, "OFFICIAL_RATE")
+        self.assertTrue(rec.request_id, "服务端 request_id 必须留痕以便对账")
+
+    # ---------------------------------------------------------- A7 / A8
+    def test_a7_persona_refs_all_traceable(self):
+        known = set(self.r.evidence_ids)
+        self.assertTrue(known, "必须登记了证据")
+        refs: list[str] = list(self.r.draft.background.evidence_refs)
+        for bucket in (self.r.draft.traits, self.r.draft.habits,
+                       self.r.draft.single_events):
+            for item in bucket:
+                refs += list(item.evidence_refs)
+        self.assertTrue(refs, "档案必须引用证据（不得凭空空转）")
+        untraceable = [r for r in refs if r not in known]
+        self.assertEqual(untraceable, [], f"不可追溯引用：{untraceable}")
+
+    def test_a8_single_event_never_becomes_trait(self):
+        """AC-7 / PF-V2 / D-012：单次行为不得固化成稳定性格。"""
+        probe = "阿雾曾在一次夜雾中连续值守七十二小时"
+        trait_texts = [i.text for i in self.r.draft.traits]
+        single_texts = [i.text for i in self.r.draft.single_events]
+        self.assertNotIn(probe, trait_texts, "单次事件不得进 traits")
+        self.assertIn(probe, single_texts, "单次事件应进 single_events")
+        for item in self.r.draft.traits:
+            self.assertNotIn(str(item.stability), ("SINGLE", "UNKNOWN"),
+                             f"traits 里的 {item.text} 稳定性不足")
+
+    # ---------------------------------------------------------- A12
+    def test_a12_no_truthiness_field_inflated(self):
+        """格式正确 ≠ 事实可信：产物里不得出现"已验证/已批准"被置真。"""
+        self.assertNotIn("verified", self.r.artifact)
+        for c in self.r.artifact["extraction"]["claims"]:
+            self.assertNotIn("evidence_id", c)
+            self.assertNotIn("verified", c)
+
+    # ---------------------------------------------------------- 独立复算器
+    def test_independent_verifier_passes_on_real_artifact(self):
+        """`verify_p4_5a_outputs.py` 是**独立实现**，它对真实产物必须全绿。"""
+        rep = verifier.verify(self.r.artifact)
+        passed, total = rep.summary()
+        failed = [name for name, ok, _ in rep.rows if not ok]
+        self.assertEqual(failed, [], f"独立复算失败项：{failed}")
+        self.assertGreaterEqual(total, 20)
+        self.assertEqual(passed, total)
+
+    def test_independent_verifier_detects_tampered_quote(self):
+        """**突变检验**：把摘录改坏，复算器必须报错（否则它只是恒真的摆设）。"""
+        import copy
+        broken = copy.deepcopy(self.r.artifact)
+        broken["extraction"]["claims"][0]["verbatim_quote"] = "阿雾根本不存在"
+        rep = verifier.verify(broken)
+        failed = [name for name, ok, _ in rep.rows if not ok]
+        self.assertTrue(any("A4" in n for n in failed),
+                        f"复算器没抓到被篡改的摘录：failed={failed}")
+
+    def test_independent_verifier_detects_tampered_cost(self):
+        import copy
+        broken = copy.deepcopy(self.r.artifact)
+        broken["ledger"]["records"][0]["cost_confirmed"] = 0.0
+        rep = verifier.verify(broken)
+        failed = [name for name, ok, _ in rep.rows if not ok]
+        self.assertTrue(any("A5" in n for n in failed),
+                        f"复算器没抓到被篡改的费用：failed={failed}")
+
+
+class TestIdempotence(unittest.TestCase):
+    """A10：重复意图不重复花钱；次数上限拦住第二次。"""
+
+    def setUp(self) -> None:
+        self.settings = settings_for()
+        self.ledger = ExternalUsageLedger()
+        self.out = runner.Out(SECRET_PLACEHOLDER, quiet=True)
+        self.stack = runner.Stack(self.settings, self.ledger, self.out)
+        self.entity_id = self.stack.ensure_entity("阿雾")
+        research = self.stack.research.run(self.stack.ctx, [self.stack.target])
+        self.ro = unwrap(research)
+        self.materials, _ = runner.materials_from_research(self.stack, self.ro)
+        self.stub = runner.StubChatProvider(
+            payload_for(self.entity_id, runner.E2E_URL))
+        self.extractor = self.stack.use_real_extractor(self.stub)
+
+    def tearDown(self) -> None:
+        self.stack.teardown()
+
+    def test_a10_duplicate_intent_skips_second_send(self):
+        first = unwrap(self.extractor.extract(
+            self.stack.ctx, self.materials, targets=[self.stack.target]))
+        self.assertEqual(self.stub.chat_calls, 1)
+        second = unwrap(self.extractor.extract(
+            self.stack.ctx, self.materials, targets=[self.stack.target]))
+        self.assertEqual(self.stub.chat_calls, 1, "重复意图不得再发一次")
+        codes = [w.code for w in second.warnings]
+        self.assertIn(WARNING_MODEL_CALL_DUPLICATE_SKIPPED, codes)
+        self.assertEqual(len(self.ledger.records()), 1, "账本不得多记一笔")
+
+    def test_a10b_call_cap_blocks_further_calls(self):
+        """`max_calls=1`：换一份材料（幂等键不同）也必须被次数闸门拦住。"""
+        unwrap(self.extractor.extract(
+            self.stack.ctx, self.materials, targets=[self.stack.target]))
+        other = list(self.materials)
+        other_material = other[0]
+        other_material.canonical_key = "p45a:other-material"
+        result = self.extractor.extract(
+            self.stack.ctx, other, targets=[self.stack.target])
+        # 换 key 后幂等守卫不生效 → 应由 `max_calls` 闸门拦下（Err）
+        if is_err(result):
+            from persona.core.errors import ErrorCode
+            self.assertEqual(result.error.code, ErrorCode.BUDGET_EXCEEDED)
+        self.assertEqual(self.stub.chat_calls, 1, "次数上限必须拦住第二次调用")
+
+
+class TestGateNegatives(unittest.TestCase):
+    """A11：不合格材料必须被拦在模型调用之前（零费用）。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.settings = settings_for()
+        cls.ledger = ExternalUsageLedger()
+        cls.out = runner.Out(SECRET_PLACEHOLDER, quiet=True)
+        cls.rows = runner.a11_gate_negatives(cls.settings, cls.ledger, cls.out)
+
+    def test_a11_all_negatives_blocked(self):
+        for row in self.rows:
+            self.assertTrue(row["ok"], f"负样例未按预期拦住：{row}")
+
+    def test_a11_zero_model_calls(self):
+        for row in self.rows:
+            self.assertEqual(row["chat_calls"], 0, "负样例不得触发模型调用")
+            self.assertEqual(row["claims"], 0)
+
+    def test_a11_codes_are_specific(self):
+        codes = {row["case"]: row["codes"] for row in self.rows}
+        self.assertIn(REJECT_MATERIAL_NOT_GATE_PASSED,
+                      next(v for k, v in codes.items() if "LOW_QUALITY" in k))
+        self.assertIn(REJECT_MATERIAL_UNDECLARED,
+                      next(v for k, v in codes.items() if "未声明" in k))
+
+    def test_a11_ledger_untouched(self):
+        self.assertEqual(len(self.ledger.records()), 0, "零调用 → 账本不得有记录")
+
+
+class TestStageSemantics(unittest.TestCase):
+    """A2（单人物修订版）：阶段语义必须**诚实**反映单人物链路。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.out = runner.Out(SECRET_PLACEHOLDER, quiet=True)
+        cls.diag = runner.diagnose_orchestrator_path(settings_for(), cls.out)
+
+    def test_a2_research_stage_executed(self):
+        self.assertTrue(self.diag["ok"], self.diag)
+        self.assertEqual(self.diag["stage_status"][STAGE_RESEARCH], STEP_EXECUTED)
+
+    def test_a2b_single_person_skips_relationship_and_dialogue(self):
+        """参与者 <2 人 → 关系与对话阶段 SKIPPED（不伪造），任务仍干净收敛。"""
+        self.assertEqual(self.diag["stage_status"][STAGE_RELATIONSHIP], STEP_SKIPPED)
+        self.assertEqual(self.diag["stage_status"][STAGE_DIALOGUE], STEP_SKIPPED)
+        self.assertEqual(self.diag["task_status"], "COMPLETED")
+        self.assertEqual(self.diag["status"], RUN_PARTIAL,
+                         "有阶段 SKIPPED → 只能报 PARTIAL，不得报全流程成功")
+
+    def test_a2c_persona_stage_still_runs(self):
+        self.assertIn(self.diag["stage_status"][STAGE_PERSONA],
+                      (STEP_EXECUTED, STEP_SKIPPED))
+
+
+class TestG4FixedMaterialFlow(unittest.TestCase):
+    """G4 回归锁：**编排器路径**必须真的把抓取正文交到抽取器手里。
+
+    修复前这里是"模型永不被调用、证据恒为 0"；这些断言在修复被回退时会立刻变红。
+
+    单人物用例整体仍 `PARTIAL` —— 这一点**如实保留**：参与者 <2 时关系/对话阶段
+    按语义跳过，与 G4 无关。要证明"整链真的通了"，必须看双人物用例（见
+    `test_two_person_run_reaches_succeeded`）。
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.out = runner.Out(SECRET_PLACEHOLDER, quiet=True)
+        cls.settings = settings_for()
+        cls.diag = runner.diagnose_orchestrator_path(cls.settings, cls.out)
+        cls.diag_two = runner.diagnose_orchestrator_path(
+            cls.settings, cls.out, two_person=True)
+
+    # ------------------------------------------------------- 静态：调用点必须存在
+    def test_materials_from_extracts_has_a_product_call_site(self):
+        """产品代码**必须**有 `materials_from_extracts()` 的调用点。
+
+        用 AST 精确定位真正的调用（注释与 docstring 提及不算），避免 grep 误报。
+        """
+        import ast
+
+        calls: list[str] = []
+        for path in (_REPO_ROOT / "persona").rglob("*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and (
+                        getattr(node.func, "id", "") == "materials_from_extracts"):
+                    calls.append(f"{path.relative_to(_REPO_ROOT)}:{node.lineno}")
+        self.assertTrue(calls,
+                        "产品代码里没有 materials_from_extracts() 调用点：G4 回来了")
+
+    # ------------------------------------------------------- 动态：单人物
+    def test_material_flow_is_non_empty_and_gate_valid(self):
+        self.assertTrue(self.diag["ok"], self.diag)
+        self.assertGreaterEqual(self.diag["materials_in_flow"], 1,
+                                "抓取正文必须进入材料流（修复前只有检索摘要）")
+        self.assertGreaterEqual(self.diag["materials_gate_valid"], 1,
+                                "材料流里必须有带门禁结论（VALID）的材料")
+        self.assertGreaterEqual(self.diag["materials_bound"], 1,
+                                "材料必须绑定已登记来源，否则可追溯闸门会拒收")
+
+    def test_orchestrator_reaches_model_exactly_once(self):
+        self.assertEqual(self.diag["stub_chat_calls"], 1,
+                         "G4 修复后编排器路径必须调用到模型（修复前恒为 0）")
+
+    def test_evidence_is_non_empty_and_stage_executed(self):
+        self.assertGreaterEqual(self.diag["evidence_count"], 1)
+        self.assertEqual(self.diag["stage_status"][STAGE_EVIDENCE], STEP_EXECUTED)
+
+    def test_single_person_partial_reason_shrinks_to_relationship_stages(self):
+        """单人物仍 PARTIAL，但原因**只剩**关系/对话按语义跳过。"""
+        self.assertEqual(self.diag["status"], RUN_PARTIAL)
+        self.assertEqual(self.diag["stage_status"][STAGE_RESEARCH], STEP_EXECUTED)
+        self.assertEqual(self.diag["stage_status"][STAGE_EVIDENCE], STEP_EXECUTED)
+        self.assertEqual(self.diag["stage_status"][STAGE_PERSONA], STEP_EXECUTED)
+        self.assertEqual(self.diag["stage_status"][STAGE_RELATIONSHIP], STEP_SKIPPED)
+        self.assertEqual(self.diag["stage_status"][STAGE_DIALOGUE], STEP_SKIPPED)
+
+    def test_no_material_undeclared_rejection_remains(self):
+        """修复后不该再有"每份材料都判未声明门禁结论"的拒收。"""
+        self.assertNotIn("MATERIAL_UNDECLARED", self.diag["warning_codes"])
+        self.assertNotIn("MATERIAL_NOT_GATE_PASSED", self.diag["warning_codes"])
+
+    def test_superseded_summary_is_reported_not_silent(self):
+        """同来源的检索摘要被抓取正文取代时必须**说出来**，不能静默丢。"""
+        self.assertIn("MATERIAL_SUPERSEDED", self.diag["warning_codes"])
+
+    # ------------------------------------------------------- 动态：双人物
+    def test_two_person_run_reaches_succeeded(self):
+        """参与者 ≥ 2 → 五阶段全 EXECUTED → 整体状态**不再是 PARTIAL**。"""
+        self.assertTrue(self.diag_two["ok"], self.diag_two)
+        self.assertEqual(self.diag_two["status"], RUN_SUCCEEDED)
+        for stage, status in self.diag_two["stage_status"].items():
+            self.assertEqual(status, STEP_EXECUTED, f"{stage} 未执行：{status}")
+
+    def test_two_person_covers_both_entities(self):
+        self.assertGreaterEqual(self.diag_two["evidence_count"], 2)
+        self.assertGreaterEqual(self.diag_two["materials_in_flow"], 2,
+                                "两个目标各自都要有材料进入材料流")
+        self.assertEqual(self.diag_two["materials_bound"],
+                         self.diag_two["materials_in_flow"],
+                         "双人物下每份材料都必须绑定来源")
+
+
+class TestG5WarningsPropagation(unittest.TestCase):
+    """G5 回归锁：抽取器的 `outcome.warnings` 必须透传到任务告警。
+
+    修复前 `_register_candidates` 把 `outcome.warnings` 整个丢掉，材料级拒收
+    被笼统标成 `CLAIM_REJECTED`：运维看不到"材料没过门禁"，只会误判成
+    "模型抽不出东西"。
+    """
+
+    def setUp(self) -> None:
+        self.out = runner.Out(SECRET_PLACEHOLDER, quiet=True)
+        self.settings = settings_for()
+        self.stack = runner.Stack(self.settings, ExternalUsageLedger(), self.out)
+        self.orch = self.stack.orchestrator()
+
+    def tearDown(self) -> None:
+        self.stack.teardown()
+
+    @staticmethod
+    def _codes(step) -> list[str]:
+        return [str(w.code) for w in step.warnings]
+
+    def test_extractor_warnings_are_propagated_verbatim(self):
+        outcome = ExtractionOutcome(
+            method="MODEL",
+            warnings=[WarningNote(
+                code=WARNING_MATERIAL_QUALITY_UNDECLARED,
+                message="1 份材料未声明正文质量门禁结论（按检索摘要处理）")])
+        step = self.orch._register_candidates(self.stack.ctx, outcome, [])
+        self.assertFalse(is_err(step), step)
+        self.assertIn(WARNING_MATERIAL_QUALITY_UNDECLARED, self._codes(step))
+
+    def test_material_level_rejection_uses_its_own_reason_as_code(self):
+        """材料级拒收（没有 claim）→ 告警码就是该原因本身。"""
+        outcome = ExtractionOutcome(
+            method="MODEL",
+            rejected=[RejectedClaim(
+                reason=REJECT_MATERIAL_UNDECLARED,
+                message="材料「合成样张」没有声明正文质量门禁结论：拒收")])
+        step = self.orch._register_candidates(self.stack.ctx, outcome, [])
+        codes = self._codes(step)
+        self.assertIn(REJECT_MATERIAL_UNDECLARED, codes,
+                      "MATERIAL_UNDECLARED 必须是可筛选的告警码")
+        self.assertNotIn("CLAIM_REJECTED", codes,
+                         "材料级拒收不得再被笼统标成 CLAIM_REJECTED")
+
+    def test_claim_level_rejection_keeps_claim_rejected_code(self):
+        """claim 级拒收（无效摘录）保持 `CLAIM_REJECTED` —— 既有契约不变。"""
+        outcome = ExtractionOutcome(
+            method="MODEL",
+            rejected=[RejectedClaim(
+                reason=REJECT_QUOTE_NOT_IN_MATERIAL,
+                message="第 0 条候选未通过 QUOTE_NOT_IN_MATERIAL 校验",
+                key="bad", claim="这句摘录不在材料里")])
+        step = self.orch._register_candidates(self.stack.ctx, outcome, [])
+        self.assertIn("CLAIM_REJECTED", self._codes(step))
+
+    def test_material_rejection_reaches_task_level_warnings(self):
+        """端到端：材料级拒收原因必须出现在**编排器路径**的任务告警里。"""
+        stack = runner.Stack(self.settings, ExternalUsageLedger(), self.out,
+                             source_provider=runner.StubSearchExtractProvider())
+        try:
+            # 桩模型返回形状合法但**门禁未过**的材料：把材料级拒收逼出来
+            stack.ensure_entity("阿雾")
+            orch = stack.orchestrator()
+            rejected_material = runner.SourceMaterial(
+                source_id="src_g5", title="[合成样张·虚构] 不合格材料",
+                url=runner.E2E_URL, canonical_key=runner.E2E_URL,
+                snippet=runner.E2E_TEXT, quality_status="LOW_QUALITY")
+            extractor = stack.use_real_extractor(
+                runner.StubChatProvider('{"claims": []}'))
+            outcome = unwrap(extractor.extract(
+                stack.ctx, [rejected_material], targets=[stack.target]))
+            step = orch._register_candidates(stack.ctx, outcome, ["src_g5"])
+            codes = self._codes(step)
+            self.assertIn(REJECT_MATERIAL_NOT_GATE_PASSED, codes)
+        finally:
+            stack.teardown()
+
+
+class TestOrchestratorRealRunWiring(unittest.TestCase):
+    """接线轮回归锁：`--run` 默认走**编排器路径**，且该路径真的端到端可跑。
+
+    "可跑"用**桩模型注入**证明（`run_orchestrator_real(provider=...)`）：同一条
+    产品代码链路（研究 → 抽取 → 证据登记 → 门禁 → 人格档案）在**零成本、零 socket**
+    下跑通，产物再交给独立复算器逐条核对。真实运行只是把注入的桩换成真 DeepSeek
+    —— 接线本身因此被离线锁住，而不是"只能靠花钱才发现接错"。
+    """
+
+    def test_default_path_is_orchestrator(self):
+        args = runner.build_parser().parse_args([])
+        self.assertEqual(args.path, "orchestrator",
+                         "--run 默认必须走编排器路径（产品代码全链）")
+        self.assertFalse(args.run, "解析默认值不得触发真实执行")
+        self.assertFalse(args.dry)
+
+    def test_explicit_script_path_still_available(self):
+        args = runner.build_parser().parse_args(["--run", "--path=script"])
+        self.assertEqual(args.path, "script", "脚本侧路径保留为对照通道")
+        self.assertTrue(args.run)
+
+    def test_recording_extractor_delegates_and_captures(self):
+        """代理必须**原样透传**调用，并留下最后一次 outcome。"""
+
+        class _Inner:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.saw_build = 0
+
+            def extract(self, ctx, materials, *, targets):
+                self.calls += 1
+                return Ok(ExtractionOutcome(method="MODEL"))
+
+            def build_request(self, *args, **kwargs):
+                self.saw_build += 1
+                return "REQ"
+
+        inner = _Inner()
+        proxy = runner.RecordingExtractor(inner)
+        self.assertIsNone(proxy.last_outcome, "没调用过就不得有 outcome")
+        result = proxy.extract(object(), [], targets=[])
+        self.assertEqual(inner.calls, 1)
+        self.assertEqual(proxy.calls, 1)
+        self.assertIs(proxy.last_outcome, result.value)
+        self.assertEqual(proxy.build_request(), "REQ", "其余方法必须透传")
+        self.assertEqual(inner.saw_build, 1)
+
+    def test_orchestrator_real_run_end_to_end_offline(self):
+        """编排器真实运行函数在**桩模型 + 断网护栏**下跑通，产物过独立复算器。"""
+        settings = settings_for()
+        ledger = ExternalUsageLedger()
+        out = runner.Out(SECRET_PLACEHOLDER, quiet=True)
+        problems: list[str] = []
+
+        def expect(cond: bool, desc: str) -> None:
+            if not cond:
+                problems.append(desc)
+
+        stub = runner.StubChatProvider('{"claims": []}')
+
+        def on_targets(stack, entity_id: str) -> None:
+            # 实体 ID 由存储生成 → 载荷只能在登记之后构造（与 diag 同一手法）
+            stub.payload = runner.orchestrator_payload({"阿雾": entity_id})
+
+        with tempfile.TemporaryDirectory(prefix="p45a-wiring-") as td:
+            dump = Path(td) / "artifact.json"
+            with network_blocked():
+                runner.run_orchestrator_real(
+                    settings, out, problems, expect=expect, ledger=ledger,
+                    limits=runner.model_limits_from_settings(settings),
+                    dump_path=str(dump), provider=stub, on_targets=on_targets)
+            self.assertTrue(dump.exists(), "接线路径必须产出可复算的产物")
+            artifact = json.loads(dump.read_text(encoding="utf-8"))
+            raw_path = dump.with_name(dump.stem + ".raw.json")
+            self.assertTrue(raw_path.exists(),
+                            "原始响应必须单独落盘（<dump>.raw.json）")
+            raw_doc = json.loads(raw_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(problems, [], "接线路径不得有任何失败项")
+        self.assertEqual(out.leak, False, "输出里不得出现密钥")
+
+        # 原始收发产物：注入的桩 Provider 没有 `_urlopen` → 记录为空但文件必须存在
+        self.assertEqual(raw_doc["schema"], "p45a-raw-exchange/1")
+        self.assertEqual(raw_doc["exchanges"], [],
+                         "桩 Provider 无网络出口 → 不得凭空编造 HTTP 记录")
+        self.assertEqual(artifact["raw_exchange_path"], str(raw_path))
+        self.assertNotIn(SECRET_PLACEHOLDER, json.dumps(raw_doc, ensure_ascii=False),
+                         "原始收发产物里不得出现密钥")
+
+        joined = "\n".join(out.lines)
+        self.assertIn("[7b] 幂等重跑", joined, "真实运行必须包含幂等重跑步骤")
+        self.assertIn("发送层幂等守卫", joined, "必须报出拦住重跑的那道闸门")
+        self.assertIn("BUDGET_EXCEEDED", joined, "预算探针必须被次数闸门拦下")
+
+        self.assertEqual(artifact["mode"], "orchestrator-path",
+                         "产物必须标明来自编排器路径")
+        self.assertEqual(artifact["calls"]["real_chat_calls"], 1)
+        self.assertEqual(len(artifact["materials"]), 1)
+        self.assertEqual(artifact["materials"][0]["quality_status"], "VALID")
+        self.assertTrue(artifact["materials"][0]["source_id"])
+        self.assertGreaterEqual(len(artifact["evidence_ids"]), 1)
+        self.assertEqual(len(artifact["extraction"]["claims"]), 5)
+        self.assertEqual(artifact["extraction"]["rejected"], [])
+
+        rep = verifier.verify(artifact)
+        passed, total = rep.summary()
+        failed = [name for name, ok, _ in rep.rows if not ok]
+        self.assertEqual(passed, total,
+                         f"独立复算器未全绿，失败项={failed}")
+
+    def test_orchestrator_stage_table_is_single_person_honest(self):
+        """单人物下关系/对话阶段必须如实 SKIPPED，桩对话 Provider 零调用。"""
+        settings = settings_for()
+        out = runner.Out(SECRET_PLACEHOLDER, quiet=True)
+        problems: list[str] = []
+        stub = runner.StubChatProvider('{"claims": []}')
+
+        def on_targets(stack, entity_id: str) -> None:
+            stub.payload = runner.orchestrator_payload({"阿雾": entity_id})
+
+        with tempfile.TemporaryDirectory(prefix="p45a-wiring-"):
+            with network_blocked():
+                runner.run_orchestrator_real(
+                    settings, out, problems,
+                    expect=lambda cond, desc: problems.append(desc) if not cond else None,
+                    ledger=ExternalUsageLedger(),
+                    limits=runner.model_limits_from_settings(settings),
+                    provider=stub, on_targets=on_targets)
+
+        self.assertEqual(problems, [])
+        joined = "\n".join(out.lines)
+        self.assertIn("关系档案", joined)
+        self.assertIn("模拟对话", joined)
+        self.assertIn("SKIPPED", joined)
+        # 只锁"整体状态"那一行：账本里也有其它 outcome=SUCCEEDED 字样，不能全串搜
+        status_lines = [ln for ln in out.lines if ln.startswith("  整体状态")]
+        self.assertEqual(len(status_lines), 1, f"理应只有一行整体状态：{status_lines}")
+        self.assertIn("PARTIAL", status_lines[0])
+        self.assertNotIn("SUCCEEDED", status_lines[0],
+                         "单人物不得报 SUCCEEDED（关系/对话按语义跳过）")
+
+
+class TestKnownGapStabilityNotWired(unittest.TestCase):
+    """**已知缺口锁（G6，本轮发现，未授权修复）**：`stability` 链路断在中间。
+
+    两个事实叠加，导致经编排器路径产出的档案里 `traits` **结构性为空**：
+
+    1. 抽取器**刻意不解析**模型自报的 `stability`（`CandidateClaim.stability`
+       默认 `UNKNOWN`，docstring 明写"不得编造"）——模型无权宣布自己的说法稳定；
+    2. 框架自带的确定性判定器 `Evidence.judge_stability()`（1 条=SINGLE、
+       ≥2=REPEATED、≥3 个不同来源=PATTERN）在生产代码里**零调用点**。
+
+    结果：TRAIT 维度证据的 stability 恒为 `UNKNOWN` → 按 AC-7 全部落
+    `single_events`。AC-7 因此是**保守满足**的（安全侧），但这正是
+    "`traits` 可能全空"更硬的原因：**不是可能，是当前接线下的必然**。
+
+    一旦接线补齐，本测试会变红 —— 那时请更新本测试与设计稿。
+    """
+
+    @staticmethod
+    def _judge_stability_callers() -> list[str]:
+        import ast
+
+        found: list[str] = []
+        for path in (_REPO_ROOT / "persona").rglob("*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.Call)
+                        and getattr(node.func, "attr", "") == "judge_stability"):
+                    found.append(f"{path.relative_to(_REPO_ROOT)}:{node.lineno}")
+        return found
+
+    def test_judge_stability_has_no_product_call_site(self):
+        calls = self._judge_stability_callers()
+        self.assertEqual(
+            calls, [],
+            f"产品代码里出现了 judge_stability() 调用点，G6 可能已接线：{calls}")
+
+    def test_model_reported_stability_is_not_parsed(self):
+        """抽取器不解析模型自报的 stability：无论载荷写什么，候选一律 UNKNOWN。"""
+        settings = settings_for()
+        out = runner.Out(SECRET_PLACEHOLDER, quiet=True)
+        stack = runner.Stack(settings, ExternalUsageLedger(), out)
+        try:
+            entity_id = stack.ensure_entity("阿雾")
+            ro = unwrap(stack.research.run(stack.ctx, [stack.target]))
+            materials, _ = runner.materials_from_research(stack, ro)
+            # 载荷里 c1/c2 写 REPEATED、c4 写 PATTERN、c5 写 SINGLE
+            stub = runner.StubChatProvider(
+                payload_for(entity_id, runner.E2E_URL))
+            extractor = stack.use_real_extractor(stub)
+            outcome = unwrap(extractor.extract(
+                stack.ctx, materials, targets=[stack.target]))
+            self.assertEqual(len(outcome.claims), 5)
+            for c in outcome.claims:
+                self.assertEqual(
+                    str(c.stability), "UNKNOWN",
+                    f"{c.key} 的 stability 被解析成了 {c.stability}"
+                    "（G6 可能已接线：请更新本测试）")
+        finally:
+            stack.teardown()
+
+    def test_unknown_stability_trait_lands_in_single_events_never_traits(self):
+        """AC-7 的保守后果：TRAIT + UNKNOWN → `single_events`，`traits` 为空。"""
+        settings = settings_for()
+        out = runner.Out(SECRET_PLACEHOLDER, quiet=True)
+        problems: list[str] = []
+        stub = runner.StubChatProvider('{"claims": []}')
+
+        def on_targets(stack, entity_id: str) -> None:
+            stub.payload = runner.orchestrator_payload({"阿雾": entity_id})
+
+        with tempfile.TemporaryDirectory(prefix="p45a-wiring-") as td:
+            dump = Path(td) / "artifact.json"
+            with network_blocked():
+                runner.run_orchestrator_real(
+                    settings, out, problems,
+                    expect=lambda cond, desc: problems.append(desc) if not cond else None,
+                    ledger=ExternalUsageLedger(),
+                    limits=runner.model_limits_from_settings(settings),
+                    dump_path=str(dump), provider=stub, on_targets=on_targets)
+            artifact = json.loads(dump.read_text(encoding="utf-8"))
+
+        self.assertEqual(problems, [])
+        persona = artifact["persona"]
+        self.assertEqual(persona["traits"], [],
+                         "当前接线下 traits 必然为空（G6：stability 无人判定）")
+        self.assertTrue(persona["single_events"],
+                        "TRAIT 维度证据必须落 single_events，不得凭空丢")
+        for item in persona["single_events"]:
+            self.assertIn(str(item["stability"]), ("SINGLE", "UNKNOWN"))
+        # AC-7 是**保守满足**：单次事件绝不进 traits
+        trait_texts = {str(i["text"]) for i in persona["traits"]}
+        single_texts = {str(i["text"]) for i in persona["single_events"]}
+        self.assertFalse(trait_texts & single_texts, "单次事件不得出现在 traits")
+
+
+class TestRawCaptureAndIdempotentRerun(unittest.TestCase):
+    """冒烟轮新增两件事的离线锁：原始响应捕获 + 幂等重跑（都 0 真实调用）。"""
+
+    def test_raw_capture_records_body_but_never_header_values(self):
+        """`RawResponseCapture` 必须留下响应体，但**只记请求头名**。
+
+        请求头里 `Authorization` 的值就是密钥 —— 记值等于把密钥写进产物。
+        """
+        body = b'{"id":"chatcmpl-test","choices":[{"message":{"content":"{}"}}]}'
+
+        class _Resp:
+            status = 200
+
+            def read(self, *a, **k):
+                return body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        class _Req:
+            full_url = "https://api.deepseek.com/chat/completions"
+            method = "POST"
+            data = b'{"model":"deepseek-flash"}'
+            headers = {"Content-Type": "application/json",
+                       "Authorization": f"Bearer {SECRET_PLACEHOLDER}"}
+
+        seen: dict = {}
+
+        def fake_urlopen(request, timeout=None):
+            seen["timeout"] = timeout
+            return _Resp()
+
+        capture = runner.RawResponseCapture(fake_urlopen)
+        with capture(_Req(), timeout=30) as response:
+            self.assertEqual(response.read(), body)
+
+        self.assertEqual(len(capture.exchanges), 1)
+        exchange = capture.exchanges[0]
+        self.assertEqual(exchange["status"], 200)
+        self.assertEqual(exchange["response_bytes"], len(body))
+        self.assertEqual(exchange["raw_response"], body.decode("utf-8"))
+        self.assertEqual(exchange["request_body_bytes"], len(_Req.data))
+        self.assertIn("authorization", exchange["request_header_names"])
+        # 关键：名字记了，值**没记**
+        blob = json.dumps(capture.exchanges, ensure_ascii=False)
+        self.assertNotIn(SECRET_PLACEHOLDER, blob,
+                         "请求头值（密钥）绝不进原始收发记录")
+
+    def test_rerun_never_adds_a_second_real_call(self):
+        """同一条链重跑：真实调用次数不变，且探针被 `BUDGET_EXCEEDED` 拦下。"""
+        settings = settings_for()
+        out = runner.Out(SECRET_PLACEHOLDER, quiet=True)
+        problems: list[str] = []
+        stub = runner.StubChatProvider('{"claims": []}')
+
+        def on_targets(stack, entity_id: str) -> None:
+            stub.payload = runner.orchestrator_payload({"阿雾": entity_id})
+
+        with tempfile.TemporaryDirectory(prefix="p45a-rerun-"):
+            with network_blocked():
+                runner.run_orchestrator_real(
+                    settings, out, problems,
+                    expect=lambda cond, desc: problems.append(desc) if not cond else None,
+                    ledger=ExternalUsageLedger(),
+                    limits=runner.model_limits_from_settings(settings),
+                    provider=stub, on_targets=on_targets)
+
+        self.assertEqual(problems, [], "幂等重跑不得产生失败项")
+        self.assertEqual(stub.chat_calls, 1, "整段流程只允许 1 次真实调用")
+
+        joined = "\n".join(out.lines)
+        self.assertIn("原样重跑 orch.run", joined)
+        self.assertIn("真实模型调用次数 = 1（重跑前 1）", joined,
+                      "重跑后真实调用次数不得变化")
+        self.assertIn("BUDGET_EXCEEDED", joined, "预算闸门必须报 BUDGET_EXCEEDED")
+
+
+if __name__ == "__main__":
+    unittest.main()

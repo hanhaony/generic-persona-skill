@@ -87,7 +87,12 @@ from ..modules.relationship_analysis import (
     RelationshipAnalyzerPort,
     RelationshipAnalysisRequest,
 )
-from ..modules.research import PersonQueryTarget, ResearchService
+from ..modules.research import (
+    PersonQueryTarget,
+    ResearchOutput,
+    ResearchService,
+    materials_from_extracts,
+)
 from ..storage.sqlite import SqliteStorage
 from .executor import TaskRunner, UnitOutcome, WorkUnit
 from .records import BudgetSpec, RetryPolicy, TaskRecord
@@ -145,6 +150,12 @@ WARNING_CLAIM_REJECTED = "CLAIM_REJECTED"              # 候选 claim 被抽取�
 WARNING_CLAIM_PENDING_REVIEW = "CLAIM_PENDING_REVIEW"  # 候选 claim 结构合法但核验不了，转待审核（P4.4-A）
 WARNING_NO_CANDIDATES = "NO_CANDIDATES"                # 一个可登记的候选都没有
 WARNING_INFERENCE_NO_ROOT = "INFERENCE_NO_ROOT"        # 无根推断，丢弃
+
+# G4：抓取正文 → 材料流的接线（Research 阶段）
+WARNING_MATERIAL_GATE_REJECTED = "MATERIAL_GATE_REJECTED"  # 抓取正文未过质量门禁，未进材料流
+WARNING_MATERIAL_UNBOUND = "MATERIAL_SOURCE_UNBOUND"       # 抓取正文找不到对应已登记来源
+WARNING_MATERIAL_SUPERSEDED = "MATERIAL_SUPERSEDED"        # 同来源的检索摘要被抓取正文取代
+WARNING_MATERIAL_NOT_USABLE = "NO_MATERIAL_FROM_EXTRACTS"  # 有抓取正文但没有一份可用，退回摘要
 
 # 冲突记录在检查点里的键（阶段间传递 ID 仍走已落盘的检查点，D-210）
 ARTIFACT_CONFLICT_IDS = "conflict_ids"
@@ -466,18 +477,37 @@ class BusinessOrchestrator:
     def _step_research(
         self, ctx: CallContext, request: BusinessRequest
     ) -> BusinessStepResult | Err:
-        """调 `ResearchService.run` → 登记来源。**来源不是证据**。"""
+        """调 `ResearchService.run` → 登记来源。**来源不是证据**。
+
+        G4 修复：这里同时把**抓取正文**（过了正文质量门禁的那些）转成材料，
+        与检索摘要一起进材料流——见 `_material_flow`。修复前只记住摘要，
+        导致上线配置下抽取器把每份材料都判"未声明门禁结论"而全部拒收，
+        模型永不被调用。
+        """
         outcome = self.deps.research.run(ctx, list(request.targets))
         if is_err(outcome):
             return outcome
         research = outcome.value
         warnings = list(research.warnings)
+
+        flow = self._material_flow(
+            ctx, research, [t.entity_id for t in request.targets],
+            _text(request.topic))
+        if isinstance(flow, Err):
+            return flow
+        materials, flow_warnings = flow
+        warnings.extend(flow_warnings)
+
+        gate_valid = sum(1 for m in materials if _text(m.quality_status))
         message = (f"登记 {len(research.source_ids)} 条来源"
                    f"（计划 {research.planned_count} 条检索，"
                    f"执行 {research.executed_count} 条，"
                    f"无结果 {research.no_result_count} 条；"
-                   f"带回 {len(research.materials)} 份材料）")
-        self._remember(research.materials)
+                   f"带回 {len(research.materials)} 份检索摘要、"
+                   f"{len(research.extracted)} 份抓取正文，"
+                   f"进入材料流 {len(materials)} 份"
+                   f"（其中带门禁结论 {gate_valid} 份））")
+        self._remember(materials)
         return BusinessStepResult(
             name=STAGE_RESEARCH, status=STEP_EXECUTED,
             artifact_ids={"source_ids": list(research.source_ids)},
@@ -604,11 +634,26 @@ class BusinessOrchestrator:
         """
         known = set(source_ids)
         warnings: list[WarningNote] = []
+        # G5 修复：抽取器自己的告警**原样透传**。
+        # 修复前这里被整个丢掉，于是"材料为什么没进抽取器"
+        # （MATERIAL_QUALITY_UNDECLARED / MODEL_CALL_DUPLICATE_SKIPPED /
+        #  MODEL_RETURNED_EMPTY / MODEL_REFUSED / NO_MATERIALS …）在任务告警里
+        # 完全看不到，只剩一句笼统的 CLAIM_REJECTED —— 运维会把"材料没过门禁"
+        # 误判成"模型抽不出东西"，且无法按码筛选。
+        warnings.extend(getattr(outcome, "warnings", []) or [])
         for rejected in outcome.rejected:
+            # 材料级拒收（只有 reason，没有 claim）**用 reason 本身当告警码**：
+            # 这样 MATERIAL_UNDECLARED / MATERIAL_NOT_GATE_PASSED 是可筛选的码，
+            # 而不是只以文字形式藏在 message 里。claim 级拒收保持 CLAIM_REJECTED。
+            reason = _text(rejected.reason)
+            detail = rejected.message or _text(getattr(rejected, "claim", ""))
+            if reason and not _text(getattr(rejected, "claim", "")):
+                warnings.append(WarningNote(
+                    code=reason, message=f"材料被拒收（{reason}）：{detail}"))
+                continue
             warnings.append(WarningNote(
                 code=WARNING_CLAIM_REJECTED,
-                message=f"候选 claim 被拒收（{rejected.reason}）："
-                        f"{rejected.message or rejected.claim}"))
+                message=f"候选 claim 被拒收（{reason}）：{detail}"))
         pending_claims = list(getattr(outcome, "pending", []) or [])
         for pending in pending_claims:
             warnings.append(WarningNote(
@@ -802,6 +847,81 @@ class BusinessOrchestrator:
                     table.setdefault(key, source_id)
         return table
 
+    def _material_flow(
+        self, ctx: CallContext, research: ResearchOutput, target_ids: list[str],
+        topic: str,
+    ) -> tuple[list[SourceMaterial], list[WarningNote]] | Err:
+        """研究产出 → **送进抽取器的材料**。G4 修复的唯一落点。
+
+        缺陷本体（修复前）：`_step_research` 只 `_remember(research.materials)`，
+        而那是**检索摘要**（`quality_status=""`）。抓取到的正文虽然过了正文质量
+        门禁、也带着 `quality_status=VALID` 躺在 `research.extracted` 里，却
+        **从来没有人取**——`materials_from_extracts()` 这个唯一会把它转成材料的
+        函数在产品代码里零调用点。于是上线配置（`require_gate_verdict=True`）
+        下每份材料都在抽取器入口被判 `MATERIAL_UNDECLARED` 全部拒收，
+        **模型一次都不会被调用**（"抓了正文却交不出去"）。
+
+        这里补上三件必须一起做的事：
+          1. 调 `materials_from_extracts()` 把**过门禁的**正文转成材料；
+          2. 把 `source_id` 绑回去——该函数按设计留 `""`，而证据登记的可追溯
+             闸门要求候选的 `source_id` 必须在本次登记的来源里；
+          3. 同一来源既有摘要又有正文时**正文取代摘要**（同一 URL 的同一份
+             内容，重复交出去只会让模型看到重复材料，且摘要必然被严格门禁拒收）。
+
+        没有可用正文时**退回摘要**（保持既有行为，不新增阻断）：此时严格门禁
+        会如实把它们判为"未声明"，而不是静默假装有材料。
+        """
+        extracts = list(getattr(research, "extracted", []) or [])
+        materials, rejected = materials_from_extracts(
+            extracts, target_entity_ids=list(target_ids), query_text=_text(topic))
+
+        warnings: list[WarningNote] = []
+        for item in rejected:
+            reasons = "、".join(str(r) for r in (item.reasons or [])) or "UNKNOWN"
+            warnings.append(WarningNote(
+                code=WARNING_MATERIAL_GATE_REJECTED,
+                message=f"抓取正文未通过质量门禁（{item.status}：{reasons}），"
+                        f"未进入材料流：{_text(item.url) or '（无 url）'}"))
+
+        locator = self._source_locator(ctx, list(research.source_ids))
+        if isinstance(locator, Err):
+            return locator
+        unbound: list[str] = []
+        for material in materials:
+            source_id = (locator.get(_text(material.url))
+                         or locator.get(_text(material.canonical_key)))
+            if not source_id:
+                unbound.append(_text(material.url) or "（无 url）")
+                continue
+            material.source_id = source_id
+        if unbound:
+            warnings.append(WarningNote(
+                code=WARNING_MATERIAL_UNBOUND,
+                message=f"{len(unbound)} 份抓取正文找不到对应的已登记来源，"
+                        f"未进入材料流（证据必须能追溯到已登记来源，不得凭空声称）："
+                        f"{unbound}"))
+
+        bound = [m for m in materials if _text(m.source_id)]
+        if not bound:
+            if extracts:
+                warnings.append(WarningNote(
+                    code=WARNING_MATERIAL_NOT_USABLE,
+                    message=f"抓取到 {len(extracts)} 份正文但无一可用"
+                            "（未过门禁或来源无法绑定）：退回检索摘要"))
+            return list(research.materials), warnings
+
+        covered = {k for m in bound
+                   for k in (_text(m.url), _text(m.canonical_key)) if k}
+        kept = [m for m in research.materials
+                if not ({_text(m.url), _text(m.canonical_key)} & covered)]
+        superseded = len(research.materials) - len(kept)
+        if superseded:
+            warnings.append(WarningNote(
+                code=WARNING_MATERIAL_SUPERSEDED,
+                message=f"{superseded} 份检索摘要被同来源的抓取正文取代"
+                        "（同一来源不重复交给抽取器）"))
+        return bound + kept, warnings
+
     def _remember(self, materials: list[SourceMaterial]) -> None:
         """把研究材料存进**进程内**缓存（按 `task_id`）。
 
@@ -824,12 +944,19 @@ class BusinessOrchestrator:
         if not prior.get("source_ids"):
             return []
         # 研究是幂等的（register_source 会去重命中），重跑只为取回材料正文，
-        # 不会产生重复来源。
+        # 不会产生重复来源。G4：走与 `_step_research` **同一条**材料流，
+        # 否则回补路径又会只取回摘要（修复不完整 = 埋一个只在续跑时触发的坑）。
         rerun = self.deps.research.run(ctx, list(request.targets))
         if is_err(rerun):
             return rerun
-        self._remember(rerun.value.materials)
-        return list(rerun.value.materials)
+        flow = self._material_flow(
+            ctx, rerun.value, [t.entity_id for t in request.targets],
+            _text(request.topic))
+        if isinstance(flow, Err):
+            return flow
+        materials, _warnings = flow
+        self._remember(materials)
+        return materials
 
     def _find_evidence(
         self, ctx: CallContext, source_id: str, draft: EvidenceDraft
