@@ -142,6 +142,7 @@ WARNING_NO_DIALOGUE_PROFILE = "NO_DIALOGUE_PROFILE"
 WARNING_EXTRACTOR_ABSENT = "EXTRACTOR_ABSENT"          # 没注入抽取器，也没给种子
 WARNING_NO_MATERIALS = "NO_MATERIALS"                  # 研究没带回材料
 WARNING_CLAIM_REJECTED = "CLAIM_REJECTED"              # 候选 claim 被抽取器拒收
+WARNING_CLAIM_PENDING_REVIEW = "CLAIM_PENDING_REVIEW"  # 候选 claim 结构合法但核验不了，转待审核（P4.4-A）
 WARNING_NO_CANDIDATES = "NO_CANDIDATES"                # 一个可登记的候选都没有
 WARNING_INFERENCE_NO_ROOT = "INFERENCE_NO_ROOT"        # 无根推断，丢弃
 
@@ -529,7 +530,9 @@ class BusinessOrchestrator:
             ctx, materials, targets=list(request.targets))
         if is_err(extracted):
             return extracted
-        return self._register_candidates(ctx, extracted.value, source_ids)
+        outcome = extracted.value
+        return self._register_candidates(
+            ctx, outcome, source_ids, usage=getattr(outcome, "usage", None))
 
     # ------------------------------------------------------- 路径 A：显式种子
 
@@ -582,7 +585,8 @@ class BusinessOrchestrator:
     # ------------------------------------------------- 路径 B：自动抽取（G-2）
 
     def _register_candidates(
-        self, ctx: CallContext, outcome: ExtractionOutcome, source_ids: list[str]
+        self, ctx: CallContext, outcome: ExtractionOutcome, source_ids: list[str],
+        *, usage: "UsageDelta | None" = None,
     ) -> BusinessStepResult | Err:
         """把**候选** claim 交给 `Evidence` 校验与登记。
 
@@ -593,6 +597,10 @@ class BusinessOrchestrator:
 
         冲突**不裁决也不合并**：相互矛盾的说法各自登记成独立证据，再请
         `Evidence.detect_conflicts` 做确定性结构检测并记 `ConflictRecord`。
+
+        `outcome.pending`（P4.4-A）是**待审核**清单：结构合法但核验不了
+        （声称原话却没摘录、材料可疑、推断的根找不到…）。它们**不登记**，
+        但必须在这里显式转成提示——否则就成了"静默丢弃"。
         """
         known = set(source_ids)
         warnings: list[WarningNote] = []
@@ -601,6 +609,13 @@ class BusinessOrchestrator:
                 code=WARNING_CLAIM_REJECTED,
                 message=f"候选 claim 被拒收（{rejected.reason}）："
                         f"{rejected.message or rejected.claim}"))
+        pending_claims = list(getattr(outcome, "pending", []) or [])
+        for pending in pending_claims:
+            warnings.append(WarningNote(
+                code=WARNING_CLAIM_PENDING_REVIEW,
+                message=f"候选 claim 待审核（{getattr(pending, 'reason', '')}）："
+                        f"{getattr(pending, 'message', '') or getattr(pending, 'claim', '')}"
+                        "——未登记，交人工"))
 
         evidence_ids: list[str] = []
         key_to_evidence: dict[str, str] = {}
@@ -683,6 +698,7 @@ class BusinessOrchestrator:
                    f"{len(evidence_ids)} 条证据"
                    + (f"，丢弃 {dropped} 条无根推断" if dropped else "")
                    + f"，拒收 {len(outcome.rejected)} 条"
+                   + (f"，待审核 {len(pending_claims)} 条" if pending_claims else "")
                    + self._conflict_note(conflicts))
         if not evidence_ids:
             # 一条都没登记成功 —— 如实说"没做"，绝不报 EXECUTED 冒充成功
@@ -692,12 +708,13 @@ class BusinessOrchestrator:
             return BusinessStepResult(
                 name=STAGE_EVIDENCE, status=STEP_SKIPPED,
                 artifact_ids={"evidence_ids": [], ARTIFACT_CONFLICT_IDS: []},
-                warnings=warnings, message=message + "：证据阶段未产出任何证据")
+                warnings=warnings, message=message + "：证据阶段未产出任何证据",
+                usage=usage)
         return BusinessStepResult(
             name=STAGE_EVIDENCE, status=STEP_EXECUTED,
             artifact_ids={"evidence_ids": evidence_ids,
                           ARTIFACT_CONFLICT_IDS: conflicts},
-            warnings=warnings, message=message)
+            warnings=warnings, message=message, usage=usage)
 
     @staticmethod
     def _to_evidence_draft(

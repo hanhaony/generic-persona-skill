@@ -161,8 +161,11 @@ class TestOfflineGuarantee(unittest.TestCase):
 class TestRegistry(unittest.TestCase):
     def test_default_registry_names(self):
         registry = default_registry()
-        # P4.2 起注册表新增真实 Provider "tavily"（仅注册、不被离线护栏包裹）
-        self.assertEqual(registry.names(), ["failing", "fake", "recording", "tavily"])
+        # P4.2 起注册表新增真实 Provider "tavily"；P4.4-C 起再新增 "deepseek"
+        # （两者都**仅注册、不被离线护栏包裹**：它们只在 offline_only=false
+        #  且密钥齐备时才会被装配层构造）。
+        self.assertEqual(registry.names(),
+                         ["deepseek", "failing", "fake", "recording", "tavily"])
 
     def test_get_unknown_name_fails(self):
         registry = default_registry()

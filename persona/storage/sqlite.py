@@ -516,6 +516,30 @@ class SqliteStorage:
                                  f"记录外部用量失败：{exc}", trace_ref=ctx.trace_ref))
         return Ok(True)
 
+    def has_external_usage(
+        self,
+        ctx: CallContext,
+        idempotency_key: str,
+    ) -> Result[bool]:
+        """跨轮幂等的**只读查询**：这个幂等键记过没有（主键查）。
+
+        发送层守卫用它防止"任务恢复 / 重跑时重复抓取"——内存账本在重跑时
+        是空的，只有持久账本记得上一轮抓过。查询出错由调用方按"保守不发送"
+        处理（宁可不抓，不可重复花钱）。
+        """
+        if ctx.dry_run:
+            return Ok(False)
+        try:
+            row = self.connect().execute(
+                "SELECT 1 FROM external_usage_records"
+                " WHERE idempotency_key = ? LIMIT 1",
+                (idempotency_key,),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            return Err(new_error(ErrorCode.STORAGE_READ_FAILED,
+                                 f"查询外部用量失败：{exc}", trace_ref=ctx.trace_ref))
+        return Ok(row is not None)
+
     def external_usage_report(
         self,
         ctx: CallContext,

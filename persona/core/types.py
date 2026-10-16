@@ -237,11 +237,20 @@ class SourceMaterial:
     subject_entity_ids: list[str] = field(default_factory=list)
     target_display_names: list[str] = field(default_factory=list)
     query_text: str = ""
+    # P4.4-A：**正文质量门禁的结论**，随材料一起传递（"" = 未声明）。
+    #
+    # 为什么必须带上：`Research` 有两类材料来源——检索摘要（`snippet`，过滤前
+    # 就已通过检索接口）与抓取正文（经 `extract_quality` 门禁判定）。下游（抽取器）
+    # 只看到 `snippet` 字段，**分不清**这段文字是"检索摘要"还是"抓取正文"，
+    # 也就无法判断它有没有过门禁。把结论随材料传递，抽取器才能拒绝
+    # "门禁判为不可用"的正文（P4.4-A 第二步第 1 点）。
+    quality_status: str = ""
 
 
 # 外部调用逐笔用量记录的状态常量（本文件只放**形状**，规则归 modules/usage_ledger）
 OP_SEARCH = "SEARCH"
 OP_EXTRACT = "EXTRACT"
+OP_CHAT = "CHAT"          # 模型对话/抽取调用（P4.4-A：与检索、抓取同一个账本）
 OUTCOME_SUCCEEDED = "SUCCEEDED"
 OUTCOME_FAILED = "FAILED"
 COST_CONFIRMED = "CONFIRMED"

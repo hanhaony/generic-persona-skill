@@ -54,6 +54,30 @@ class LogLevel(str, Enum):
     ERROR = "ERROR"
 
 
+class ModelCurrency(str, Enum):
+    """模型单价的**计价币种**（P4.4-B）。
+
+    只允许两种：DeepSeek 官方价目表用 `USD`，阿里云百炼用 `CNY`。
+    **一本账里只能有一个币种**——把 USD 单价和 CNY 上限混进同一本账，
+    闸门算出来的数就没有意义了，所以币种是配置项而不是每次调用随便传。
+    """
+
+    USD = "USD"
+    CNY = "CNY"
+
+
+class ModelPriceTier(str, Enum):
+    """价格档位（P4.4-B）。
+
+    DeepSeek 的价目表**分峰时与闲时**（同一模型差一倍），所以"这次按哪个档位
+    预留"必须显式选一个并在配置里留下痕迹——否则同一份单价既能算出 0.6 也能
+    算出 1.2，账本上的数字变成猜的。
+    """
+
+    OFF_PEAK = "off_peak"    # 闲时（更便宜：估算更乐观 → 需要更保守的预留时别选它）
+    PEAK = "peak"            # 峰时（更贵：**保守预留应该选这个**）
+
+
 # ---------------------------------------------------------------------------
 # 敏感配置
 # ---------------------------------------------------------------------------
@@ -165,7 +189,75 @@ class ResearchLimits:
     max_queries: int = 5                 # 最多几次检索
     max_results_per_query: int = 5       # 每次检索最多保留多少条结果
     max_extracts: int = 3                # 最多抓取多少篇网页正文（0 = 不抓取）
+    max_remediations: int = 1            # 每个 URL 最多补救几次（P4.5：低质量正文的官方参数重试）
     max_cost: float | None = None        # 金额上限（None = 不限制）
+
+
+# ---------------------------------------------------------------------------
+# 模型抽取（G-2 / P4.4-B）的配置
+# ---------------------------------------------------------------------------
+
+# 已选定的服务商（P4.4-B 决策）。**这里只登记"允许联网的模型服务商"名字**，
+# 具体单价一律由配置给出（见 `ModelSettings`）——单价是会过期的商业条款，
+# 不写死在代码里当"官方费率"。
+NETWORK_MODEL_PROVIDER_NAMES: tuple[str, ...] = ("deepseek",)
+
+# 服务商决策的登记值（P4.4-B）：DeepSeek API / deepseek-flash / USD。
+# 注意：**只有"是否启用"默认关闭**（`provider=None`），其余字段在 .env.example
+# 里给出一份可直接用的取值；默认关闭是为了让"什么都不配"仍然离线、不花钱。
+DEFAULT_MODEL_ID = "deepseek-flash"
+
+
+@dataclass(frozen=True)
+class ModelSettings:
+    """模型抽取（G-2）的配置（P4.4-B）。
+
+    分三组，各自回答一个问题：
+
+    1. **用谁**：`provider` / `model_id` / `currency`。
+       `provider=None` 表示**未启用模型抽取**（安全默认：什么都不配就离线、不花钱）。
+    2. **多少钱**：`price_in_per_1m` / `price_out_per_1m` / `price_tier` /
+       `price_source` / `price_checked_at`。
+       单价是**原币**（`currency`）每 100 万 token；`price_source` + `price_checked_at`
+       是"这个数字从哪来、什么时候核对的"——没有来源的单价等于没有单价。
+    3. **闸门**：`max_cost`（本轮总上限）/ `max_cost_per_task`（单任务上限）/
+       `max_calls` / `est_tokens_in` / `est_tokens_out` / `require_gate_verdict`。
+
+    **币种固定 USD，不做汇率换算**（P4.4-C 拍板）：DeepSeek 官方计价即 USD，
+    一本账里只会有一种币。原 P4.4-B 的 `fx_usd_cny` / `fx_source` 折算通道已
+    按拍板**移除**——汇率是会过期的商业条款，而折算结果又不参与任何预算判定，
+    留着只会多一个"看起来算了其实没算"的数。
+
+    三条硬规矩（由 `validate_settings` 兜住，不是靠自觉）：
+      - 设了费用上限 → **必须**给出输入与输出两个单价，否则拒绝加载
+        （没单价就没法在发送前估算，也就没法保证不超支）；
+      - 给出了单价 → **必须**记录来源；
+      - 启用真实模型服务商 → 不允许 `offline_only=true`，且必须已设置密钥。
+    """
+
+    # ---- 1. 用谁 ----
+    provider: str | None = None            # None = 未启用模型抽取
+    model_id: str = DEFAULT_MODEL_ID
+    currency: str = ModelCurrency.USD.value
+
+    # ---- 2. 多少钱（原币 / 每 1M token）----
+    price_tier: str = ModelPriceTier.OFF_PEAK.value
+    price_in_per_1m: float | None = None
+    price_out_per_1m: float | None = None
+    price_source: str | None = None        # 官方价目表地址
+    price_checked_at: str | None = None    # 核对日期（YYYY-MM-DD）
+
+    # ---- 3. 闸门 ----
+    max_cost: float | None = None            # 本轮/本账本的总额上限（原币）
+    max_cost_per_task: float | None = None   # 单任务上限（原币）
+    max_calls: int | None = None             # 一条流程最多几次模型调用
+    est_tokens_in: int = 0                   # 事前估算输入 token（0 = 不估算）
+    est_tokens_out: int = 0
+    require_gate_verdict: bool = True         # 材料必须亮出正文质量门禁结论
+
+    def enabled(self) -> bool:
+        """是否启用模型抽取。`False` 时其余字段一律不生效（也不校验单价）。"""
+        return bool(str(self.provider or "").strip())
 
 
 @dataclass(frozen=True)
@@ -185,6 +277,7 @@ class AppSettings:
     budget: BudgetLimits = field(default_factory=BudgetLimits)
     retry: RetryLimits = field(default_factory=RetryLimits)
     research: ResearchLimits = field(default_factory=ResearchLimits)
+    model: ModelSettings = field(default_factory=ModelSettings)
     secrets: Secrets = field(default_factory=Secrets)
     sources: Mapping[str, str] = field(default_factory=dict)
 
@@ -238,7 +331,25 @@ class AppSettings:
                 "max_queries": self.research.max_queries,
                 "max_results_per_query": self.research.max_results_per_query,
                 "max_extracts": self.research.max_extracts,
+                "max_remediations": self.research.max_remediations,
                 "max_cost": self.research.max_cost,
+            },
+            "model": {
+                "enabled": self.model.enabled(),
+                "provider": self.model.provider,
+                "model_id": self.model.model_id,
+                "currency": self.model.currency,
+                "price_tier": self.model.price_tier,
+                "price_in_per_1m": self.model.price_in_per_1m,
+                "price_out_per_1m": self.model.price_out_per_1m,
+                "price_source": self.model.price_source,
+                "price_checked_at": self.model.price_checked_at,
+                "max_cost": self.model.max_cost,
+                "max_cost_per_task": self.model.max_cost_per_task,
+                "max_calls": self.model.max_calls,
+                "est_tokens_in": self.model.est_tokens_in,
+                "est_tokens_out": self.model.est_tokens_out,
+                "require_gate_verdict": self.model.require_gate_verdict,
             },
             "secrets": self.secrets.to_masked_dict(),
         }
@@ -310,8 +421,55 @@ CONFIG_FIELDS: tuple[FieldSpec, ...] = (
               "每次检索最多保留多少条结果（默认 5）", minimum=1, maximum=50),
     FieldSpec("PERSONA_RESEARCH_MAX_EXTRACTS", "research.max_extracts", "int", 3,
               "一次研究最多抓取多少篇网页正文（0 = 不抓取正文，默认 3）", minimum=0, maximum=20),
+    FieldSpec("PERSONA_RESEARCH_MAX_REMEDIATIONS", "research.max_remediations", "int", 1,
+              "每个 URL 的正文抓取最多补救几次（低质量时用官方参数重试，默认 1；0 = 不补救）",
+              minimum=0, maximum=5),
     FieldSpec("PERSONA_RESEARCH_MAX_COST", "research.max_cost", "float", None,
               "一次研究的金额上限；留空表示不限制", minimum=0, nullable=True),
+    # ---- 模型抽取（G-2 / P4.4-B）：用谁 ----
+    FieldSpec("PERSONA_MODEL_PROVIDER", "model.provider", "str", None,
+              "模型服务商（当前只有 deepseek）；**留空 = 不启用模型抽取**（离线、不花钱）",
+              nullable=True),
+    FieldSpec("PERSONA_MODEL_ID", "model.model_id", "str", DEFAULT_MODEL_ID,
+              "模型 ID（P4.4-B 决策：deepseek-flash）"),
+    FieldSpec("PERSONA_MODEL_CURRENCY", "model.currency", "enum", ModelCurrency.USD.value,
+              "模型单价的币种（一本账只能有一个币种）",
+              choices=tuple(m.value for m in ModelCurrency)),
+    # ---- 多少钱（原币 / 每 1M token）----
+    FieldSpec("PERSONA_MODEL_PRICE_TIER", "model.price_tier", "enum",
+              ModelPriceTier.OFF_PEAK.value,
+              "按哪个价格档位预留（DeepSeek 分峰时/闲时，同一模型差一倍）",
+              choices=tuple(t.value for t in ModelPriceTier)),
+    FieldSpec("PERSONA_MODEL_PRICE_IN_PER_1M", "model.price_in_per_1m", "float", None,
+              "输入单价（原币 / 每 100 万 token）；设了费用上限就必须给出",
+              minimum=0, maximum=1_000_000, nullable=True),
+    FieldSpec("PERSONA_MODEL_PRICE_OUT_PER_1M", "model.price_out_per_1m", "float", None,
+              "输出单价（原币 / 每 100 万 token）；设了费用上限就必须给出",
+              minimum=0, maximum=1_000_000, nullable=True),
+    FieldSpec("PERSONA_MODEL_PRICE_SOURCE", "model.price_source", "str", None,
+              "单价的来源（官方价目表地址）；给出单价就必须记录来源",
+              nullable=True),
+    FieldSpec("PERSONA_MODEL_PRICE_CHECKED_AT", "model.price_checked_at", "str", None,
+              "单价的核对日期（YYYY-MM-DD）", nullable=True),
+    # ---- 闸门 ----
+    FieldSpec("PERSONA_MODEL_MAX_COST", "model.max_cost", "float", None,
+              "本轮模型调用的总额上限（原币，如 USD）；留空表示不限制",
+              minimum=0, maximum=1_000_000, nullable=True),
+    FieldSpec("PERSONA_MODEL_MAX_COST_PER_TASK", "model.max_cost_per_task", "float", None,
+              "单个任务的模型费用上限（原币）；留空表示不限制",
+              minimum=0, maximum=1_000_000, nullable=True),
+    FieldSpec("PERSONA_MODEL_MAX_CALLS", "model.max_calls", "int", None,
+              "一条流程最多几次模型调用；留空表示不限制", minimum=0, maximum=10_000,
+              nullable=True),
+    FieldSpec("PERSONA_MODEL_EST_TOKENS_IN", "model.est_tokens_in", "int", 0,
+              "事前估算的输入 token（0 = 不估算；设了费用上限就必须 > 0）",
+              minimum=0, maximum=10_000_000),
+    FieldSpec("PERSONA_MODEL_EST_TOKENS_OUT", "model.est_tokens_out", "int", 0,
+              "事前估算的输出 token（0 = 不估算；设了费用上限就必须 > 0）",
+              minimum=0, maximum=10_000_000),
+    FieldSpec("PERSONA_MODEL_REQUIRE_GATE_VERDICT", "model.require_gate_verdict", "bool",
+              True,
+              "材料是否必须亮出正文质量门禁结论才允许进入抽取器（P4.4-B 决策：true）"),
 )
 
 # 真实（联网）Provider 名称。装配前必须由 `validate_settings` 校验：
@@ -381,7 +539,20 @@ def _to_enum(spec: FieldSpec, text: str):
         return RunMode(text)
     if spec.path == "log_level":
         return LogLevel(text)
+    model_enum = _MODEL_ENUM_PATHS.get(spec.path)
+    if model_enum is not None:
+        # **存纯字符串**（不是枚举成员）：币种/档位要原样流进
+        # `ModelCallLimits.currency`，变成枚举成员后 str() 会带上类名，
+        # 账本里的币种就会写成 "ModelCurrency.USD" 这种不能对账的东西。
+        return model_enum(text).value
     raise AssertionError(f"未登记的枚举字段：{spec.path}")
+
+
+# 模型相关枚举字段：登记 → 取值 → 立即降回纯字符串（理由见上）
+_MODEL_ENUM_PATHS: dict[str, type] = {
+    "model.currency": ModelCurrency,
+    "model.price_tier": ModelPriceTier,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +598,8 @@ def validate_settings(settings: AppSettings) -> list[AppError]:
             f"退避上限 {settings.retry.backoff_max_ms}ms 小于退避基数 "
             f"{settings.retry.backoff_base_ms}ms"))
 
+    problems.extend(_validate_model(settings))
+
     # —— 密钥：格式只粗筛，值绝不出现在信息里 ——
     for env_key, value in settings.secrets._items():
         if value is None:
@@ -470,6 +643,88 @@ def config_error(spec: FieldSpec, reason: str) -> AppError:
         f"配置项 {spec.env_key}（{spec.path}）无效：{reason}",
         details={"env_key": spec.env_key, "path": spec.path},
     )
+
+
+def _validate_model(settings: AppSettings) -> list[AppError]:
+    """模型抽取配置的交叉校验（P4.4-B）。
+
+    这里只做**配置层能判定的自相矛盾**，不判断"这个单价对不对"（那要人工核对
+    官方价目表）。每一条都对应一条预算红线，放在加载期而不是运行期：
+
+    - 设了上限却缺单价 → 运行期只能"拒绝发起请求"，与其到那时才停，不如加载就报错；
+    - 给了单价却没有来源 → 无法审计"这个数字从哪来的"；
+    - 单任务上限 > 总上限 → 自相矛盾；
+    - 启用了真实模型服务商却仍要求离线 → 拒构造（与真实搜索 Provider 同规矩）。
+    """
+    model = settings.model
+    problems: list[AppError] = []
+
+    ceiling = model.max_cost if model.max_cost is not None else model.max_cost_per_task
+    if ceiling is not None:
+        if model.price_in_per_1m is None or model.price_out_per_1m is None:
+            problems.append(config_error(
+                FIELD_BY_ENV_KEY["PERSONA_MODEL_PRICE_IN_PER_1M"],
+                "设了模型费用上限，但输入/输出单价没有同时给出。"
+                "没有单价就无法在发送前估算本次费用，也就无法保证不超支——"
+                "闸门不会用估计值冒充，只会拒绝自动发起请求。请补齐两个单价"
+                "或清空上限。"))
+        if int(model.est_tokens_in or 0) <= 0 and int(model.est_tokens_out or 0) <= 0:
+            problems.append(config_error(
+                FIELD_BY_ENV_KEY["PERSONA_MODEL_EST_TOKENS_IN"],
+                "设了模型费用上限，但事前 token 估算全是 0（est_tokens_in/out）。"
+                "闸门要按『本次可能产生的最大费用』预留，没有 token 估算就算不出"
+                "这个数——未知不等于 0。请给出保守估算或清空上限。"))
+
+    if (model.price_in_per_1m is not None or model.price_out_per_1m is not None) \
+            and not str(model.price_source or "").strip():
+        problems.append(config_error(
+            FIELD_BY_ENV_KEY["PERSONA_MODEL_PRICE_SOURCE"],
+            "给出了模型单价，但没有记录单价的来源（官方价目表地址）。"
+            "来源不明的单价一旦过期就会被当成官方费率误信，比没有单价更危险。"))
+
+    if (model.max_cost is not None and model.max_cost_per_task is not None
+            and model.max_cost_per_task > model.max_cost):
+        problems.append(config_error(
+            FIELD_BY_ENV_KEY["PERSONA_MODEL_MAX_COST_PER_TASK"],
+            f"单任务上限 {model.max_cost_per_task} 大于总上限 {model.max_cost}："
+            "单任务花费不可能超过总额，这两个数写反了。"))
+
+    if model.provider in NETWORK_MODEL_PROVIDER_NAMES:
+        if settings.offline_only:
+            problems.append(new_error(
+                ErrorCode.VALIDATION_CONFIG_INVALID,
+                f"model.provider={model.provider!r} 是真实模型服务商，"
+                f"不能在 offline_only=true 下启用（那会真实联网并产生费用）。"
+                f"请设 PERSONA_OFFLINE_ONLY=false 并提供模型密钥，"
+                f"或把 PERSONA_MODEL_PROVIDER 留空以关闭模型抽取。",
+                details={"path": "model.provider", "reason": "offline_conflict"},
+            ))
+        elif not settings.secrets.provider_api_key:
+            problems.append(new_error(
+                ErrorCode.VALIDATION_REQUIRED_FIELD,
+                f"启用了真实模型服务商（model.provider={model.provider!r}），"
+                f"但未设置模型密钥。请设置 {ENV_PROVIDER_API_KEY}"
+                f"（或它的别名 DEEPSEEK_API_KEY）后再启用。",
+                details={"env_key": ENV_PROVIDER_API_KEY, "reason": "missing"},
+            ))
+
+    # —— 交叉检查：要求门禁结论，却不抓正文 ——
+    # 只在**真的启用模型**时才判：否则"什么都不配"的默认配置会被无关的规则打回。
+    # 这条拦的是一种很具体的死局：检索摘要天生没有门禁结论（它不是网页正文），
+    # 所以"要求每份材料都亮出结论" + "不抓正文" = 材料永远进不了抽取器
+    # = 模型一次都不会被调用。这条死局在运行期看起来像"业务流程正常跑完了"，
+    # 极难从日志发现，所以必须挡在加载期。
+    if (model.enabled() and model.require_gate_verdict
+            and int(settings.research.max_extracts or 0) <= 0):
+        problems.append(config_error(
+            FIELD_BY_ENV_KEY["PERSONA_RESEARCH_MAX_EXTRACTS"],
+            "启用了真实模型抽取并开启 require_gate_verdict（材料必须亮出正文质量"
+            "门禁结论），但研究阶段不抓取网页正文（max_extracts=0）：检索摘要天生"
+            "没有门禁结论，结果是**没有任何材料能进入抽取器，模型一次都不会被调用**。"
+            "请把该值设为 ≥1（并确认抓取正文确实经过质量门禁），"
+            "或把 require_gate_verdict 设为 false。"))
+
+    return problems
 
 
 # ---------------------------------------------------------------------------

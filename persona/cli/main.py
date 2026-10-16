@@ -58,6 +58,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-dotenv", action="store_true", help="忽略 .env 文件，只看默认值与环境变量",
     )
 
+    p_model = sub.add_parser(
+        "model", help="模型抽取（G-2）的配置概览与 dry-run（**不调真实模型、不花钱**）")
+    p_model.add_argument(
+        "action", nargs="?", default="plan", choices=("plan", "dryrun"),
+        help="plan=打印装配后的决策快照；dryrun=打印将要发出的 ChatRequest（默认 plan）",
+    )
+    p_model.add_argument(
+        "--no-dotenv", action="store_true", help="忽略 .env 文件，只看默认值与环境变量",
+    )
+
     p_task = sub.add_parser("task", help="任务生命周期（创建 / 查询 / 推进 / 暂停 / 恢复 / 取消）")
     tsub = p_task.add_subparsers(dest="task_action", metavar="{create,show,list,...}")
 
@@ -151,7 +161,9 @@ def _print_info() -> None:
     print("    persona.providers    外部服务统一接口 + Mock（全程离线，不需要 API Key）")
     print("    persona.orchestrator 六态状态机 + 任务服务 + 预算闸门 + Mock 执行器（P2.3）\n"
           "                        + BusinessOrchestrator（业务编排：Research→Evidence→\n"
-          "                        Persona→Relationship→Dialogue，复用既有任务能力）")
+          "                        Persona→Relationship→Dialogue，复用既有任务能力）\n"
+          "                        + model_setup（P4.4-B：配置→模型抽取器装配、预算上限、\n"
+          "                        gate 开关、dry-run；**不调真实模型**）")
     print("    persona.modules      业务模块端口协议；ResearchService（资料搜集：检索计划/检索/")
     print("                        过滤排序/经 Evidence 登记来源；不写证据表）已实现、")
     print("                        EvidenceService（来源/事件/证据管理）、")
@@ -173,6 +185,9 @@ def _print_info() -> None:
           "`BusinessOrchestrator` 已可一条命令跑完五阶段业务链，但**证据 claim 仍需调用方显式提供**"
           "（源→证据自动抽取未实现），故 AC-1/AC-2 仅为部分满足；"
           "对话/记忆只做本地基础能力，不调真实模型、不接入外网检索；"
+          "模型抽取（G-2）的服务商、单价、预算与 gate 开关已可按配置装配，"
+          "`persona model plan/dryrun` 可离线查看将要发出的请求，"
+          "但**尚未授权真实模型调用**，真实模型抽取质量未经验证；"
           "对话与记忆已打通闭环，但**默认不把对话写入长期记忆**"
           "（须显式授权 + 显式候选）。`EvaluationService` 提供只读不变式与依赖检查。")
 
@@ -280,6 +295,118 @@ def _print_config(action: str, *, use_dotenv: bool) -> int:
     for note in result.warnings:
         print(f"  提示      : {note.message}")
     return EXIT_OK
+
+
+def _load_settings_or_report(*, use_dotenv: bool):
+    """加载配置；失败时打印人话并返回 None（**不回显任何密钥值**）。"""
+    from ..config import load_settings
+    from ..core.result import error_of, is_ok, unwrap
+
+    result = load_settings(use_dotenv=use_dotenv)
+    if not is_ok(result):
+        error = error_of(result)
+        print("配置校验：未通过")
+        print(f"  错误码    : {error.code}")
+        print(f"  说明      : {error.message}")
+        extra = error.details.get("all_problems")
+        if isinstance(extra, list) and len(extra) > 1:
+            print(f"  其它问题（共 {len(extra)} 条）:")
+            for message in extra[1:]:
+                print(f"    - {message}")
+        print("  提示      : 参考 .env.example，或 `persona config show` 看当前生效值")
+        return None
+    for note in result.warnings:
+        print(f"  提示      : {note.message}")
+    return unwrap(result)
+
+
+def _yes_no(value: bool) -> str:
+    return "是" if value else "否"
+
+
+def _print_model(action: str, *, use_dotenv: bool) -> int:
+    """`persona model plan|dryrun`。
+
+    **两条命令都不会发出任何请求**：`plan` 只读配置，`dryrun` 只构造请求对象。
+    所以它们不需要密钥（密钥缺失时打印"未设置"，绝不回显内容）。
+    """
+    from ..config.spec import ENV_PROVIDER_API_KEY
+    from ..orchestrator import build_dry_run_request, model_plan
+
+    settings = _load_settings_or_report(use_dotenv=use_dotenv)
+    if settings is None:
+        return 1
+
+    plan = model_plan(settings)
+    if action == "plan":
+        _print_model_plan(plan, ENV_PROVIDER_API_KEY)
+        return EXIT_OK
+
+    # ---- dryrun ----
+    request, admitted, rejected = build_dry_run_request(settings)
+    _print_model_plan(plan, ENV_PROVIDER_API_KEY, compact=True)
+    print()
+    print("dry-run：构造一次抽取请求（**没有发送任何请求，也没有产生费用**）")
+    print(f"  目标模型        : {request.model_hint}")
+    print(f"  response_format : {request.response_format}"
+          f"（统一契约的『要结构化输出』；DeepSeekProvider 发出前映射为 json_object）")
+    print(f"  max_output_tokens: {request.max_output_tokens}")
+    print(f"  prompt_version  : {request.metadata.get('prompt_version')}")
+    print(f"  通过准入的材料  : {len(admitted)} 份"
+          f"{f'，被门禁挡下 {len(rejected)} 份' if rejected else ''}")
+    if rejected:
+        for item in rejected:
+            print(f"    - [{item.reason}] {item.message}")
+    if not admitted:
+        print("  ⚠️ 没有任何材料通过准入：真实运行时也**不会**发起请求。")
+        return EXIT_OK
+    for index, message in enumerate(request.messages):
+        label = "system（规则）" if message.role == "system" else \
+            "user（数据；材料已被标记块包裹）"
+        print(f"--- [{index}] {message.role} —— {label} ---")
+        print(message.content)
+        print()
+    print("说明：内容是 dry-run **合成样张**（不是任何真实人物/事件）；"
+          "真实材料必须由研究阶段给出正文质量门禁结论才能通过准入。")
+    print("本命令全程离线：不联网、不调模型、不记账。")
+    return EXIT_OK
+
+
+def _print_model_plan(plan: dict, key_env: str, *, compact: bool = False) -> None:
+    """打印装配后的决策快照。**只显示密钥"是否设置"，不显示内容**（D-081）。"""
+    def money(value: Any) -> str:
+        return "未设置" if value is None else str(value)
+
+    per_call = plan.get("est_cost_per_call")
+
+    print("模型抽取决策快照（P4.4-B / P4.4-C 拍板）")
+    print(f"  是否启用        : {_yes_no(plan['enabled'])}"
+          f"（PERSONA_MODEL_PROVIDER={plan['provider'] or '未设置'}）")
+    print(f"  服务商 / 模型   : {plan['provider'] or '—'} / {plan['model_id']}")
+    print(f"  币种            : {plan['currency']}（固定 USD，不做汇率换算）")
+    print(f"  价格档位        : {plan['price_tier']}")
+    print(f"  单价（原币/1M） : 输入 {money(plan['price_per_1m_in'])}"
+          f"  输出 {money(plan['price_per_1m_out'])}")
+    print(f"  单价（账本/1K） : 输入 {money(plan['price_per_1k_in'])}"
+          f"  输出 {money(plan['price_per_1k_out'])}")
+    print(f"  单价来源        : {plan['price_source'] or '未记录'}"
+          f"（核对日期 {plan['price_checked_at'] or '未记录'}）")
+    is_set = plan["secret_status"].get(key_env)
+    print(f"  模型密钥        : {key_env} "
+          f"{'已设置（内容不显示）' if is_set else '未设置'}")
+    if compact:
+        return
+    print(f"  预算            : 总上限 {money(plan['max_cost_total'])}"
+          f" | 单任务上限 {money(plan['max_cost_per_task'])}"
+          f" | **生效上限 {money(plan['max_cost_effective'])}** {plan['currency']}")
+    print(f"  调用次数上限    : {money(plan['max_calls'])}")
+    print(f"  事前 token 估算 : 输入 {plan['est_tokens_in']} / 输出 {plan['est_tokens_out']}")
+    print(f"  单次调用估算    : {money(per_call)} {plan['currency']}")
+    print(f"  gate 开关       : require_gate_verdict="
+          f"{_yes_no(plan['require_gate_verdict'])}"
+          f"（材料必须亮出正文质量门禁结论才允许进抽取器）")
+    for note in plan.get("notes", []):
+        print(f"  注意            : {note}")
 
 
 def _open_task_service(project_id: str) -> tuple[Any, Any] | None:
@@ -460,6 +587,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             getattr(args, "action", "show"),
             use_dotenv=not getattr(args, "no_dotenv", False),
         )
+    if args.command == "model":
+        return _print_model(
+            getattr(args, "action", "plan"),
+            use_dotenv=not getattr(args, "no_dotenv", False),
+        )
     if args.command == "task":
         if not getattr(args, "task_action", ""):
             # 没有子动作时打印 task 的帮助（argparse 的 --help 会走 SystemExit）
@@ -484,7 +616,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(f"命令 `persona {args.command}` 尚未实现。")
     print(f"当前阶段：{STAGE}")
-    print("可用命令：persona info / persona selftest / persona config / persona task")
+    print("可用命令：persona info / persona selftest / persona config / persona model / persona task")
     return EXIT_NOT_IMPLEMENTED
 
 

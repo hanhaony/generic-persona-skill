@@ -59,6 +59,7 @@ from ..core.usage_ledger import (
     ExternalUsageLedger,
     estimate_extract_credits,
     estimate_search_credits,
+    extract_key_parts,
     make_idempotency_key,
 )
 from .base import (
@@ -232,9 +233,13 @@ class TavilyProvider:
         if req.include_favicon:
             payload["include_favicon"] = True
 
+        # 幂等键：优先用调用方给的（便于与调用方的预留对齐），否则按请求内容生成。
+        # 兜底推导走 `extract_key_parts`——与 Research 预留侧**同一个函数**，
+        # 保证"预留键 == 结算键"由构造保证，而不是靠两边碰巧写成一样的顺序。
         key = (req.metadata or {}).get("idempotency_key") or make_idempotency_key(
-            "tavily", OP_EXTRACT, *sorted(urls), depth, req.query or "",
-            req.format or "", req.chunks_per_source)
+            "tavily", OP_EXTRACT,
+            *extract_key_parts(urls, depth=depth, query=req.query,
+                               fmt=req.format, chunks_per_source=req.chunks_per_source))
 
         outcome = self._post_json(
             ctx, "/extract", payload, operation=OP_EXTRACT,

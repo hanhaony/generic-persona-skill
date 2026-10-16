@@ -46,6 +46,7 @@ from .types import (  # noqa: F401  (本模块对外重导出，供调用方单�
     COST_UNKNOWN,
     CURRENCY_CREDIT,
     CURRENCY_UNKNOWN,
+    OP_CHAT,
     OP_EXTRACT,
     OP_SEARCH,
     OUTCOME_FAILED,
@@ -78,6 +79,28 @@ WARNING_USAGE_LEDGER_PAUSED = "USAGE_LEDGER_PAUSED"
 # --------------------------------------------------------------------------
 # 数据模型
 # --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ModelCallLimits:
+    """模型调用的**量级与费用闸门**（P4.4-A 第五步）。
+
+    **单价由装配层注入，本模块不内置任何单价**（理由见 `estimate_model_cost`）。
+    单价一旦给出，账本就能同时回答"这次花了多少"和"还能不能再花"。
+
+    三个闸门各管一件事，互不替代：
+        - `max_calls`：次数上限（防"无限重试把额度打光"）；
+        - `max_cost`：金额上限（按官方单价估算后比较）；
+        - `price_per_1k_*`：把 token 换成金额的唯一依据；缺它就**无法保证**不超上限。
+    """
+
+    max_calls: int | None = None          # 一次流程最多几次模型调用（None = 不限制）
+    max_cost: float | None = None         # 费用上限（None = 不限制）
+    price_per_1k_in: float | None = None  # 输入单价（每 1K token；官方价目表）
+    price_per_1k_out: float | None = None
+    currency: str = CURRENCY_UNKNOWN      # 单价的计价单位（如 CNY / USD）
+    est_tokens_in: int = 0                # 事前估算的输入 token（0 = 不估算 → 费用未知）
+    est_tokens_out: int = 0
 
 
 # --------------------------------------------------------------------------
@@ -118,6 +141,111 @@ def make_idempotency_key(provider: str, operation: str, *parts: Any) -> str:
     normalized = "|".join(str(p) for p in parts if p is not None and str(p) != "")
     raw = f"{provider}|{operation}|{normalized}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def model_call_key_parts(
+    *,
+    model: str,
+    material_keys: list[str] | tuple[str, ...],
+    target_ids: list[str] | tuple[str, ...] = (),
+    prompt_version: str = "",
+) -> tuple:
+    """模型调用幂等键的**唯一口径**（P4.4-A）。
+
+    组成 = 模型名 | 排序后的材料键 | 排序后的目标对象 | 提示词版本
+
+    为什么这些进键而"提示词字数"不进：键要表达的是**请求意图**（拿这批材料、
+    对这些人、用这个模型抽一次）。字数是实现的副产品，把它放进键会让
+    "同一意图、格式微调"变成两笔新花费——那就不是幂等了。
+    """
+    return (
+        str(model or ""),
+        *sorted(str(k) for k in material_keys if str(k or "").strip()),
+        *sorted(str(t) for t in target_ids if str(t or "").strip()),
+        str(prompt_version or ""),
+    )
+
+
+def estimate_model_cost(
+    limits: "ModelCallLimits",
+    *,
+    tokens_in: int | None = None,
+    tokens_out: int | None = None,
+) -> float | None:
+    """按**装配层给出的官方单价**估算一次模型调用费用。
+
+    **单价缺失 → 返回 `None`（不知道就是不知道，D-060）**。本模块不内置任何
+    服务商单价：那是"某账户在某时间点的商业条款"，写死进代码迟早会过期，
+    而一个过期的单价会被当成"官方费率"误信——比没有单价更危险。
+
+    返回 `None` 还有一个硬后果（P4.4-A 第五步第 3 点）：调用方在设了费用上限
+    时必须**拒绝自动发起请求**，因为"无法估算"就等于"无法保证不超上限"。
+    """
+    if limits.price_per_1k_in is None and limits.price_per_1k_out is None:
+        return None
+    count_in = int(tokens_in if tokens_in is not None else limits.est_tokens_in)
+    count_out = int(tokens_out if tokens_out is not None else limits.est_tokens_out)
+    if count_in <= 0 and count_out <= 0:
+        # 单价有、token 数却是 0（大概率是没给估算）→ **仍然算"不知道"**：
+        # 用 0 当估算会让"设了上限"的闸门形同虚设（D-060：未知不是 0）。
+        return None
+    total = 0.0
+    if limits.price_per_1k_in is not None:
+        total += (count_in / 1000.0) * float(limits.price_per_1k_in)
+    if limits.price_per_1k_out is not None:
+        total += (count_out / 1000.0) * float(limits.price_per_1k_out)
+    return total
+
+
+def cost_from_model_usage(
+    limits: "ModelCallLimits",
+    *,
+    tokens_in: int | None,
+    tokens_out: int | None,
+) -> float | None:
+    """响应拿到真实 token 用量后，按官方单价算**实际**费用。
+
+    与 `estimate_model_cost` 的分工：这个是**事后**、用的是响应回报的真实 token 数；
+    那个是**事前**、用的是估算 token 数。两者都不做货币换算，单位由
+    `limits.currency` 声明。token 数未知或缺单价 → `None`（不填 0）。
+    """
+    if tokens_in is None and tokens_out is None:
+        return None
+    if limits.price_per_1k_in is None and limits.price_per_1k_out is None:
+        return None
+    return estimate_model_cost(limits, tokens_in=tokens_in or 0,
+                               tokens_out=tokens_out or 0)
+
+
+def extract_key_parts(
+    urls: list[str] | tuple[str, ...],
+    *,
+    depth: str = "basic",
+    query: str = "",
+    fmt: str = "",
+    chunks_per_source: int | None = None,
+) -> tuple:
+    """Extract 幂等键的**唯一口径**（P4.5 补救接线）。
+
+    `Research` 预留（请求发出之前）与 Provider 兜底推导（没给 metadata 键时）
+    **必须调同一个函数**。此前两边各写一遍：research 侧 4 段、provider 侧 6 段，
+    任何一处漂移都会出事——
+
+    - 预留用 A 键、结算用 B 键 → A 的预留永远弹不掉，**幽灵占额度**；
+    - 两笔不同请求共用一个键 → 该记的那笔被当成重复，**静默不计**。
+
+    组成（顺序即契约，不要单独改一边）：
+        排序后的 URL 们 | depth | query | format | chunks_per_source
+    空值由 `make_idempotency_key` 过滤（None / "" 不参与哈希），
+    所以"没带 query"与"带了空 query"天然是同一个键。
+    """
+    return (
+        *sorted(str(u) for u in urls if str(u).strip()),
+        str(depth or "basic"),
+        query or "",
+        fmt or "",
+        chunks_per_source,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -225,6 +353,20 @@ class ExternalUsageLedger:
 
     def get(self, key: str) -> ExternalUsageRecord | None:
         return self._records.get(key)
+
+    def has_attempted(self, key: str) -> bool:
+        """这个幂等键是否已经走过"预留 / 结算"——**重发可能重复计费**。
+
+        `settle()` 的幂等只防"重复**记账**"，防不了"重复**花钱**"：键相同
+        再发一次，钱真的会再花一次，而 settle 只会静默返回 `False`。
+        发送前守卫 + settle 才是完整的幂等（P4.5 D3）。
+
+        覆盖三种状态：已结算（`_records`）、费用未知占位（`_unknown_holds`）、
+        预留中（`_reservations`）——后两者说明这笔已经花过（或正在花），
+        同样不能重发。
+        """
+        return (key in self._records or key in self._unknown_holds
+                or key in self._reservations)
 
     def totals(self) -> UsageTotals:
         t = UsageTotals()

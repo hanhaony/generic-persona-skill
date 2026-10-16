@@ -55,7 +55,7 @@ from typing import Any, Protocol, runtime_checkable
 from ..core.context import CallContext
 from ..core.enums import FetchStatus, SourceKind
 from ..core.errors import ErrorCategory, ErrorCode, new_error
-from ..core.result import Err, Ok, Result, UsageDelta, WarningNote, is_err
+from ..core.result import Err, Ok, Result, UsageDelta, WarningNote, is_err, unwrap
 from ..core.temporal import FuzzyDate, TimePrecision
 from ..config.spec import ResearchLimits
 from ..core.types import (
@@ -68,6 +68,7 @@ from ..core.types import (
 from ..core.usage_ledger import (
     estimate_extract_credits,
     estimate_search_credits,
+    extract_key_parts,
     make_idempotency_key,
 )
 from ..providers.base import (
@@ -77,11 +78,16 @@ from ..providers.base import (
     SearchResult,
 )
 from .extract_quality import (
+    DEFAULT_CHUNKS_PER_SOURCE,
     DEFAULT_MIN_EFFECTIVE_CHARS,
     ContentQuality,
-    REASON_EMPTY,
     QUALITY_EMPTY,
+    QUALITY_LOW,
+    QUALITY_VALID,
+    REASON_EMPTY,
     assess_content_quality,
+    has_extraction_defect,
+    plan_remediation,
 )
 from .compliance import (
     COMPLIANCE_STAGE_EXTRACT,
@@ -107,6 +113,18 @@ WARNING_CANDIDATE_REJECTED = "CANDIDATE_REJECTED"    # 有候选被拒（原因�
 WARNING_BATCH_DEDUP = "BATCH_DEDUP"                  # 同一批内的重复候选被折叠
 WARNING_REGISTER_DEDUP = "SOURCE_DEDUP_HIT"          # 与 Evidence 同名：命中去重，返回原记录
 WARNING_NO_EVENTS = "NO_EVENTS"                      # 本模块不产出 SourceEvent（交 Evidence）
+# —— P4.5 补救接线（官方 query+chunks_per_source / format=text 自动重抓）——
+WARNING_EXTRACT_REMEDIATED = "EXTRACT_REMEDIATED"    # 低质量正文经官方参数补救后通过门禁
+WARNING_EXTRACT_REMEDIATION_BUDGET_STOPPED = "EXTRACT_REMEDIATION_BUDGET_STOPPED"
+# D1：补救阶段费用上限不足 → **停手 + 告警**，已抓到的材料照常返回（不把整轮判失败）
+WARNING_EXTRACT_REMEDIATION_UNKNOWN_PAUSE = "EXTRACT_REMEDIATION_UNKNOWN_PAUSE"
+# 费用状态未知的请求达到上限 → 保守停手，等人工核对（不默认失败请求免费）
+WARNING_EXTRACT_REMEDIATION_CAPPED = "EXTRACT_REMEDIATION_CAPPED"
+# 本轮补救发送总量达到 max_extracts → 截断（D2）
+WARNING_EXTRACT_DUPLICATE_SKIPPED = "EXTRACT_DUPLICATE_SKIPPED"
+# 幂等：同一请求意图账本里已记过 → **不再发送**（settle 幂等防不了重复花钱）
+WARNING_NO_REMEDIATION_SUPPORT = "NO_REMEDIATION_SUPPORT"
+# 注入的提取策略没有按 URL 补救的入口 → 跳过补救（不静默失败）
 # 官方默认检索/提取深度（docs.tavily.com：search_depth 与 extract_depth 默认 basic）
 DEFAULT_SEARCH_DEPTH = "basic"
 WARNING_COST_CEILING_UNENFORCEABLE = "COST_CEILING_UNENFORCEABLE"
@@ -320,6 +338,11 @@ class ExtractedContent:
     flagged_untrusted: bool = False      # 是否检测到疑似提示注入
     # P4.5：正文质量评估（None = 尚未评估）。只有 VALID 才能当研究材料。
     quality: "ContentQuality | None" = None
+    # P4.5 补救诊断（纯记录，不参与门禁判定）：
+    #   `remediation_attempts` —— 已发出的补救请求数（受 max_remediations 约束）；
+    #   `remediation_detail`   —— 每次补救的选项与结果（救活/仍低质量/被跳过/出错）。
+    remediation_attempts: int = 0
+    remediation_detail: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def is_usable_material(self) -> bool:
@@ -368,6 +391,7 @@ class ContentExtractionStrategy(Protocol):
         max_extracts: int,
         metadata: dict | None = None,     # P4.5：透传 idempotency_key 等
         query: str = "",                  # P4.5：官方 query 参数（内容块相关性重排）
+        chunks_per_source: int | None = None,  # P4.5 D4：官方分块参数（需 query 才生效）
     ) -> Result[list[ExtractedContent]]:
         ...
 
@@ -385,6 +409,19 @@ class UsageSinkPort(Protocol):
 
     def record_external_usage(self, ctx: CallContext,
                               record: ExternalUsageRecord) -> Any:
+        ...
+
+    def has_external_usage(self, ctx: CallContext,
+                           idempotency_key: str) -> Any:
+        """跨轮幂等的**只读查询**（P4.5 D3）：这个键在持久账本里记过没有。
+
+        没有它，任务恢复 / 重跑时内存账本是空的，发送层守卫失效——同一个
+        请求会真的再花一次钱，而 `settle` 只会静默返回 `False`（防重复记账，
+        不防重复花钱）。实现方按主键查即可；查不到/查不了由调用方保守处理。
+
+        用 `getattr` 取用（见 `_duplicate_reason`）：早期只实现了写入侧的
+        老出口不因新增该方法而失效。
+        """
         ...
 
 
@@ -429,6 +466,15 @@ def materials_from_extracts(
             source_kind="WEB_PAGE",
             subject_entity_ids=_str_list(target_entity_ids),
             query_text=query_text,
+            # P4.4-A：把**门禁结论**随材料交给下游。
+            #
+            # 走到这里的条目必然 `is_usable_material`（即门禁判为 `VALID`），
+            # 所以这个值不是重复判定，而是把"已经判过了"这件事**告诉抽取器**：
+            # 抽取器据此才能执行它那一侧的材料准入（`admit_materials`），
+            # 并在上线时用 `require_gate_verdict=True` 拒绝任何没有结论的材料。
+            # 不填的后果很具体：真实链路上每份材料都是"未声明"，
+            # 严格模式会把**所有**真实材料都拒掉（等于模型永远跑不起来）。
+            quality_status=QUALITY_VALID,
         ))
     return materials, rejected
 
@@ -450,19 +496,19 @@ class TopNExtractionStrategy:
         max_extracts: int,
         metadata: dict | None = None,
         query: str = "",
+        chunks_per_source: int | None = None,
     ) -> Result[list[ExtractedContent]]:
-        """抓前 N 个候选的正文。
+        """抓前 N 个候选的正文（Protocol 入口；实际抓取在 `extract_urls`）。
 
         P4.5：
         - `metadata["idempotency_key"]` 透传给 Provider，保证预留与结算对得上；
-        - `query` 用官方 `query` 参数（内容块按相关性重排）；
+        - `query` + `chunks_per_source` 用官方参数（内容块按相关性重排 + 分块）。
+          D4：初始抓取**默认带上**（真实复测实测：314,743 字长页 → 1,937 字正文），
+          从源头减少"摘录是导航骨架"的概率；无 query 时按官方约束都不带；
         - **把 Provider 回报的 usage 原样带出去**（`Ok(out, usage=...)`）。
           此前这一步把 usage 整个丢掉，导致抓取用量从不进账本 —— 这是 P4.3
           真实运行暴露的缺陷的直接根因。
         """
-        from ..core.temporal import to_iso, utc_now
-        from ..providers.base import ExtractRequest
-
         if max_extracts <= 0:
             return Ok([])
         # 已按 rank_weight 降序，取前 N 个带 URL 的结果
@@ -475,6 +521,36 @@ class TopNExtractionStrategy:
                 break
         if not urls:
             return Ok([])
+        return self.extract_urls(
+            ctx, provider, urls, max_extracts=max_extracts,
+            metadata=metadata, query=query, chunks_per_source=chunks_per_source)
+
+    def extract_urls(
+        self,
+        ctx: CallContext,
+        provider: Provider,
+        urls: list[str],
+        *,
+        max_extracts: int,
+        metadata: dict | None = None,
+        query: str = "",
+        chunks_per_source: int | None = None,
+        format: str | None = None,
+    ) -> Result[list[ExtractedContent]]:
+        """抓**指定 URL 列表**的正文（`extract` 与补救都走这里，同一套转换）。
+
+        补救之所以复用本方法而不是另写一条路：转换逻辑（提示注入检测、
+        `raw_content`/`excerpt` 映射、usage 透传）只有一份，初始抓取与补救
+        抓取的行为差异只体现在**请求参数**上（query/chunks/format）。
+        """
+        from ..core.temporal import to_iso, utc_now
+        from ..providers.base import ExtractRequest
+
+        urls = [str(u) for u in (urls or []) if str(u).strip()]
+        if not urls:
+            return Ok([])
+        if max_extracts > 0:
+            urls = urls[:max_extracts]
 
         extract_fn = getattr(provider, "extract", None)
         if extract_fn is None or not callable(extract_fn):
@@ -486,6 +562,11 @@ class TopNExtractionStrategy:
         if query:
             # 官方参数：内容块按与 query 的相关性重排（本阶段只用官方选项）
             request.query = query
+            # 官方约束：chunks_per_source 仅在提供 query 时可用（Provider 侧夹紧 1..5）
+            if chunks_per_source is not None:
+                request.chunks_per_source = chunks_per_source
+        if format:
+            request.format = format
         response = extract_fn(ctx, request)
         if is_err(response):
             return response
@@ -1132,14 +1213,42 @@ class ResearchService:
         # 预留按"最坏情况"（全部 URL 都成功）估，结算时再按真实成功数收敛。
         urls = [_text(c.result.url) for c in extractable if _text(c.result.url)]
         urls = list(dict.fromkeys(urls))
-        key = self._reserve(ctx, OP_EXTRACT, *sorted(urls), "basic",
-                            estimate=estimate_extract_credits(len(urls), "basic"),
-                            max_cost=self.deps.effective_limits.max_cost)
+
+        query_text = self._target_query_text()
+        # D4：初始抓取也带官方 `chunks_per_source`（官方默认 3）。
+        # 真实复测实测：query+chunks 把 314,743 字长页压成 1,937 字正文，
+        # 从源头减少"摘录是导航骨架"的概率，省掉一次补救额度。
+        # 官方约束：chunks_per_source 仅在提供 query 时可用 → 无 query 就不带。
+        initial_chunks = DEFAULT_CHUNKS_PER_SOURCE if query_text else None
+
+        # 幂等键：research 预留与 provider 结算共用 `extract_key_parts` 同一口径
+        # （顺序/空值过滤只有一个定义），保证"预留键 == 结算键"由构造保证。
+        key = make_idempotency_key(
+            "tavily", OP_EXTRACT,
+            *extract_key_parts(urls, depth="basic", query=query_text,
+                               chunks_per_source=initial_chunks))
+
+        # —— 发送层守卫（P4.5 D3）：账本记过这个键就不再发 ——
+        # `settle` 的幂等只防"重复记账"，防不了"重复花钱"：键相同再发一次，
+        # 钱真的会再花一次，而 settle 只会静默返回 False。
+        duplicate = self._duplicate_reason(ctx, key)
+        if duplicate is not None:
+            output.warnings.append(WarningNote(
+                code=WARNING_EXTRACT_DUPLICATE_SKIPPED,
+                message=f"正文抓取跳过发送：{duplicate}（幂等键 {key[:8]}…）"))
+            return Ok(ComplianceDecision.allow(rule="extraction_deduped"))
+
+        self._reserve(ctx, OP_EXTRACT, *extract_key_parts(
+            urls, depth="basic", query=query_text,
+            chunks_per_source=initial_chunks),
+            estimate=estimate_extract_credits(len(urls), "basic"),
+            max_cost=self.deps.effective_limits.max_cost)
 
         result = strategy.extract(
             ctx, self.deps.provider, extractable, max_extracts=max_extracts,
             metadata={"idempotency_key": key},
-            query=self._target_query_text(),
+            query=query_text,
+            chunks_per_source=initial_chunks,
         )
         if is_err(result):
             # 失败 ≠ 免费：预留**不释放**（转为未知占位，继续占额度）
@@ -1157,7 +1266,189 @@ class ResearchService:
         items, rejected = self._gate_extract_quality(ctx, result.value)
         output.extracted.extend(items)
         output.rejected_extracts.extend(rejected)
+        # —— 低质量正文的官方参数补救（P4.5 补救接线）——
+        # 初始已带 query+chunks（D4），补救只剩 format=text 等官方选项作兜底。
+        self._remediate_low_quality(ctx, output, items)
         return Ok(ComplianceDecision.allow(rule="extraction_done"))
+
+    # ------------------------------------------------------------ 补救（P4.5）
+
+    def _remediate_low_quality(
+        self,
+        ctx: CallContext,
+        output: "ResearchOutput",
+        items: list["ExtractedContent"],
+    ) -> None:
+        """对低质量正文做**有限**补救：用官方参数重抓，过了门禁就原地救活。
+
+        三条硬约束（接入时用户明确要求）：
+          1. **预算**：每次补救都走"天花板 → 预留 → 发送 → 入账"，与初始抓取
+             同一套；失败不释放预留（失败 ≠ 免费）。预算不足 → **停手 + warning**，
+             已抓到的材料照常返回（D1：不把整轮判成 BUDGET_EXCEEDED——
+             初始抓取已成功，好材料不该被一次"可选补救"作废）。
+          2. **次数**：每 URL 最多 `max_remediations` 次；本轮补救发送总量
+             ≤ `max_extracts`（D2：补救是同一篇的第二次抓取，不占初始名额，
+             但也不能无限膨胀）。
+          3. **幂等**：发送前查账本（轮内 + 跨轮），记过就**不再发**（D3）。
+
+        只补救"拿到了但质量不行"的条目；API 抓取失败（`error` 有值）的条目
+        不补救——那是抓取层问题，重试属于另一类决策。
+        """
+        limits = self.deps.effective_limits
+        if limits.max_remediations <= 0 or limits.max_extracts <= 0:
+            return
+        strategy = self.deps.extraction_strategy
+        remediate_fn = getattr(strategy, "extract_urls", None)
+        if remediate_fn is None or not callable(remediate_fn):
+            output.warnings.append(WarningNote(
+                code=WARNING_NO_REMEDIATION_SUPPORT,
+                message=f"提取策略 {type(strategy).__name__} 不支持按 URL 补救，跳过补救"))
+            return
+
+        query_text = self._target_query_text()
+        # D4+R1：初始抓取已带 query+chunks（两者同进同退）时，补救选项①
+        # （query+chunks）是重复消费，由 plan_remediation 剔除。
+        already_queried = bool(query_text)
+
+        sent = 0
+        for item in items:
+            if item.error or item.quality is None:
+                continue        # API 失败 / 未评估：不是"质量不行"，不补救
+            if item.quality.status not in (QUALITY_LOW, QUALITY_EMPTY):
+                continue
+            if item.remediation_attempts >= limits.max_remediations:
+                continue
+            if not has_extraction_defect(item.quality):
+                # 只是"与目标人物无关"这类**相关性**判断 → 重新抓同一页
+                # 也不会变有关，补救只会白花额度（预算要花在能救回来的条目上）
+                item.remediation_detail.append(
+                    {"skipped": "非提取质量缺陷（相关性判断），补救无收益"})
+                continue
+            plan = plan_remediation(
+                item.url, item.quality, query=query_text,
+                max_options=limits.max_remediations - item.remediation_attempts,
+                already_queried=already_queried)
+            if not plan.allowed or not plan.options:
+                # 视频/社交页等：没有可用的官方选项 → 记诊断，不花额度
+                item.remediation_detail.append(
+                    {"skipped": plan.reason or "无可选官方参数"})
+                continue
+            for option in plan.options:
+                if sent >= limits.max_extracts:
+                    output.warnings.append(WarningNote(
+                        code=WARNING_EXTRACT_REMEDIATION_CAPPED,
+                        message=f"补救总量已达本轮上限（{limits.max_extracts}），停止补救"))
+                    return
+                # —— 预算（D1）：不足 → 停手 + warning，**不返回 Err** ——
+                # 粗粒度最坏情况（1 credit/URL），与初始路径同口径
+                ceiling = self._cost_ceiling(output, reserve=1.0)
+                if ceiling is not None:
+                    output.warnings.append(WarningNote(
+                        code=WARNING_EXTRACT_REMEDIATION_BUDGET_STOPPED,
+                        message=f"补救因费用上限停止：{ceiling.error.message}"))
+                    return
+                # —— 费用不明 → 保守停手（未知请求达上限，等人工核对）——
+                pause, why = self._pause_reason(limits.max_cost)
+                if pause:
+                    output.warnings.append(WarningNote(
+                        code=WARNING_EXTRACT_REMEDIATION_UNKNOWN_PAUSE,
+                        message=f"补救因费用状态不明停止：{why}"))
+                    return
+                option_query = str(option.get("query") or "")
+                option_format = str(option.get("format") or "")
+                option_chunks = option.get("chunks_per_source")
+                key = make_idempotency_key(
+                    "tavily", OP_EXTRACT,
+                    *extract_key_parts([item.url], depth="basic",
+                                       query=option_query, fmt=option_format,
+                                       chunks_per_source=option_chunks))
+                duplicate = self._duplicate_reason(ctx, key)
+                if duplicate is not None:
+                    output.warnings.append(WarningNote(
+                        code=WARNING_EXTRACT_DUPLICATE_SKIPPED,
+                        message=f"补救跳过发送：{duplicate}（幂等键 {key[:8]}…）"))
+                    continue
+                self._reserve(ctx, OP_EXTRACT, *extract_key_parts(
+                    [item.url], depth="basic", query=option_query,
+                    fmt=option_format, chunks_per_source=option_chunks),
+                    estimate=estimate_extract_credits(1, "basic"),
+                    max_cost=limits.max_cost)
+                sent += 1
+                result = remediate_fn(
+                    ctx, self.deps.provider, [item.url], max_extracts=1,
+                    metadata={"idempotency_key": key},
+                    query=option_query, chunks_per_source=option_chunks,
+                    format=option_format or None)
+                if is_err(result):
+                    # 失败 ≠ 免费：预留不释放（Provider 已按 UNKNOWN 结算），
+                    # 由上面的 should_pause 决定是否继续花下一个。
+                    item.remediation_attempts += 1
+                    item.remediation_detail.append(
+                        {"option": dict(option), "error": str(result.error)})
+                    continue
+                self._add_usage(output.budget_used, getattr(result, "usage", None))
+                for note in (result.warnings or []):
+                    output.warnings.append(note)
+                # 重新过门禁（判的是新摘录，不是旧的）
+                fresh, _ = self._gate_extract_quality(ctx, list(result.value or []))
+                item.remediation_attempts += 1
+                rescued = [f for f in fresh if not f.error and f.is_usable_material]
+                if rescued:
+                    new = rescued[0]
+                    # 原地更新：URL 不变，换掉内容/摘录/质量（不新增同 URL 的重复条目）
+                    item.title = new.title or item.title
+                    item.content = new.content
+                    item.excerpt = new.excerpt
+                    item.content_type = new.content_type
+                    item.truncated = new.truncated
+                    item.extracted_at = new.extracted_at or item.extracted_at
+                    item.flagged_untrusted = new.flagged_untrusted
+                    item.quality = new.quality
+                    item.remediation_detail.append(
+                        {"option": dict(option), "result": "rescued"})
+                    output.rejected_extracts = [
+                        r for r in output.rejected_extracts if r.url != item.url]
+                    output.warnings.append(WarningNote(
+                        code=WARNING_EXTRACT_REMEDIATED,
+                        message=f"正文经官方参数补救后通过质量门禁：{item.url}"))
+                    break   # 救活了就不再花后续选项
+                item.remediation_detail.append(
+                    {"option": dict(option), "result": "still_low_quality"})
+                # 更新 rejected 条目的诊断，让"补救过但没救活"可追溯
+                for r in output.rejected_extracts:
+                    if r.url == item.url:
+                        r.diagnosis = dict(r.diagnosis)
+                        r.diagnosis["remediation"] = list(item.remediation_detail)
+
+    def _duplicate_reason(self, ctx: CallContext, key: str) -> str | None:
+        """这个幂等键是不是已经抓过（轮内账本 + 跨轮持久账本）。
+
+        返回 None = 没抓过可以发；否则返回原因（用于 warning）。
+        持久账本查询出错 → **保守当作已抓过**：宁可不抓，不可重复花钱。
+        """
+        ledger = self._usage_ledger()
+        if ledger is not None and ledger.has_attempted(key):
+            return "本轮账本已记录该请求"
+        probe = getattr(self.deps.usage_sink, "has_external_usage", None)
+        if probe is None:
+            return None
+        outcome = probe(ctx, key)
+        if is_err(outcome):
+            return f"持久账本查询失败，按已记录处理（{outcome.error.message}）"
+        if unwrap(outcome):
+            return "持久账本已记录该请求（跨轮/任务恢复）"
+        return None
+
+    def _pause_reason(self, max_cost: float | None) -> tuple[bool, str]:
+        """保守停手判断：会超成本上限，或未知费用请求达到上限。
+
+        `ExternalUsageLedger.should_pause` 此前只活在账本对象里、从未接进
+        流程——"费用状态不明就停手"这条规则等于没执行。这里接上。
+        """
+        ledger = self._usage_ledger()
+        if ledger is None:
+            return False, ""
+        return ledger.should_pause(max_cost, need=1.0)
 
     # ------------------------------------------------------------ 质量门禁
 

@@ -39,6 +39,19 @@ from .business import (
 )
 from .checkpoint import idempotency_key, is_unit_done, mark_unit_done, new_checkpoint
 from .executor import MockUnitHandler, TaskRunner, UnitOutcome, WorkUnit
+from .model_setup import (
+    DRY_RUN_SAMPLE_TARGETS,
+    build_dry_run_request,
+    chat_provider_config,
+    chat_provider_from_settings,
+    claim_extractor_from_settings,
+    effective_max_cost,
+    estimate_call_cost_usd,
+    model_limits_from_settings,
+    model_plan,
+    sample_materials,
+    unit_price_per_1k,
+)
 from .records import (
     PROCESS_INTERRUPTED,
     BudgetSpec,
@@ -116,4 +129,17 @@ __all__ = [
     "STEP_SKIPPED",
     "STEP_FAILED",
     "STEP_NOT_REACHED",
+    # 模型抽取装配（P4.4-B）
+    "model_limits_from_settings",
+    "claim_extractor_from_settings",
+    "estimate_call_cost_usd",
+    "unit_price_per_1k",
+    "effective_max_cost",
+    "model_plan",
+    "build_dry_run_request",
+    "sample_materials",
+    "DRY_RUN_SAMPLE_TARGETS",
+    # 真实聊天 Provider 装配（P4.4-C）
+    "chat_provider_config",
+    "chat_provider_from_settings",
 ]

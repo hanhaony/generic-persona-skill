@@ -54,10 +54,19 @@ ENV_ALIASES: dict[str, str] = {
     "RESEARCH_MAX_RESULTS": "PERSONA_RESEARCH_MAX_RESULTS",
     "RESEARCH_MAX_EXTRACTS": "PERSONA_RESEARCH_MAX_EXTRACTS",
     "RESEARCH_MAX_COST": "PERSONA_RESEARCH_MAX_COST",
+    "RESEARCH_MAX_REMEDIATIONS": "PERSONA_RESEARCH_MAX_REMEDIATIONS",
 }
-# 密钥别名：TAVILY_API_KEY 映射到"搜索密钥"（与 PERSONA_SEARCH_API_KEY 等价）。
+# 密钥别名：服务商惯用名 → 本项目的敏感变量名。
+#   TAVILY_API_KEY    → 搜索密钥（真实搜索 Provider，P4.2）
+#   DEEPSEEK_API_KEY  → 模型密钥（真实模型 Provider，P4.4-B）
+# 别名有两层作用，**缺一不可**：
+#   1) 环境变量里写了惯用名，本项目也能读到（不用把密钥改个名字再存一遍）；
+#   2) `.env` 文件里写了惯用名，会被识别为"敏感变量写进文件"并**告警忽略**
+#      ——没有这一层，`DEEPSEEK_API_KEY=...` 会落在 `PERSONA_` 前缀之外被**静默忽略**，
+#      用户以为配好了，实际一直没生效。
 ENV_SECRET_ALIASES: dict[str, str] = {
     "TAVILY_API_KEY": ENV_SEARCH_API_KEY,
+    "DEEPSEEK_API_KEY": ENV_PROVIDER_API_KEY,
 }
 
 
@@ -65,7 +74,7 @@ def _apply_aliases(raw: dict[str, str]) -> dict[str, str]:
     """把用户短名键重命名为集中字段名（非 PERSONA_ 短名只在此消歧义）。"""
     out: dict[str, str] = {}
     for key, value in raw.items():
-        target = ENV_ALIASES.get(key, key)
+        target = ENV_ALIASES.get(key) or ENV_SECRET_ALIASES.get(key, key)
         out[target] = value
     return out
 
@@ -202,13 +211,11 @@ def load_settings(
         sources[_spec_of(key)] = "explicit"
 
     # ---------- 敏感配置：只从环境变量来 ----------
-    # 用**位置参数**构造：既避免写出字段名，也保证顺序固定
-    # 搜索密钥支持别名 TAVILY_API_KEY（与 PERSONA_SEARCH_API_KEY 等价）
-    search_key = _clean(environment.get(ENV_SEARCH_API_KEY)) \
-        or _clean(environment.get("TAVILY_API_KEY"))
+    # 用**位置参数**构造：既避免写出字段名，也保证顺序固定。
+    # 取值顺序：`PERSONA_*` 本体优先，其次才是服务商惯用别名（见 ENV_SECRET_ALIASES）。
     secrets = Secrets(
-        _clean(environment.get(ENV_PROVIDER_API_KEY)),
-        search_key,
+        _secret_from_env(environment, ENV_PROVIDER_API_KEY),
+        _secret_from_env(environment, ENV_SEARCH_API_KEY),
     )
     settings = replace(settings, secrets=secrets, sources=dict(sources))
 
@@ -257,6 +264,50 @@ def _clean(value: str | None) -> str | None:
         return None
     stripped = value.strip()
     return stripped or None
+
+
+def _secret_from_env(environment: Mapping[str, str], primary_key: str) -> str | None:
+    """读一个敏感变量：`PERSONA_*` 本体优先，其次按 `ENV_SECRET_ALIASES` 找别名。
+
+    大小写**不敏感**（见 `_env_lookup_ci`）。这不是假想防御：2026-10-16 在本机
+    实测到环境变量名被改写大小写的情况（注册表里存的是小写 `deepseek_api_key`），
+    而密钥读不到时上层只报"未设置"，用户完全看不出是大小写问题。
+
+    返回值**只进内存**，不落任何日志/文件/错误信息（D-078/D-081）；
+    本函数也不校验格式（那是 `validate_settings` 的事，且它只报"哪个变量有问题"）。
+    """
+    value = _env_lookup_ci(environment, primary_key)
+    if value is not None:
+        return value
+    for alias, target in ENV_SECRET_ALIASES.items():
+        if target != primary_key:
+            continue
+        found = _env_lookup_ci(environment, alias)
+        if found is not None:
+            return found
+    return None
+
+
+def _env_lookup_ci(environment: Mapping[str, str], name: str) -> str | None:
+    """大小写不敏感地取一个环境变量的值（取不到返回 `None`）。
+
+    为什么需要：Windows 上 `os.environ` 会把键名规范成大写，本项目的变量又全是
+    大写命名，所以默认路径精确取就能命中；但**显式传入的 env 字典**（测试）和
+    非 Windows 平台上的用户环境可能是任意大小写。密钥这种"读不到只报未设置"
+    的配置，一旦栽在大小写上极难排查，所以这里兜一次。
+
+    优先级确定且可预期：**精确大小写命中 > 遍历中第一个忽略大小写的命中**。
+    """
+    direct = _clean(environment.get(name))
+    if direct is not None:
+        return direct
+    wanted = name.upper()
+    for key, value in environment.items():
+        if key.upper() == wanted:
+            found = _clean(value)
+            if found is not None:
+                return found
+    return None
 
 
 def _spec_of(env_key: str) -> str:

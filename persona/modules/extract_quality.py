@@ -104,6 +104,16 @@ OFFICIAL_EXTRACT_FORMATS = ("markdown", "text")
 OFFICIAL_CHUNKS_MIN, OFFICIAL_CHUNKS_MAX = 1, 5
 DEFAULT_CHUNKS_PER_SOURCE = 3         # 官方默认值
 
+# 属于"**提取质量缺陷**"的拒收原因：换官方参数重抓同一页**可能**改善。
+# 其余原因是相关性 / 页面类型判断——重新抓取不会让一页无关内容变得有关，
+# 对它们补救只是白花额度（P4.5 补救接线：预算要花在能救回来的条目上）。
+EXTRACTION_DEFECT_REASONS = frozenset({
+    REASON_EMPTY,
+    REASON_TOO_SHORT,
+    REASON_NAV_DOMINATED,
+    REASON_NO_PROSE,
+})
+
 
 # --------------------------------------------------------------------------
 # 结果
@@ -300,12 +310,26 @@ class RemediationPlan:
                 "options": list(self.options), "reason": self.reason}
 
 
+def has_extraction_defect(quality: ContentQuality) -> bool:
+    """这次拒收里有没有"**提取质量缺陷**"（值得花一次补救额度）。
+
+    只有相关性判断（与目标人物无关）或页面类型不支持时 → 不该补救：
+    换 `format` / `chunks_per_source` 重新抓**同一页**，不会让一页无关
+    内容变得有关——那是在拿预算赌运气。
+
+    有空 / 过短 / 导航占满 / 找不到连续正文中**任意一个** → 值得试一次
+    官方参数（这些恰恰是提取方式可能改善的问题）。
+    """
+    return any(r in EXTRACTION_DEFECT_REASONS for r in (quality.reasons or []))
+
+
 def plan_remediation(
     url: str,
     quality: ContentQuality,
     *,
     query: str = "",
     max_options: int = DEFAULT_MAX_REMEDIATIONS,
+    already_queried: bool = False,
 ) -> RemediationPlan:
     """给出补救方案。**只按官方参数，且不超过 `max_options` 个。**
 
@@ -315,6 +339,12 @@ def plan_remediation(
          **与 query 最相关的若干内容块**，而不是页面开头。
          （官方约束：`chunks_per_source` 仅在提供 `query` 时可用，1<=x<=5）
       2. `format=text`：官方的纯文本格式选项。
+
+    `already_queried=True` 表示调用方**已经用 query+chunks_per_source 抓过
+    这个 URL**（P4.5 D4：初始抓取默认带官方分块参数）——此时选项①是
+    **重复消费**：官方按"成功 URL 提取"计费、与请求怎么分批无关
+    （真实复测确认：第 5 次成功提取才计 1 credit），同一 URL 同参数
+    再抓一次内容也相同。故剔除①，只留②。
 
     对视频/社交页**不补救**：这类页面没有可提的文章正文，补救只会白花额度。
     """
@@ -328,8 +358,9 @@ def plan_remediation(
         return plan
 
     options: list[dict] = []
-    # ① 官方 query + chunks_per_source（需要 query 才成立）
-    if query:
+    # ① 官方 query + chunks_per_source（需要 query 才成立；
+    #    且调用方已用同参数抓过时是重复消费，剔除）
+    if query and not already_queried:
         chunks = min(max(DEFAULT_CHUNKS_PER_SOURCE, OFFICIAL_CHUNKS_MIN),
                      OFFICIAL_CHUNKS_MAX)
         options.append({"query": query, "chunks_per_source": chunks})
@@ -339,6 +370,9 @@ def plan_remediation(
     if not query:
         # 没有研究目标文本时，① 不成立（官方约束），只剩 ②
         plan.reason = "无研究目标文本，官方 chunks_per_source 选项不可用"
+    elif already_queried:
+        plan.reason = ("初始抓取已带 query+chunks_per_source，"
+                       "重复发送是重复消费，只保留 format=text")
 
     plan.options = options[:max(0, max_options)]
     if not plan.options:
