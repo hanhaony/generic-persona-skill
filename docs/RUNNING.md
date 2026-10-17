@@ -881,6 +881,52 @@ RelationshipService.create_relationship / revise
 
 ---
 
+## 5.15 G11：外部用量账本只有纯内存实现（**跨进程累计不成立**）
+
+**登记日期**：2026-10-17（P4.5-B C 轮，用户要求显式登记）
+
+### 事实（代码级）
+
+`ExternalUsageLedger`（`persona/core/usage_ledger.py`）是**纯内存**对象：没有落盘、
+没有初始化时恢复、没有跨进程共享。每个进程各自从 `occupied_cost() == 0` 起算。
+
+### 影响（必须说清，不许含糊）
+
+| 看起来成立的 | 实际成立吗 |
+| --- | --- |
+| 单次运行内 `max_cost` 闸门有效（超限即 `BUDGET_EXCEEDED`、可恢复暂停） | ✅ 成立（同一进程内累计） |
+| **跨多次运行 / 跨进程的累计费用闸门** | ❌ **不成立**：第二个进程看不到前一次的花费，`occupied` 重新从 0 开始 |
+| "本项目的累计花费已被系统自动限制在 0.25 USD 内" | ❌ **不成立**：0.25 是**每次进程**的上限，不是历史累计上限 |
+
+结论：**系统的费用保护是"单次运行"级别的，累计金额只能靠人工记账。**
+在实现落盘账本之前，任何人不得把"账本里有 `max_cost`"当成"总花费受控"。
+
+### 人工累计记账规则（C 轮之后生效）
+
+1. **不重置**。累计值是跨轮次的连续量，每轮只做加法。
+2. 计算公式：
+
+   ```
+   新累计 = 上轮累计 + 本轮 cost_confirmed
+   ```
+
+3. 已知基线：上一轮（P4.5-A 真实冒烟）累计 = **0.0012765 USD**。
+   因此 C 轮之后的累计 = `0.0012765 + 本轮实际`。
+4. 金额来源以账本记录为准：`cost_status=CONFIRMED` 且 `cost_source=OFFICIAL_RATE`。
+   若某笔 `cost_status != CONFIRMED`（例如响应缺 token），**按估算值计入并显式标注
+   "未确认"**，不得当作 0。
+5. 每轮报告必须写出三个数：**本轮金额 / 累计金额 / 单次上限（0.25 USD）**。
+6. 若累计金额本身被质疑，审计入口是每轮落盘的产物（`ledger.records[]`）与
+   `cost_confirmed` 的复算结果（`scripts/verify_p4_5a_outputs.py` 的 A5.* 检查）。
+
+### 本轮不做什么（避免把两件事混在一起）
+
+- **不**实现系统级累计闸门（落盘账本 + 跨进程恢复 + 累计上限）。它需要新表、
+  并发写与对账语义，**另立轮次**，不混进冒烟。
+- **不**用"再跑一次"来抵消一次未入账的运行——那会让累计记账失真。
+
+---
+
 ## 6. 变更历史
 
 | 日期 | 版本 | 变更 |
@@ -902,3 +948,4 @@ RelationshipService.create_relationship / revise
 | 2026-10-14 | v0.16 | G-2（来源材料 → 候选 claim 自动抽取）：新增 `persona/modules/extraction.py`（`ClaimExtractorPort` / `CandidateClaim` / `MockClaimExtractor` / `ProviderClaimExtractor`）；`Research` 追加 `materials` 输出（此前 `snippet` 被丢弃是核心数据缺口）；`SourceMaterial` 下沉 `core/types.py`；`BusinessDeps` 新增可注入 `claim_extractor`，`evidence_seeds` 变可选；新增 `tests/test_claim_extraction.py`（28 项）+ 业务编排器 G-2 用例（18 项）；测试数 648 → **694**（3.13.14 / 3.14.7 实测全过）；新增 §5.13；**AC-1 由「部分满足」转为已满足（Mock 链路，不等于真实网络研究已过）**；新登记缺口 G-6（材料无法落检查点）；H-17（正文抓取）仍开 | 已实现，**待人工验收** |
 | 2026-10-14 | v0.15 | H-10A（业务编排型 Orchestrator，用户称 H-10A，编号差异见 DECISIONS Q-37 第九轮 / §2.24）：新增 `persona/orchestrator/business.py`（**`BusinessOrchestrator`**，实现 `UnitHandler` 接入既有 `TaskRunner`，打通 Research → Evidence → Persona → Relationship → Dialogue）；既有任务 Orchestrator 一行未改；新增 `tests/test_business_orchestrator.py`（37 项）；测试数 611 → **648**（3.13.14 / 3.14.7 实测全过）；新增 §5.12（调用链 / 调用方式 / 结果三态 / AC-1·AC-2 核对 / 遗留 G-1~G-5 / 已知限制）；`INTERFACES §12.7` 登记契约（v0.1.5） | 已实现，**待人工验收** |
 | 2026-10-14 | v0.14 | H-11A（Research 最小可运行实现，用户称 H-11A，编号差异见 DECISIONS Q-37 第八轮 / §2.23）：`persona/modules/research.py` 由 Protocol-only 推进为 **`ResearchService`**（确定性检索计划 / 经 Provider.search 检索 / 过滤排序 / 经 Evidence 登记 / run 聚合），新增独立 **`SourceRegistrarPort`（仅 `register_source`，堵死 F-10）**与 `ResearchDeps`；新增 `tests/test_research_module.py`（48 项）；测试数 563 → **611**（3.13.14 / 3.14.7 实测全过）；新增 §5.11（交付 / 调用方式与 IO / 与 Evidence 衔接 / 追溯与隔离 / 契约取舍 / 遗留 H-14~H-17 / 接真实研究服务的条件）；`INTERFACES §5.3` 回填实现状态（v0.1.4） | 已实现，**待人工验收** |
+| 2026-10-17 | v0.18 | 新增 §5.15：**G11 登记**——`ExternalUsageLedger` 纯内存、无落盘，**跨进程累计费用闸门不成立**；明确 0.25 USD 是"每次进程"上限而非累计上限；给出 C 轮之后的人工累计记账规则（不重置、新累计 = 上轮累计 + 本轮 `cost_confirmed`、基线 0.0012765 USD、未确认笔数按估算值计入并标注）；声明系统级累计闸门**另立轮次**、不混进冒烟 | 待确认 |

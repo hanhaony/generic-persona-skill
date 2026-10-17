@@ -242,6 +242,41 @@ E2E_TEXT_2 = "\n\n".join(E2E_PASSAGES_2)
 
 E2E_TARGET_2 = PersonQueryTarget(entity_id="pe_p45a_adeng", display_name="阿灯")
 
+# --------------------------------------------------------------------------
+# 第三份合成材料："互动页"（C 轮新增）
+#
+# 为什么必须单独一份：前两份材料**没有任何一句同时点名两人**，因此抽取阶段
+# 结构性地产不出覆盖 ≥2 名参与者的 RELATION 证据，关系档案只能是
+# `INSUFFICIENT_EVIDENCE`。链路是通的，但"关系条目产出路径"从未被验证过。
+#
+# 每句都点名两人、且分别覆盖：共同例行 / 互动方式 / 配合旧例 / 同一夜的双方视角 /
+# 散场交接。复用已有事实（铜钟、掌灯、护灯架）以避免制造冲突噪声。
+# 门禁实测：status=VALID, prose_chars=243, nav_line_ratio=0.0, target_mentioned=True。
+# --------------------------------------------------------------------------
+E2E_URL_3 = "https://example.invalid/mist-harbor-lantern-night-joint-watch"
+E2E_TITLE_3 = "[合成样张·虚构] 雾港星灯会与灯塔值守旧例合记（非真实人物）"
+
+E2E_PASSAGES_3: tuple[str, ...] = (
+    "据雾港志补记，星灯会与灯塔值守其实是一套旧例：每年灯会那一晚，阿雾与阿灯都要一同登上堤坝，从东头到西头逐盏核对灯位。",
+    "核对灯位时两人话都不多，阿灯提灯照路，阿雾报出每一处风向与潮位，只在发现偏差时才会多说一句。",
+    "老住户说，阿雾敲的铜钟就是灯会的开场信号，钟声三响之后阿灯才开始掌灯，这个配合已经沿用多年。",
+    "有一年风暴夜里，阿灯独自护住整排灯架，阿雾在塔上整夜守着铜钟，直到风势减弱两人才在堤坝上碰面。",
+    "灯会散场之后，阿灯会点亮最后一盏灯，再上塔把当夜的情形说给阿雾听，说完便各自回到自己的位置。",
+)
+E2E_TEXT_3 = "\n\n".join(E2E_PASSAGES_3)
+
+#: 第三条检索查询的话题后缀（挂在阿雾身上）。
+#: `plan_queries` 的规则是"每目标 1 条基础词 +（若有 topic）1 条话题词"，
+#: 所以给阿雾挂上它，就能**确定性地**多出第三条查询 → 第三次抓取 → 第三份材料。
+#: 这样不依赖 `filter_and_rank` 的排序（把互动页塞成某个查询的第二条结果会被排序挤掉）。
+E2E_PAIR_TOPIC = "与阿灯 灯会值守旧例"
+
+#: 三条查询用的研究上限：两个目标共 3 条计划（阿雾 ×2 + 阿灯 ×1）。
+#: 抓取上限同步开到 3——少一条就会被截断，材料只有 2 份，关系又退化成"没证据"。
+E2E_RESEARCH_LIMITS_THREE = ResearchLimits(
+    max_queries=3, max_results_per_query=1, max_extracts=3,
+    max_remediations=0, max_cost=None)
+
 #: A11 负样例用到的两个不合格状态
 NEG_UNDECLARED = ""
 
@@ -476,18 +511,26 @@ class _CapturingResponse:
 
 
 class StubTwoTargetSourceProvider:
-    """桩数据源（双目标版）：按**检索词里的目标名**返回各自的合成正文。
+    """桩数据源（多目标版）：按**检索词**返回各自的合成正文。
 
-    与单目标桩的唯一差别是"per-query 结果"——真实 Provider 本来就是这样
+    与单目标桩的差别是"per-query 结果"——真实 Provider 本来就是这样
     （同一个检索词不会返回同一个 URL），单目标桩只是把这一点简化掉了。
-    它的用途只有一个：让 `--dry` 能在**零成本**下跑出一个参与者 ≥ 2 的编排器
-    请求，从而证明五个阶段真的能全部 EXECUTED（单人物请求做不到，见模块 docstring）。
+
+    C 轮起它有 **3 个页面**：阿雾页、阿灯页、以及两人共同的"互动页"。
+    互动页由第三条查询（给阿雾挂了 `topic` 之后）取回，用来让抽取阶段
+    有机会产出覆盖 ≥2 名参与者的 `RELATION` 证据——否则关系条目产出路径
+    永远验证不到（前两份材料里没有一句同时点名两人）。
     """
 
-    #: display_name → (url, title, text)
-    _CATALOG = {
+    #: 检索词 → (url, title, text)。
+    #:
+    #: **精确匹配优先**：第三条查询（`阿雾 与阿灯 灯会值守旧例`）同时含两个人名，
+    #: 若沿用"子串命中"的写法，它会同时返回阿雾页与阿灯页 → 3 条查询得到 4 份正文，
+    #: 抓取上限被挤爆、材料数不再是 3。所以这里按**完整检索词**查表。
+    _PAGES: dict[str, tuple[str, str, str]] = {
         "阿雾": (E2E_URL, E2E_TITLE, E2E_TEXT),
         "阿灯": (E2E_URL_2, E2E_TITLE_2, E2E_TEXT_2),
+        f"阿雾 {E2E_PAIR_TOPIC}": (E2E_URL_3, E2E_TITLE_3, E2E_TEXT_3),
     }
 
     def __init__(self) -> None:
@@ -504,7 +547,16 @@ class StubTwoTargetSourceProvider:
     def search(self, ctx, req):
         self.search_calls += 1
         query = str(getattr(req, "query", "") or "")
-        hits = [entry for name, entry in self._CATALOG.items() if name in query]
+        pair = self._PAGES[f"阿雾 {E2E_PAIR_TOPIC}"]
+        entry = self._PAGES.get(query)
+        if entry is not None:
+            hits = [entry]
+        elif E2E_PAIR_TOPIC in query:
+            # 话题词被改写时的兜底：仍只返回互动页，绝不顺带返回人物页
+            hits = [pair]
+        else:
+            hits = [e for name, e in self._PAGES.items()
+                    if name in query and e is not pair]
         usage = UsageDelta(requests=1, latency_ms=1)
         results = [SearchResult(title=title, url=url, canonical_key=url,
                                 snippet=text, published_at=None,
@@ -514,7 +566,7 @@ class StubTwoTargetSourceProvider:
 
     def extract(self, ctx, req):
         self.extract_calls += 1
-        by_url = {url: (title, text) for url, title, text in self._CATALOG.values()}
+        by_url = {url: (title, text) for url, title, text in self._PAGES.values()}
         results = []
         for target_url in (req.urls or []):
             title, text = by_url.get(str(target_url), (E2E_TITLE, E2E_TEXT))
@@ -810,15 +862,19 @@ def diagnose_orchestrator_path(settings, out: Out, *,
               else StubSearchExtractProvider())
     stack = Stack(settings, ExternalUsageLedger(), out,
                   chat_provider=StubDialogueProvider(), source_provider=source,
-                  research_limits=(E2E_RESEARCH_LIMITS_TWO if two_person
+                  research_limits=(E2E_RESEARCH_LIMITS_THREE if two_person
                                    else E2E_RESEARCH_LIMITS))
     try:
         claims_stub = StubChatProvider(_orchestrator_payload_shell())
         stack.use_stub_extractor(claims_stub)
         target_list = stack.ensure_targets(names)
+        if two_person:
+            # C 轮：给第一个目标挂话题 → 多出第三条查询 → 取回"互动页"
+            target_list[0].topic = E2E_PAIR_TOPIC
         ids = {t.display_name: t.entity_id for t in target_list}
-        claims_stub.payload = orchestrator_payload(ids if two_person
-                                                  else {"阿雾": ids["阿雾"]})
+        claims_stub.payload = orchestrator_payload(
+            ids if two_person else {"阿雾": ids["阿雾"]},
+            with_pair=two_person)
         orch = stack.orchestrator()
         result = orch.run(stack.ctx, stack.request(targets=target_list))
         info: dict = {"ok": is_ok(result), "two_person": two_person}
@@ -844,6 +900,17 @@ def diagnose_orchestrator_path(settings, out: Out, *,
                 1 for m in materials if str(getattr(m, "quality_status", "")))
             info["materials_bound"] = sum(
                 1 for m in materials if str(getattr(m, "source_id", "")))
+            # C 轮：L4 —— 关系档案真的被写出来了吗（阳性对照的离线版本）
+            rel_rows = []
+            for rid in (run.relationship_profile_ids or []):
+                view = stack.relationship.get_relationship(stack.ctx, rid)
+                if is_ok(view):
+                    rel_rows.append({
+                        "id": rid, "version": view.value.version,
+                        "status": str(view.value.status),
+                        "shared_experiences": len(view.value.shared_experiences),
+                    })
+            info["relationship"] = rel_rows
         else:
             info["error"] = f"{result.error.code}: {result.error.message}"
         info["stub_chat_calls"] = claims_stub.chat_calls
@@ -857,10 +924,17 @@ def _orchestrator_payload_shell() -> str:
     return json.dumps({"claims": []})
 
 
-def orchestrator_payload(name_to_id: dict[str, str]) -> str:
+def orchestrator_payload(name_to_id: dict[str, str], *,
+                         with_pair: bool = False) -> str:
     """编排器诊断用的**模型输出**：VERBATIM 候选，摘录逐字取自对应合成正文。
 
     每个主体 5 条；第 5 条是 `TRAIT + SINGLE`（AC-7 探针）。
+
+    `with_pair=True` 时追加 **2 条双主体 RELATION**（摘录逐字取自互动页，
+    `subject_entity_ids` 同时含两人）——这是"关系条目产出路径"的**阳性对照**：
+    若连桩模型给的双人证据都变不成 `shared_experiences`，那是代码坏了，
+    与真实模型是否愿意产出 RELATION 无关。
+
     `material_key` 用材料的 `canonical_key`（= url）——抽取器就是这么定位的。
     """
     catalog = {
@@ -888,6 +962,24 @@ def orchestrator_payload(name_to_id: dict[str, str]) -> str:
                 "dimension": dimension, "subject_entity_ids": [entity_id],
                 "material_key": material_key, "verbatim_quote": text,
                 "stability": stability, "canon_level": "CANON", "confidence": 0.9,
+            })
+
+    if with_pair and "阿雾" in name_to_id and "阿灯" in name_to_id:
+        both = [name_to_id["阿雾"], name_to_id["阿灯"]]
+        # 摘录必须是互动页里的**逐字子串**（框架会核验 locator）
+        pair_rows = [
+            ("p1", "每年灯会那一晚，阿雾与阿灯都要一同登上堤坝，从东头到西头逐盏核对灯位",
+             "每年灯会那一晚，阿雾与阿灯都要一同登上堤坝，从东头到西头逐盏核对灯位。"),
+            ("p2", "有一年风暴夜里，阿灯独自护住整排灯架，阿雾在塔上整夜守着铜钟",
+             "有一年风暴夜里，阿灯独自护住整排灯架，阿雾在塔上整夜守着铜钟，"
+             "直到风势减弱两人才在堤坝上碰面。"),
+        ]
+        for key, claim_text, quote in pair_rows:
+            claims.append({
+                "key": f"{key}_pair", "claim": claim_text, "tier": "VERBATIM",
+                "dimension": "RELATION", "subject_entity_ids": list(both),
+                "material_key": E2E_URL_3, "verbatim_quote": quote,
+                "stability": "UNKNOWN", "canon_level": "CANON", "confidence": 0.9,
             })
     return json.dumps({"claims": claims}, ensure_ascii=False)
 
@@ -927,6 +1019,9 @@ def _print_diag(out: Out, diag: dict) -> None:
     if diag.get("warning_codes"):
         out(f"  告警码          : {diag['warning_codes']}")
     out(f"  证据阶段说明     : {diag.get('evidence_message')}")
+    for row in (diag.get("relationship") or []):
+        out(f"  关系档案（L4）   : {row['id']} v{row['version']} "
+            f"status={row['status']} 共享经历={row['shared_experiences']}")
 
 
 def print_stage_table(out: Out, run) -> None:
@@ -1056,9 +1151,10 @@ def run_orchestrator_real(settings, out: Out, problems: list[str], *,
 
     # G8：双人物必须换数据源与上限——单目标桩只会返回阿雾那份正文，
     # 第二个人物拿不到材料（关系阶段就成了"没证据"，而不是"链路没通"）。
+    # C 轮：双人物还要第三份"互动页"材料 → 上限开到 3 条查询 / 3 次抓取。
     source_provider = (StubTwoTargetSourceProvider() if two_person
                        else StubSearchExtractProvider())
-    research_limits = (E2E_RESEARCH_LIMITS_TWO if two_person
+    research_limits = (E2E_RESEARCH_LIMITS_THREE if two_person
                        else E2E_RESEARCH_LIMITS)
 
     stack = Stack(settings, ledger, out,
@@ -1067,6 +1163,10 @@ def run_orchestrator_real(settings, out: Out, problems: list[str], *,
                   research_limits=research_limits)
     try:
         targets = stack.ensure_targets(names)
+        if two_person:
+            # C 轮：给第一个目标挂话题 → `plan_queries` 多产出一条话题查询 →
+            # 桩返回"互动页"→ 材料流 3 份。不依赖排序，完全确定性。
+            targets[0].topic = E2E_PAIR_TOPIC
         entity_id = targets[0].entity_id
         shown = "、".join(f"{t.display_name}={t.entity_id}" for t in targets)
         out(f"  目标实体        : {shown}（{label}）")
@@ -1091,6 +1191,29 @@ def run_orchestrator_real(settings, out: Out, problems: list[str], *,
             problems.append("研究链路失败（编排器路径预检）")
             return
         preview_materials, _rejected = materials_from_research(stack, preview.value)
+        if two_person:
+            # ---- 方案 §9.1 发送前硬闸门（P1~P4）：任一不成立即**停在发送前** ----
+            # 用 return 而不是 expect：软断言会照常发出请求，白花一次钱。
+            gate: list[str] = []
+            preview_keys = [str(getattr(m, "canonical_key", "") or getattr(m, "url", ""))
+                            for m in preview_materials]
+            if len(preview_materials) != 3:
+                gate.append(f"P1 材料流 {len(preview_materials)} 份（应 3 份）")
+            if not all(str(getattr(m, "quality_status", "")) == "VALID"
+                       for m in preview_materials):
+                gate.append("P1 有材料未过门禁（非 VALID）")
+            if not all(str(getattr(m, "source_id", "")) for m in preview_materials):
+                gate.append("P2 有材料未绑定已登记来源")
+            if E2E_URL_3 not in preview_keys:
+                gate.append("P3 互动页不在抽取输入里")
+            if len({t.entity_id for t in targets}) != 2:
+                gate.append("P4 目标不是 2 个互异的实体")
+            if gate:
+                out("  [FAIL] 发送前硬闸门未通过，**未发出任何请求**：")
+                for g in gate:
+                    out(f"      - {g}")
+                problems.extend(gate)
+                return
         req_built = inner_extractor.build_request(
             preview_materials, targets, model_hint=settings.model.model_id)
         body_builder = getattr(real_provider, "_build_body", None)
@@ -1112,6 +1235,16 @@ def run_orchestrator_real(settings, out: Out, problems: list[str], *,
                    "编排器路径：thinking = disabled")
             expect(body.get("stream") is False, "编排器路径：stream = false")
             expect(not out.scan(wire), "编排器路径：请求体里**不含**密钥")
+            if two_person:
+                # P3 的线上侧：请求体必须真的带 3 个 material_key，且含互动页。
+                # 同样是硬闸门——不成立就**不发请求**。
+                n_keys = wire.count("[material_key=")
+                if n_keys != 3 or E2E_URL_3 not in wire:
+                    out(f"  [FAIL] 发送前 P3 未通过：请求体 material_key {n_keys} 个"
+                        f"（应 3）、互动页{'在' if E2E_URL_3 in wire else '**不在**'}"
+                        "——**未发出任何请求**")
+                    problems.append("发送前 P3：请求体 material_key 不符合预期")
+                    return
 
         # --- 真实执行（1 次，失败不重试）---
         started = time.monotonic()
@@ -1303,6 +1436,49 @@ def run_orchestrator_real(settings, out: Out, problems: list[str], *,
                 out("     ⚠️ 探针返回 Ok：预算闸门未按预期拦下，必须人工复核。")
                 problems.append("预算探针未被拦下（防止多发一次真实请求）")
 
+        # ---------------- [7c] 四层探针（C 轮：把"空"归因到唯一原因） ----
+        facts = collect_round_c_facts(
+            stack=stack, run=run, outcome=outcome, targets=targets,
+            drafts=drafts, materials=materials)
+        diag = facts["diagnostics"]
+        out.hr("[7c] 四层探针：关系条目产出路径归因")
+        out("  L1 材料        : "
+            f"{diag['L1_materials']} 份进入材料流（其中带门禁结论 "
+            f"{diag['L1_materials_with_gate']} 份）")
+        out("  L2 抽取        : "
+            f"{diag['L2_relation_candidates']} 条 RELATION 候选"
+            f"（accepted 共 {len(outcome.claims)} 条）")
+        if diag["L2_relation_claim_texts"]:
+            for txt in diag["L2_relation_claim_texts"][:6]:
+                out(f"      · {txt}")
+        out("  L3 主体        : "
+            f"{diag['L3_candidates_covering_both']} 条覆盖 ≥2 名目标")
+        out("  L4 写入        : "
+            f"shared_experiences={diag['L4_shared_experiences']} 条，"
+            f"status={diag['L4_status']}")
+        out("")
+        out(f"  判定            : {diag['verdict']}")
+        out(f"  含义            : {diag['verdict_text']}")
+        if diag["verdict"] == "LINK_FAULT":
+            out("  [FAIL] 落到判定矩阵第 4 行：RELATION 候选覆盖两人，档案却为空。")
+            out("         这是**链路故障**，按 BUG 处理；**不得**用'再跑一次'掩盖。")
+            problems.append("关系链路故障（L2/L3 有候选，L4 无条目）")
+        stab = diag["stability"]
+        out("")
+        out(f"  稳定性判定      : {stab['with_verdict']}/{stab['total']} 条带 "
+            "stability_verdict")
+        if stab["missing"]:
+            out(f"      [FAIL] 缺判定：{stab['missing']}")
+            problems.append("存在缺稳定性判定的证据（G6 判定未覆盖全量）")
+        if stab["declared_column_rewritten"]:
+            out(f"      [FAIL] stability 列被改写（应保持登记值 UNKNOWN）："
+                f"{stab['declared_column_rewritten']}")
+            problems.append("stability 列被判定覆盖（破坏可追溯性）")
+        if stab["occurrences_ne_distinct_sources"]:
+            out(f"      [FAIL] occurrences != distinct_sources（G6-D2 去重失效）："
+                f"{stab['occurrences_ne_distinct_sources']}")
+            problems.append("稳定性判定未按来源去重")
+
         # ---------------- [8] 账本 ----------------
         out.hr("[8] 账本")
         dump_ledger(out, ledger, limits.max_cost, limits.currency)
@@ -1341,7 +1517,12 @@ def run_orchestrator_real(settings, out: Out, problems: list[str], *,
                 mode="orchestrator-path",
                 profile_id=(run.persona_profile_ids[0]
                             if run.persona_profile_ids else None),
-                already_current=None)
+                already_current=None,
+                targets_info=facts["targets_info"],
+                relationship_info=facts["relationship_info"],
+                evidence_info=facts["evidence_info"],
+                stage_warnings=facts["stage_warnings"],
+                diagnostics=facts["diagnostics"])
             artifact["raw_exchange_path"] = str(raw_path)
             path.write_text(json.dumps(artifact, ensure_ascii=False, indent=2),
                             encoding="utf-8")
@@ -1751,16 +1932,202 @@ def main(argv: list[str] | None = None) -> int:
         stack.teardown()
 
 
+def collect_round_c_facts(*, stack: "Stack", run, outcome, targets, drafts,
+                          materials) -> dict:
+    """回读本轮运行的事实，产出产物块 + **四层探针**判定（纯只读，不改库）。
+
+    四层探针（方案 §7.1）：
+
+    | 层 | 观测量 | 为空意味着 |
+    |---|---|---|
+    | L1 材料 | 进入材料流份数 / 带门禁结论份数 | 研究或门禁问题（与模型无关）|
+    | L2 抽取 | accepted 里 `dimension=RELATION` 的候选条数 | 模型没读出来 |
+    | L3 主体 | 上述候选中 `subject_entity_ids` 覆盖两人的条数 | 读出来的是单人视角 |
+    | L4 写入 | `shared_experiences` 条数 + 档案 `status` | **L2/L3 都有而 L4 空 = 链路故障** |
+
+    判定矩阵见方案 §7.2。把"空"归因到**唯一**原因，是为了避免把
+    "链路故障"当成"证据不足"，再用"再跑一次"掩盖缺陷。
+    """
+    ctx = stack.ctx
+    target_ids = {t.entity_id for t in targets}
+
+    # ---------- L1：材料 ----------
+    l1_total = len(materials)
+    l1_valid = sum(1 for m in materials if str(getattr(m, "quality_status", "") or ""))
+
+    # ---------- L2 / L3：抽取候选 ----------
+    claims = list(getattr(outcome, "claims", []) or [])
+    rel_claims = [c for c in claims if "RELATION" in str(getattr(c, "dimension", ""))]
+    l2 = len(rel_claims)
+    l3 = sum(1 for c in rel_claims
+             if len(set(getattr(c, "subject_entity_ids", []) or []) & target_ids) >= 2)
+
+    # ---------- 逐条证据（G6-D1 的运行时证据） ----------
+    evidence_info: list[dict] = []
+    stab_missing: list[str] = []
+    declared_rewritten: list[str] = []
+    occurrences_mismatch: list[str] = []
+    for eid in list(run.evidence_ids or []):
+        got = stack.evidence.get_evidence(ctx, eid)
+        if is_err(got):
+            stab_missing.append(f"{eid}（读取失败 {got.error.code}）")
+            continue
+        view = got.value
+        verdict = view.stability_verdict if isinstance(view.stability_verdict, dict) else None
+        evidence_info.append({
+            "id": view.id,
+            "claim": view.claim,
+            "dimension": str(view.dimension),
+            "subject_entity_ids": list(view.subject_entity_ids),
+            "source_id": view.source_id,
+            "stability": str(view.stability),
+            "stability_verdict": dict(verdict) if verdict else None,
+        })
+        if verdict is None:
+            stab_missing.append(view.id)
+        else:
+            # G6-D1：`stability` 列是登记时的声明，**不得**被判定覆盖
+            if str(view.stability) != "UNKNOWN":
+                declared_rewritten.append(view.id)
+            # G6-D2：按 source_id 去重后 occurrences 恒等于 distinct_sources。
+            # **只对有来源的证据成立**：INFERENCE 证据按登记规则不带单一来源
+            # （`source_id=None`，推断来自多条证据而非某个来源），此时
+            # occurrences=1 / distinct_sources=0 是正确结果，不是去重失效。
+            if view.source_id:
+                if int(verdict.get("occurrences", -1)) != int(
+                        verdict.get("distinct_sources", -2)):
+                    occurrences_mismatch.append(view.id)
+
+    # ---------- L4：关系档案写入 ----------
+    relationship_info: list[dict] = []
+    l4_items = 0
+    for rid in list(run.relationship_profile_ids or []):
+        got = stack.relationship.get_relationship(ctx, rid)
+        if is_err(got):
+            relationship_info.append({"id": rid, "error": str(got.error.code)})
+            continue
+        view = got.value
+        items = list(getattr(view, "shared_experiences", []) or [])
+        l4_items += len(items)
+        relationship_info.append({
+            "id": view.id,
+            "version": view.version,
+            "status": str(view.status),
+            "cardinality": str(view.cardinality),
+            "participant_entity_ids": list(view.participant_entity_ids),
+            "shared_experiences": [{
+                "text": str(getattr(it, "text", "")),
+                "evidence_refs": [str(r) for r in (getattr(it, "evidence_refs", []) or [])],
+                "participant_entity_ids": [str(p) for p in
+                                           (getattr(it, "participant_entity_ids", []) or [])],
+            } for it in items],
+            "interaction_patterns": len(getattr(view, "interaction_patterns", []) or []),
+            "perspectives": sorted((getattr(view, "perspectives", {}) or {}).keys()),
+            "open_questions": list(getattr(view, "open_questions", []) or []),
+            "superseded_by": getattr(view, "superseded_by", None),
+        })
+
+    # ---------- 逐目标人物档案 ----------
+    targets_info: list[dict] = []
+    persona_by_id = {str(pid): pid for pid in (run.persona_profile_ids or [])}
+    for t in targets:
+        got = stack.persona.get_persona(ctx, t.entity_id)
+        view = got.value if is_ok(got) else None
+        d = drafts.get(t.entity_id)
+        targets_info.append({
+            "entity_id": t.entity_id,
+            "display_name": t.display_name,
+            "persona_profile_id": (view.id if view is not None
+                                   else persona_by_id.get(t.entity_id)),
+            "version": (view.version if view is not None else None),
+            "status": (str(view.status) if view is not None else None),
+            "background_refs": ([str(r) for r in d.background.evidence_refs]
+                                if d is not None else []),
+            "traits": [{"text": i.text, "stability": str(i.stability),
+                        "evidence_refs": [str(r) for r in i.evidence_refs]}
+                       for i in (d.traits if d is not None else [])],
+            "habits": [{"text": i.text, "stability": str(i.stability)}
+                       for i in (d.habits if d is not None else [])],
+            "single_events": [{"text": i.text, "stability": str(i.stability)}
+                              for i in (d.single_events if d is not None else [])],
+            "experiences": len(d.experiences if d is not None else []),
+            "open_questions": len(d.open_questions if d is not None else []),
+        })
+
+    # ---------- 阶段告警码 ----------
+    stage_warnings = {str(s.name): sorted({str(w.code) for w in (s.warnings or [])})
+                      for s in (run.steps or [])}
+
+    # ---------- 判定矩阵（§7.2） ----------
+    statuses = [r.get("status") for r in relationship_info if "status" in r]
+    if l1_valid < 3:
+        verdict = "PRECONDITION_NOT_MET"
+        verdict_text = "未通过前置：材料不足 3 份 VALID，不进入归因"
+    elif l4_items >= 1 and statuses and all(s == "OK" for s in statuses):
+        verdict = "LINK_OK"
+        verdict_text = "链路通：双人证据已变成条目，档案 status=OK"
+    elif l2 == 0:
+        verdict = "INSUFFICIENT_NO_RELATION_DIMENSION"
+        verdict_text = "证据不足：模型未产出任何 RELATION 维度候选"
+    elif l3 == 0:
+        verdict = "INSUFFICIENT_SINGLE_SUBJECT"
+        verdict_text = "证据不足：RELATION 候选都是单人视角（未覆盖两名参与者）"
+    elif l4_items == 0:
+        verdict = "LINK_FAULT"
+        verdict_text = "**链路故障**：RELATION 候选覆盖两人，但关系档案没有条目"
+    else:
+        verdict = "PARTIAL"
+        verdict_text = "关系档案有条目但 status 非 OK，需人工复核"
+
+    return {
+        "targets_info": targets_info,
+        "relationship_info": relationship_info,
+        "evidence_info": evidence_info,
+        "stage_warnings": stage_warnings,
+        "diagnostics": {
+            "L1_materials": l1_total,
+            "L1_materials_with_gate": l1_valid,
+            "L2_relation_candidates": l2,
+            "L2_relation_claim_texts": [str(getattr(c, "claim", ""))[:80]
+                                        for c in rel_claims],
+            "L3_candidates_covering_both": l3,
+            "L4_shared_experiences": l4_items,
+            "L4_status": statuses,
+            "verdict": verdict,
+            "verdict_text": verdict_text,
+            "stability": {
+                "total": len(evidence_info),
+                "with_verdict": sum(1 for e in evidence_info
+                                    if e.get("stability_verdict")),
+                "missing": stab_missing,
+                "declared_column_rewritten": declared_rewritten,
+                "occurrences_ne_distinct_sources": occurrences_mismatch,
+            },
+        },
+    }
+
+
 def build_artifact(*, materials, outcome, evidence_ids, source_ids, draft,
                    entity_id, ledger, limits, recorder, elapsed, target,
                    mode: str = "script-side-assembly",
                    profile_id: str | None = None,
-                   already_current: bool | None = None) -> dict:
+                   already_current: bool | None = None,
+                   targets_info: list[dict] | None = None,
+                   relationship_info: list[dict] | None = None,
+                   evidence_info: list[dict] | None = None,
+                   stage_warnings: dict | None = None,
+                   diagnostics: dict | None = None) -> dict:
     """把本次运行的关键事实写成 JSON（**只写事实，不写密钥**）。
 
     落盘的意义：让 `verify_p4_5a_outputs.py` 能在**不重跑、不联网**的前提下
     独立复算摘录可追溯性与费用；复算器不 import `claim_validation`，
     避免"用被测代码验证被测代码"。
+
+    C 轮新增四个**可选**块（默认 `None` → 不写，单人物旧产物逐字不变）：
+      - `targets[]`：每名目标的人物档案摘要（双人物必须有 2 条）；
+      - `relationship[]`：关系档案回读（含 `status` / `shared_experiences`）；
+      - `evidence[]`：逐条证据的 `stability` 与 `stability_verdict`（G6-D1 的运行时证据）；
+      - `diagnostics`：四层探针 + 阶段告警码（把"空"归因到唯一原因）。
     """
     records = []
     for rec in ledger.records():
@@ -1855,6 +2222,14 @@ def build_artifact(*, materials, outcome, evidence_ids, source_ids, draft,
                             for i in draft.experiences],
             "open_questions": list(draft.open_questions),
         },
+        # ---- C 轮：多目标 / 关系 / 逐条稳定性（可选块，None → 省略） ----
+        **({"targets": list(targets_info)} if targets_info is not None else {}),
+        **({"relationship": list(relationship_info)}
+           if relationship_info is not None else {}),
+        **({"evidence": list(evidence_info)} if evidence_info is not None else {}),
+        **({"stage_warnings": dict(stage_warnings)}
+           if stage_warnings is not None else {}),
+        **({"diagnostics": dict(diagnostics)} if diagnostics is not None else {}),
         "ledger": {
             "records": records,
             "requests": totals.requests,

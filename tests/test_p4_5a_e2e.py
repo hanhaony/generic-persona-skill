@@ -1147,7 +1147,10 @@ class TestG8DualPersonEntry(unittest.TestCase):
         self.assertEqual(problems, [], f"双人物接线不得有失败项：{problems}")
         self.assertEqual(stub.chat_calls, 1, "双人物仍只允许 1 次真实调用")
         self.assertEqual(artifact["calls"]["real_chat_calls"], 1)
-        self.assertEqual(len(artifact["materials"]), 2, "两个目标各一份材料")
+        # C 轮：阿雾带话题 → 多一条话题查询 → 额外取回"互动页"，共 3 份
+        # （前两份是两个目标各一份，第三份是双人合记材料）。
+        self.assertEqual(len(artifact["materials"]), 3,
+                         "两个目标各一份材料 + 一份双人互动页")
         self.assertGreaterEqual(len(artifact["evidence_ids"]), 2)
 
         joined = "\n".join(out.lines)
@@ -1574,6 +1577,128 @@ class TestG6StabilityAssessment(unittest.TestCase):
         self.assertEqual(loaded.single_events, [])
         for item in loaded.traits:
             self.assertIn(str(item.stability), ("REPEATED", "PATTERN"))
+
+
+# ==========================================================================
+# C 轮 E1：离线阳性对照 —— "关系条目产出路径"的可证伪定义
+# ==========================================================================
+class TestRoundCPairSmoke(unittest.TestCase):
+    """E1：给定**合格的双主体 RELATION claim**，产品代码能否把它变成条目。
+
+    **边界（必须写进报告，不许外推）**：
+
+      - E1 只证明"链路能把合格输入变成条目"，**不**证明畸形输入下的鲁棒性
+        （摘录错位、主体 ID 越界、参与者不足等由别的测试覆盖）；
+      - E1 通过 **不等于**"真实模型一定会抽出双人句"——那是 E2 的乙级验收项，
+        不可控，失败也不判 E1 失败；
+      - E1 的价值在于：若 E2 出现 L2/L3 有候选而 L4 为空，可以直接判定为
+        **代码缺陷**，而不是"模型没抽出来"，也**不许**用"再跑一次"掩盖。
+    """
+
+    def _run_pair(self, *, with_pair: bool):
+        """跑一次双人物编排器路径（桩模型，零网络、零费用），返回产物。"""
+        settings = settings_for()
+        out = runner.Out(SECRET_PLACEHOLDER, quiet=True)
+        problems: list[str] = []
+        stub = runner.StubChatProvider('{"claims": []}')
+
+        def on_targets(stack, entity_id: str) -> None:
+            ids = {t.display_name: t.entity_id for t in stack.targets}
+            stub.payload = runner.orchestrator_payload(ids, with_pair=with_pair)
+
+        with tempfile.TemporaryDirectory(prefix="p45c-e1-") as td:
+            dump = Path(td) / "pair.json"
+            with network_blocked():
+                runner.run_orchestrator_real(
+                    settings, out, problems,
+                    expect=lambda cond, desc: problems.append(desc) if not cond else None,
+                    ledger=ExternalUsageLedger(),
+                    limits=runner.model_limits_from_settings(settings),
+                    dump_path=str(dump), provider=stub, on_targets=on_targets,
+                    names=["阿雾", "阿灯"])
+            artifact = json.loads(dump.read_text(encoding="utf-8"))
+        return artifact, problems, out, stub
+
+    def test_e1_pair_claims_become_shared_experiences(self):
+        """阳性对照：2 条双主体 RELATION claim → 2 条 shared_experiences + status=OK。"""
+        artifact, problems, _out, stub = self._run_pair(with_pair=True)
+        self.assertEqual(problems, [], f"E1 不得有失败项：{problems}")
+        self.assertEqual(stub.chat_calls, 1, "桩仍只被调用 1 次（零网络、零费用）")
+
+        rel = artifact["relationship"]
+        self.assertEqual(len(rel), 1, "双人物必须产出恰好 1 份关系档案")
+        profile = rel[0]
+        self.assertEqual(profile["status"], "OK", "有条目 ⇒ status 必须是 OK")
+        self.assertEqual(profile["cardinality"], "PAIR")
+        self.assertEqual(len(profile["participant_entity_ids"]), 2)
+        self.assertEqual(len(profile["shared_experiences"]), 2,
+                         "两条双主体 RELATION 证据必须各成一条条目")
+
+        # 每条条目的引用都必须落在本次已登记证据里（可追溯，不是凭空生成）
+        evidence_ids = set(artifact["evidence_ids"])
+        for item in profile["shared_experiences"]:
+            self.assertTrue(item["evidence_refs"], "条目必须带 evidence_refs")
+            self.assertTrue(set(item["evidence_refs"]) <= evidence_ids,
+                            f"条目引用了未登记证据：{item['evidence_refs']}")
+
+        # 两份人物档案都在、且 traits 不违反 AC-7
+        self.assertEqual(len(artifact["targets"]), 2)
+        for t in artifact["targets"]:
+            for item in t["traits"]:
+                self.assertIn(str(item["stability"]), ("REPEATED", "PATTERN"),
+                              "SINGLE/UNKNOWN 绝不能进 traits")
+
+    def test_e1_four_layer_probe_reports_link_ok(self):
+        """四层探针必须落在"链路通"行，且能从原始计数复算。"""
+        artifact, _problems, _out, _stub = self._run_pair(with_pair=True)
+        diag = artifact["diagnostics"]
+        self.assertEqual(diag["L1_materials_with_gate"], 3, "三份材料全部过门禁")
+        self.assertGreaterEqual(diag["L2_relation_candidates"], 2)
+        self.assertGreaterEqual(diag["L3_candidates_covering_both"], 2)
+        self.assertGreaterEqual(diag["L4_shared_experiences"], 1)
+        self.assertEqual(diag["verdict"], "LINK_OK", diag["verdict_text"])
+
+        # G6：每条证据都有判定，且 stability 列未被改写
+        stab = diag["stability"]
+        self.assertEqual(stab["with_verdict"], stab["total"])
+        self.assertEqual(stab["missing"], [])
+        self.assertEqual(stab["declared_column_rewritten"], [])
+        self.assertEqual(stab["occurrences_ne_distinct_sources"], [])
+        for row in artifact["evidence"]:
+            self.assertIsNotNone(row["stability_verdict"], "G6-D1 判定必须落库")
+            self.assertEqual(row["stability"], "UNKNOWN",
+                             "stability 列是登记时声明，判定不得覆盖")
+
+    def test_e1_artifact_passes_independent_verifier(self):
+        """独立复算器（含新增 REL.* / STAB.* / C*.）对 E1 产物必须全绿。"""
+        artifact, _problems, _out, _stub = self._run_pair(with_pair=True)
+        rep = verifier.verify(artifact)
+        failed = [name for name, ok, _ in rep.rows if not ok]
+        self.assertEqual(failed, [], f"独立复算失败项：{failed}")
+        names = [name for name, _ok, _ in rep.rows]
+        for required in ("REL.2", "REL.4", "STAB.1", "STAB.2", "C1"):
+            self.assertTrue(any(n.startswith(required) for n in names),
+                            f"复算器缺少 {required} 检查（新增项没生效）")
+
+    def test_e1_without_pair_claims_is_insufficient_not_fault(self):
+        """阴性对照：没有双主体 claim 时必须判"证据不足"，**不得**判"链路故障"。
+
+        这是"区分链路通与证据不足"的反向锁——否则探针可能把所有空结果
+        都报成 LINK_FAULT（或反之全报成证据不足），归因就失效了。
+        """
+        artifact, problems, _out, _stub = self._run_pair(with_pair=False)
+        self.assertEqual(problems, [], f"证据不足不是故障，不得记失败项：{problems}")
+        diag = artifact["diagnostics"]
+        self.assertEqual(diag["L1_materials_with_gate"], 3)
+        self.assertEqual(diag["L2_relation_candidates"], 0)
+        self.assertEqual(diag["L4_shared_experiences"], 0)
+        self.assertEqual(diag["verdict"], "INSUFFICIENT_NO_RELATION_DIMENSION",
+                         diag["verdict_text"])
+        rel = artifact["relationship"][0]
+        self.assertEqual(rel["status"], "INSUFFICIENT_EVIDENCE")
+        self.assertIn("NO_RELATION_EVIDENCE",
+                      artifact["stage_warnings"].get("RELATIONSHIP_DISTILL", []),
+                      "证据不足必须带对应告警码，不允许静默返回空档案")
 
 
 if __name__ == "__main__":

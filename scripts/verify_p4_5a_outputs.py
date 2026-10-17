@@ -231,6 +231,133 @@ def verify(artifact: dict) -> Report:
     rep.check("A12 产物中不存在'已验证/已批准'被置真的字段", not truthy,
               f"命中={truthy}")
 
+    # ---------- C 轮：多目标 / 关系条目 / 稳定性（仅在新版产物里校验） ----------
+    targets = artifact.get("targets") or []
+    relationship = artifact.get("relationship") or []
+    evidence_rows = artifact.get("evidence") or []
+    stage_warnings = artifact.get("stage_warnings") or {}
+    diagnostics = artifact.get("diagnostics") or {}
+
+    if diagnostics:
+        target_ids = {str(t.get("entity_id")) for t in targets}
+        pair = len(targets) >= 2
+
+        if pair:
+            rep.check("C1 双目标各有一份人物档案", len(targets) == 2,
+                      f"targets={[t.get('display_name') for t in targets]}")
+        else:
+            rep.check("C1 单目标产物只有 1 份人物档案", len(targets) == 1,
+                      f"targets={[t.get('display_name') for t in targets]}")
+
+        # 每份档案都不能把 SINGLE/UNKNOWN 写进 traits（AC-7 / PF-V2 / D-012）
+        bad_traits_multi: list[str] = []
+        refs_multi: list[str] = []
+        for t in targets:
+            for item in t.get("traits") or []:
+                if str(item.get("stability")) in NON_TRAIT_STABILITIES:
+                    bad_traits_multi.append(f"{t.get('display_name')}:{item.get('text')}")
+                refs_multi += [str(r) for r in (item.get("evidence_refs") or [])]
+            refs_multi += [str(r) for r in (t.get("background_refs") or [])]
+        rep.check("C2 每份人物档案的 traits 都不含 SINGLE/UNKNOWN 条目",
+                  not bad_traits_multi, f"违规={bad_traits_multi}")
+        rep.check("C3 多目标档案引用全部命中已登记证据",
+                  not [r for r in refs_multi if r not in evidence_ids],
+                  f"不可追溯={sorted({r for r in refs_multi if r not in evidence_ids})}")
+
+        # ---- REL.*：关系条目产出路径（仅双目标产物有意义） ----
+        # 单人物请求下关系阶段按语义 SKIPPED，四层探针的判定矩阵不适用
+        # （矩阵的前置行是"3 份材料"，单人物只有 1 份）。此时只检查"确实没有
+        # 关系档案"，不把 SKIPPED 误判成链路故障。
+        if pair:
+            rep.check("REL.1 关系档案恰好 1 份", len(relationship) == 1,
+                      f"relationship={[r.get('id') for r in relationship]}")
+            rel = relationship[0] if relationship else {}
+            participants = [str(p) for p in (rel.get("participant_entity_ids") or [])]
+            items = rel.get("shared_experiences") or []
+            rep.check("REL.2 cardinality = PAIR 且参与者恰好 2 人",
+                      str(rel.get("cardinality")) == "PAIR" and len(participants) == 2,
+                      f"cardinality={rel.get('cardinality')} participants={participants}")
+            rep.check("REL.3 关系参与者都在本次目标内",
+                      bool(participants) and set(participants) <= target_ids,
+                      f"participants={participants} targets={sorted(target_ids)}")
+            rep.check("REL.4 status=OK ⟺ shared_experiences 非空",
+                      (str(rel.get("status")) == "OK") == bool(items),
+                      f"status={rel.get('status')} items={len(items)}")
+            rel_refs = [str(r) for it in items for r in (it.get("evidence_refs") or [])]
+            rep.check("REL.5 关系条目引用全部命中已登记证据",
+                      not [r for r in rel_refs if r not in evidence_ids],
+                      f"悬空={sorted({r for r in rel_refs if r not in evidence_ids})}")
+
+            # 判定矩阵自洽：产物自报的 verdict 必须能从原始计数复算出来
+            l1 = int(diagnostics.get("L1_materials_with_gate") or 0)
+            l2 = int(diagnostics.get("L2_relation_candidates") or 0)
+            l3 = int(diagnostics.get("L3_candidates_covering_both") or 0)
+            l4 = int(diagnostics.get("L4_shared_experiences") or 0)
+            statuses = [str(s) for s in (diagnostics.get("L4_status") or [])]
+            if l1 < 3:
+                expect = "PRECONDITION_NOT_MET"
+            elif l4 >= 1 and statuses and all(s == "OK" for s in statuses):
+                expect = "LINK_OK"
+            elif l2 == 0:
+                expect = "INSUFFICIENT_NO_RELATION_DIMENSION"
+            elif l3 == 0:
+                expect = "INSUFFICIENT_SINGLE_SUBJECT"
+            elif l4 == 0:
+                expect = "LINK_FAULT"
+            else:
+                expect = "PARTIAL"
+            rep.check("REL.6 归因结论可由原始计数独立复算",
+                      str(diagnostics.get("verdict")) == expect,
+                      f"自报={diagnostics.get('verdict')} 复算={expect}")
+
+            # 证据不足时**必须**有对应告警码（不允许静默返回空档案）
+            rel_codes = set(stage_warnings.get("RELATIONSHIP_DISTILL") or [])
+            if l1 < 3:
+                rep.check("REL.7 未过前置时不要求关系告警（材料不足，归因不成立）",
+                          True, f"codes={sorted(rel_codes)}")
+            elif l2 == 0:
+                rep.check("REL.7 L2=0 时带 NO_RELATION_EVIDENCE 告警",
+                          "NO_RELATION_EVIDENCE" in rel_codes,
+                          f"codes={sorted(rel_codes)}")
+            elif l3 == 0:
+                rep.check("REL.7 L3=0 时带主体不足告警",
+                          "RELATION_EVIDENCE_SUBJECT_INSUFFICIENT" in rel_codes,
+                          f"codes={sorted(rel_codes)}")
+            else:
+                rep.check("REL.7 关系阶段告警码可解释", True, f"codes={sorted(rel_codes)}")
+        else:
+            rep.check("REL.1s 单人物不产出关系档案（参与者 <2 按语义跳过）",
+                      not relationship,
+                      f"relationship={[r.get('id') for r in relationship]}")
+
+        # ---- STAB.*：G6 稳定性判定的运行时证据 ----
+        verdict_of = {str(e.get("id")): e.get("stability_verdict") for e in evidence_rows}
+        rep.check("STAB.1 每条证据都有 stability_verdict",
+                  bool(evidence_rows) and all(verdict_of.values()),
+                  f"缺判定={[k for k, v in verdict_of.items() if not v]}")
+        rewritten = [e.get("id") for e in evidence_rows
+                     if str(e.get("stability")) != "UNKNOWN"]
+        rep.check("STAB.2 stability 列未被判定覆盖（仍是登记值 UNKNOWN）",
+                  not rewritten, f"被改写={rewritten}")
+        # 只对**有来源**的证据成立：INFERENCE 证据登记时不带单一来源
+        # （source_id 为空），occurrences=1 / distinct_sources=0 是正确结果。
+        sourced = [v for e, v in verdict_of.items()
+                   if v and next((r.get("source_id") for r in evidence_rows
+                                  if str(r.get("id")) == e), None)]
+        rep.check("STAB.3 有来源证据的 occurrences == distinct_sources（G6-D2 生效）",
+                  all(int(v.get("occurrences", -1)) == int(v.get("distinct_sources", -2))
+                      for v in sourced),
+                  "存在有来源证据 occurrences != distinct_sources")
+        bad_support = []
+        for t in targets:
+            for item in t.get("traits") or []:
+                for r in (item.get("evidence_refs") or []):
+                    v = verdict_of.get(str(r)) or {}
+                    if str(v.get("stability")) in NON_TRAIT_STABILITIES:
+                        bad_support.append(f"{t.get('display_name')}:{r}")
+        rep.check("STAB.4 traits 的支撑证据判定均非 SINGLE/UNKNOWN",
+                  not bad_support, f"违规={bad_support}")
+
     # ---------- 密钥 ----------
     blob = json.dumps(artifact, ensure_ascii=False)
     rep.check("SEC 产物中不含密钥形态字符串", not SECRET_SHAPE.search(blob),
@@ -257,6 +384,21 @@ def main(argv: list[str] | None = None) -> int:
     print(f"schema={artifact.get('schema')}  目标="
           f"{(artifact.get('target') or {}).get('display_name')}")
     print(f"整批 verdict={((artifact.get('extraction') or {}).get('verdict'))}")
+    names = [str(t.get("display_name")) for t in (artifact.get("targets") or [])]
+    if names:
+        print(f"目标数={len(names)}（{'、'.join(names)}）", end="")
+        rel = (artifact.get("relationship") or [{}])[0]
+        if rel:
+            print(f"  关系档案 status={rel.get('status')} "
+                  f"shared_experiences={len(rel.get('shared_experiences') or [])}", end="")
+        print("")
+    diag = artifact.get("diagnostics") or {}
+    if diag:
+        print(f"四层探针：L1={diag.get('L1_materials_with_gate')} "
+              f"L2={diag.get('L2_relation_candidates')} "
+              f"L3={diag.get('L3_candidates_covering_both')} "
+              f"L4={diag.get('L4_shared_experiences')} "
+              f"→ {diag.get('verdict')}")
     print("")
     for name, ok, detail in rep.rows:
         print(f"  [{'OK ' if ok else 'FAIL'}] {name}")
