@@ -1701,5 +1701,81 @@ class TestRoundCPairSmoke(unittest.TestCase):
                       "证据不足必须带对应告警码，不允许静默返回空档案")
 
 
+# ==========================================================================
+# P4.7 / P1a S2：夹具里加"跨源同句"后，同一套产品代码能产出 `traits`
+# ==========================================================================
+class TestP1aS2SharedSentenceAcrossSources(unittest.TestCase):
+    """S1（桩 claim）之外的第二次证明：**e2e 夹具**里放一句逐字相同的话。
+
+    与 S1 的分工：
+      - S1 在最小的 BusinessFixture 上证明"判定链会判 REPEATED 并进 traits"；
+      - S2 在**完整的 e2e 夹具 + 真实编排器路径**上再证一次，顺带锁住
+        "两份材料 ⇒ 两条证据 ⇒ 两个来源 ⇒ 一条 traits"这条端到端因果。
+
+    仍然**零真实调用**：模型输出是桩（`StubChatProvider`），
+    `network_blocked()` 保证一个字节都出不去。
+    """
+
+    def _run(self):
+        settings = settings_for()
+        out = runner.Out(SECRET_PLACEHOLDER, quiet=True)
+        problems: list[str] = []
+        stub = runner.StubChatProvider('{"claims": []}')
+
+        def on_targets(stack, entity_id: str) -> None:
+            ids = {t.display_name: t.entity_id for t in stack.targets}
+            stub.payload = runner.orchestrator_payload(
+                ids, with_pair=True, with_shared_trait=True)
+
+        with tempfile.TemporaryDirectory(prefix="p47-s2-") as td:
+            dump = Path(td) / "s2.json"
+            with network_blocked():
+                runner.run_orchestrator_real(
+                    settings, out, problems,
+                    expect=lambda cond, desc: problems.append(desc) if not cond else None,
+                    ledger=ExternalUsageLedger(),
+                    limits=runner.model_limits_from_settings(settings),
+                    dump_path=str(dump), provider=stub, on_targets=on_targets,
+                    names=["阿雾", "阿灯"])
+            artifact = json.loads(dump.read_text(encoding="utf-8"))
+        return artifact, problems, stub
+
+    def test_shared_sentence_becomes_a_trait(self):
+        artifact, problems, stub = self._run()
+        self.assertEqual(problems, [], f"S2 不得有失败项：{problems}")
+        self.assertEqual(stub.chat_calls, 1, "仍然是零网络、零费用的一次桩调用")
+
+        alice = next(t for t in artifact["targets"] if t["display_name"] == "阿灯")
+        trait_texts = [item["text"] for item in alice["traits"]]
+        self.assertIn(runner.E2E_SHARED_SENTENCE, trait_texts,
+                      f"跨源同句必须进 traits：{trait_texts}")
+        self.assertNotIn(runner.E2E_SHARED_SENTENCE,
+                         [item["text"] for item in alice["single_events"]],
+                         "同一句话不得同时进 traits 与 single_events")
+        for item in alice["traits"]:
+            self.assertIn(item["stability"], ("REPEATED", "PATTERN"),
+                          f"traits 里的说法稳定性不足：{item}")
+
+    def test_shared_sentence_evidence_comes_from_two_sources(self):
+        artifact, _problems, _stub = self._run()
+        rows = [row for row in artifact["evidence"]
+                if row["claim"] == runner.E2E_SHARED_SENTENCE]
+        self.assertEqual(len(rows), 2, "同一说法来自两份材料 ⇒ 两条证据（不跨源去重）")
+        self.assertEqual(len({row["source_id"] for row in rows}), 2)
+        for row in rows:
+            self.assertEqual(row["stability"], "UNKNOWN",
+                             "登记值必须是 UNKNOWN（模型无权自评）")
+            self.assertEqual(row["stability_verdict"]["stability"], "REPEATED")
+            self.assertEqual(row["stability_verdict"]["distinct_sources"], 2)
+
+    def test_no_ac7_violation_in_any_profile(self):
+        """顺带守住 AC-7：两份档案里所有 traits 条目都必须是重复出现的说法。"""
+        artifact, _problems, _stub = self._run()
+        for target in artifact["targets"]:
+            for item in target["traits"]:
+                self.assertIn(item["stability"], ("REPEATED", "PATTERN"),
+                              f"{target['display_name']} 的 traits 出现 AC-7 违规：{item}")
+
+
 if __name__ == "__main__":
     unittest.main()

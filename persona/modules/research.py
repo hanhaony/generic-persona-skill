@@ -49,7 +49,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, runtime_checkable
 
 from ..core.context import CallContext
@@ -599,6 +599,132 @@ def detect_untrusted_for(content: str) -> list[str]:
     return detect_prompt_injection(content)
 
 
+# --------------------------------------------------------------------------
+# 本地材料（P4.7：离线通道 —— 用户提供文件，不做检索）
+#
+# 为什么需要它：`persona business run` 之前只能靠检索拿材料，而检索 Provider
+# 尚未接线（H-17 / P3），于是 CLI 在任何配置下都跑不出真实五阶段。补一条
+# "用户直接把材料文件交给 CLI"的通道，就能在**零外部调用**的前提下验证
+# 装配层 + 编排器 + 各业务模块在 CLI 入口下真的能协同工作。
+#
+# 两条红线（对应 G4 的教训）：
+#   1. **绝不内置合成数据**：材料只能来自用户给的文件路径，产品代码里没有
+#      任何"演示用假材料"——否则 CLI 看起来能生成档案，实际产出的是假数据；
+#   2. **门禁不能绕过**：本地文件与抓取正文走**同一个** `assess_content_quality`
+#      判定，结论写进 `quality_status` 随材料传递；判不合格的材料不进材料流。
+# --------------------------------------------------------------------------
+
+#: 单份本地材料的字数上限（超出截断并告警，不静默）
+MAX_LOCAL_MATERIAL_CHARS = 200_000
+
+WARNING_LOCAL_MATERIAL_UNREADABLE = "LOCAL_MATERIAL_UNREADABLE"
+WARNING_LOCAL_MATERIAL_GATE_REJECTED = "LOCAL_MATERIAL_GATE_REJECTED"
+WARNING_LOCAL_MATERIAL_TRUNCATED = "LOCAL_MATERIAL_TRUNCATED"
+
+#: 本地文件的编码尝试顺序：BOM 优先，其次 UTF-8，最后 GB18030（中文 Windows 常见）
+_LOCAL_ENCODINGS = ("utf-8-sig", "utf-8", "gb18030")
+
+
+@dataclass(frozen=True)
+class LocalMaterialFile:
+    """一份**已读入**的本地材料（文件名 + 正文 + 定位符）。"""
+
+    path: str
+    title: str
+    text: str
+    locator: str
+
+
+def _local_locator(path: Any) -> str:
+    """本地文件的稳定定位符（`file:///` 前缀 + POSIX 形式的绝对路径）。
+
+    用它当 `url` / `canonical_key`：`Evidence.register_source` 要求至少一个
+    locator 非空，而 `file://` 一眼能看出"不是网上的东西"，不会被误当来源。
+    """
+    from pathlib import Path
+
+    resolved = Path(str(path)).expanduser().resolve()
+    return "file:///" + resolved.as_posix().lstrip("/")
+
+
+def _read_local_text(path: Any) -> tuple[str, str]:
+    """读文本文件。返回 `(正文, 编码)`；读不了抛 `OSError`/`UnicodeDecodeError`。"""
+    from pathlib import Path
+
+    raw = Path(str(path)).expanduser().read_bytes()
+    last_error: Exception | None = None
+    for encoding in _LOCAL_ENCODINGS:
+        try:
+            return raw.decode(encoding), encoding
+        except UnicodeDecodeError as exc:      # 换下一种编码再试
+            last_error = exc
+    raise last_error or UnicodeDecodeError("utf-8", b"", 0, 1, "无法解码本地文件")
+
+
+def load_local_materials(
+    paths: "list[Any]",
+    *,
+    target_entity_ids: "list[str] | tuple[str, ...]" = (),
+    target_names: "list[str] | tuple[str, ...]" = (),
+    min_effective_chars: int = DEFAULT_MIN_EFFECTIVE_CHARS,
+    max_chars: int = MAX_LOCAL_MATERIAL_CHARS,
+) -> tuple[list[SourceMaterial], list[WarningNote]]:
+    """把**用户提供的文件**读成材料（`SourceMaterial`），并跑同一个正文质量门禁。
+
+    返回 `(可用材料, 告警)`。**不可用的一律不进材料流**：
+      - 文件读不了 → `LOCAL_MATERIAL_UNREADABLE`；
+      - 门禁判 EMPTY / LOW_QUALITY → `LOCAL_MATERIAL_GATE_REJECTED`（带原因）；
+      - 超过 `max_chars` → 截断并记 `LOCAL_MATERIAL_TRUNCATED`（不静默截断）。
+
+    ⚠️ 本函数**不登记来源**：登记是 `ResearchService.adopt` 的事（要经 Evidence）。
+    """
+    materials: list[SourceMaterial] = []
+    warnings: list[WarningNote] = []
+    for raw_path in paths or []:
+        shown = str(raw_path)
+        try:
+            text, encoding = _read_local_text(raw_path)
+        except (OSError, UnicodeDecodeError) as exc:
+            warnings.append(WarningNote(
+                code=WARNING_LOCAL_MATERIAL_UNREADABLE,
+                message=f"本地材料读取失败，已跳过：{shown}（{type(exc).__name__}: {exc}）"))
+            continue
+
+        if len(text) > max_chars:
+            warnings.append(WarningNote(
+                code=WARNING_LOCAL_MATERIAL_TRUNCATED,
+                message=f"本地材料超出 {max_chars} 字上限，已截断：{shown}"
+                        f"（原 {len(text)} 字）"))
+            text = text[:max_chars]
+
+        locator = _local_locator(raw_path)
+        quality = assess_content_quality(
+            text, url=locator, target_names=list(target_names),
+            min_effective_chars=min_effective_chars)
+        if not quality.is_usable:
+            reasons = "、".join(str(r) for r in quality.reasons) or "UNKNOWN"
+            warnings.append(WarningNote(
+                code=WARNING_LOCAL_MATERIAL_GATE_REJECTED,
+                message=f"本地材料未通过正文质量门禁（{quality.status}：{reasons}），"
+                        f"未进入材料流：{shown}（编码 {encoding}）"))
+            continue
+
+        materials.append(SourceMaterial(
+            source_id="",
+            title=shown.rsplit("/", 1)[-1].rsplit("\\", 1)[-1] or shown,
+            url=locator,
+            canonical_key=locator,
+            snippet=text,
+            published_at=None,
+            source_kind=str(SourceKind.OTHER),
+            subject_entity_ids=list(target_entity_ids),
+            target_display_names=list(target_names),
+            query_text="",
+            quality_status=str(quality.status),
+        ))
+    return materials, warnings
+
+
 @dataclass
 class ResearchOutput:
     """`run` 的结构化结果（INTERFACES §5.2 `ResearchOutput`）。
@@ -973,6 +1099,54 @@ class ResearchService:
             if any(w.code == WARNING_REGISTER_DEDUP for w in registered.warnings):
                 outcome.dedup_hits += 1
         return Ok(outcome)
+
+    def adopt(
+        self, ctx: CallContext, materials: "list[SourceMaterial]"
+    ) -> Result[ResearchOutput]:
+        """接入**调用方提供的材料**（P4.7 离线通道）：只登记来源，不检索。
+
+        与 `run` 的三处差别，都是有意的：
+
+        1. **不做检索计划、不发任何外部请求**：没有 `Provider.search` / `extract`，
+           因此也不做费用预留与结算（不花钱就不可能记错钱）；
+        2. **材料正文由调用方读入并已过同一个门禁**（`quality_status` 非空），
+           本方法不重新判定、也不改判——门禁结论只有一个来源；
+        3. **来源仍走 `Evidence.register_source`**：`canonical_key` 用文件定位符，
+           重复接入同一文件会命中去重（返回同一个 `source_id`），
+           证据的可追溯闸门因此与检索路径完全一致。
+
+        返回的 `ResearchOutput.planned_count` / `executed_count` 恒为 0：
+        "没有检索"是事实，不该伪造成 1 条计划 1 条执行。
+        """
+        output = ResearchOutput()
+        for material in materials or []:
+            locator = (_text(material.canonical_key) or _text(material.url))
+            if not locator:
+                return Err(new_error(
+                    ErrorCode.VALIDATION_REQUIRED_FIELD,
+                    f"材料「{_text(material.title) or '（无标题）'}」缺少 "
+                    "canonical_key / url：无法登记来源（证据必须可追溯）",
+                    trace_ref=ctx.trace_ref))
+            draft = SourceDraft(
+                title=_text(material.title) or locator,
+                canonical_key=locator,
+                kind=_coerce_source_kind(material.source_kind),
+                url=_text(material.url) or None,
+                published_at=None,          # 本地文件没有可信的发布时间，不猜
+                subject_entity_ids=_str_list(material.subject_entity_ids),
+                fetch_status=FetchStatus.OK,
+            )
+            registered = self.deps.evidence.register_source(ctx, draft)
+            if is_err(registered):
+                return registered
+            source_id = str(registered.value.id)
+            output.source_ids.append(source_id)
+            output.materials.append(replace(material, source_id=source_id))
+            if any(w.code == WARNING_REGISTER_DEDUP for w in registered.warnings):
+                output.warnings.append(WarningNote(
+                    code=WARNING_REGISTER_DEDUP,
+                    message=f"材料「{draft.title}」命中去重，复用既有来源 {source_id}"))
+        return Ok(output, warnings=list(output.warnings))
 
     @staticmethod
     def _to_material(candidate: RankedCandidate, source_id: str) -> SourceMaterial:

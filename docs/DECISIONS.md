@@ -470,6 +470,20 @@ D-020）、`status=AMBIGUOUS/INSUFFICIENT_EVIDENCE/CONFLICTED`（D-008）、
 | D-243 | **不破坏已验收数据模型与校验**：`_draft_from_analysis` 产出的 `RelationshipDraft` 条目仍走 `RelationshipService` 既有 `_validate_item` / RL-V6 悬空引用守卫——编造的证据 ID（不存在/非 PUBLIC 命名空间/版本不一致）会被判 `VALIDATION_DANGLING_REFERENCE` 而拒绝（`test_analyzer_fake_evidence_ref_rejected` 实测 RUN_FAILED + STEP_FAILED）。规则分析器自身也不生成任何伪造引用：每个条目必带 `evidence_refs`，引用 ID 全部来自输入证据（结构上不可能凭空生成关系） | 用户目标 8/9；RL-V4/RL-V6；D-215 | 已实现，**待人工验收** |
 | D-244 | **能力边界明示**：`RelationshipAnalysisOutcome.is_semantic_model` 字段对所有本阶段实现恒为 `False`（Rule / Mock / Provider）；`method` 区分 `RULE_BASED_OFFLINE` / `MOCK_FIXTURE` / `MODEL`。任何人不得以本阶段规则分析器的"通过"宣称"真实语义模型已验证"。未来替换实现只需在 `BusinessDeps` 注入新的 `RelationshipAnalyzerPort` 实现，接口与产出形状不变 | 用户目标 9；D-231 同精神 | 已实现，**待人工验收** |
 
+### 2.27 P4.7：补记产品化 / CLI 离线材料 / P1a S1-S2 / 默认禁止真实外呼（2026-10-17，用户拍板）
+
+> 触发事件：P4.7 自检时发生 **1 次未授权真实调用**（deepseek / CHAT，0.0019161 USD，
+> 已落库）。用户验收结论：**接受记录、不追责，累计 0.0097980 USD 计入人工账本、不重置**，
+> 但要求把"默认禁止真实外呼"变成产品规则（D-245）。
+
+| 编号 | 决定 | 依据 | 状态 |
+| --- | --- | --- | --- |
+| D-245 | **默认禁止真实外呼（装配层闸门）**：`build_business_stack(..., allow_real=False)` 是唯一默认值。即使配置为 `PERSONA_OFFLINE_ONLY=false` + `PERSONA_MODEL_PROVIDER=deepseek`，未显式授权时装配层**不构造**真实 Provider，只记 `REAL_PROVIDER_BLOCKED`；CLI 对应 `persona business run --allow-real`，不给则退出码 2 并打印规则与开关。**配置层（能否联网）与装配层（本次是否花钱）必须是两个开关**——2026-10-17 的未授权调用正是把"配置允许"当成"已授权"导致的。显式注入的 `chat_provider` / `claim_extractor` 不受闸门约束（注入本身即显式动作），`business plan` 不构造 Provider 故天然不受影响 | 用户 P4.7 验收整改要求；实测事故 0.0019161 USD | 已实现（`tests/test_p4_7_real_call_gate.py` 9 项） |
+| D-246 | **`--material` 不替代模型**：本地材料只解决"材料从哪来"，研究阶段如实报告"未做检索"（`planned/executed` 恒 0，不伪造成 1）；材料仍须通过同一个 `assess_content_quality`，无抽取器时同样拒绝运行（本地材料不能凭空变成 claim）。**不在产品代码内置任何演示材料**（G4 教训：假数据会让"看起来能跑"掩盖缺陷） | 用户 P4.7 拍板第 4 项 | 已实现（`tests/test_p4_7_local_materials.py` 12 项） |
+| D-247 | **G12 登记：跨源同句 ⇒ `traits` 两条同文本条目**：`_build_persona_draft` 按**证据**生成条目（`item_id = pi_<evidence_id>`），同一说法跨源时产生两条文本相同、各引一条证据的条目。**不是 AC-7 违规、不是判定链缺陷**，是档案可读性缺陷；修复要改档案条目身份语义（影响版本 diff 与既有断言），用户拍板**单独立轮**，不混进 P1a。详见 `RUNNING.md` §5.16 | 用户 P4.7 拍板第 1 项 | **已登记，未修** |
+| D-248 | **P1a S3 并入阶段三**：S1（离线桩）+ S2（e2e 夹具）已证明规则层与编排层"跨源同句 ⇒ REPEATED ⇒ traits"成立；S3 剩下的未知是"真实模型会不会逐字复用同一句"，属模型行为而非代码，一次 POST 只能观察不能保证。故**本轮止步 S2**，S3 与真实检索接线一起做 | 用户 P4.7 拍板第 2 项 | 已决定 |
+| D-249 | **`usage list` 暂缓**：当前 `usage backfill` 只打印账本合计，没有逐笔列表；要做需先定筛选口径（按项目 / 按任务 / 按时间窗 / 按 `cost_status`），否则会先做出一个"看起来能对账、实际口径不明"的命令 | 用户 P4.7 拍板第 3 项 | **暂缓，待定口径** |
+
 ---
 
 ## 3. 尚未确定的开放问题
@@ -577,3 +591,4 @@ D-020）、`status=AMBIGUOUS/INSUFFICIENT_EVIDENCE/CONFLICTED`（D-008）、
 | 2026-10-14 | v0.17 | 新增 §2.25（D-221 ~ D-235）：G-2 来源材料 → 候选 claim 自动抽取的实现口径——编号冲突（与 P3.3 的同名 G-2 无关，Q-37 第十轮）、新增 `modules/extraction.py` 不重写已验收模块、核心数据缺口是 Research 此前**丢掉了 `snippet`**（现返回 `materials`）、`SourceMaterial` 下沉 core 以避开 L4↔L4 同层调用、抽取器拿不到 Evidence（AST 断言）、三种 claim 的机械区分与推断无根即丢弃（EV-V3）、等级不等于真实性、8 种拒收原因不静默丢弃、冲突只记录不裁决且不做模糊合并、推断也要幂等、材料无法落检查点（新缺口 G-4，改进程内缓存 + 幂等重跑回补）、Mock 打 `mock-fixture` 标签且不代表真实能力、模型抽取只定义契约不接真实模型、业务入口不再要求 claim、两个既有测试改口径而非删除（D-234）；H-17（正文抓取）仍遗留 |
 | 2026-10-14 | v0.16 | 新增 §2.24（D-206 ~ D-220）：H-10A 业务编排型 Orchestrator 的实现口径——编号映射 Q-37 第九轮、保留既有任务 Orchestrator 并新增独立 `BusinessOrchestrator`（实现 `UnitHandler` 被既有 `TaskRunner` 驱动）、不复制第二套六态机/预算/检查点（源码级静态断言）、五阶段复用 `TaskType` 同名 stage（`TaskType` 无全流程成员 → 缺口 G-1）、阶段间数据只经检查点 `artifact_ids`、证据 claim 不由编排器生成（缺口 G-2，用 `EvidenceSeed` 绑定来源）、证据与档案写入的幂等守卫（`item_id` 由证据 ID 推导）、Persona 按维度机械搬运且 `SINGLE` 不进 traits（AC-7）、Relationship 只用 RELATION 维度证据且不为群体关系臆造语义（RL-V3/RL-V6）、`entity_type` 只读判定（PF-V5/D-115）、结果三态自述且部分成功不算全流程成功、失败即上报且后续步骤 `NOT_REACHED`、`resume` 需重传请求（缺口 G-3）；Q-37 扩展覆盖第九轮"H-10A → 仓库 H-10 业务编排器" |
 | 2026-10-14 | v0.15 | 新增 §2.23（D-191 ~ D-205）：P2 的 `Research` 部分最小可运行实现（用户称 H-11A）的实现口径——编号映射 Q-37 第八轮、保留 `ResearchPort` 并按 INTERFACES §5.2 更正签名（D-110 同口径）、只注入 `SourceRegistrarPort`（仅 `register_source`，结构性堵死 F-10）、**不注入 Storage 不落自己的表**、确定性模板检索计划（Q-29）、0 结果为业务结果而非错误、过滤排序确定性且被拒项必带原因、登记只经 Evidence 且失败整体传播、run 的失败纪律（单查询失败继续 / 全失败上报 / `BUDGET_EXCEEDED` 立即传播 / `budget` 参数不记账）、隔离（只产 `Source` 恒 `PUBLIC_SOURCE`、不产 `EvidenceItem`）、`NO_RESULT` 用模块常量不改已审 `FetchStatus`、`VALIDATION.empty_targets` 未登记故复用 `required_field`（零新增错误码）、`RankedCandidate.score` → `rank_weight`（配合 INV-4 而不放宽不变式）、Mock Research Provider 放测试侧；Q-37 扩展覆盖第八轮"H-11A → 仓库 P2 Research" | 已实现，**待人工验收** |
+| 2026-10-17 | v0.18 | 新增 §2.27（D-245 ~ D-249）：P4.7 验收与整改——① **装配层默认禁止真实外呼**（`allow_real=False`，未授权记 `REAL_PROVIDER_BLOCKED`；CLI `--allow-real` 才授权；配置层与装配层是两个开关，D-245）；② `--material` 不替代模型（D-246）；③ **G12 登记**：跨源同句 ⇒ `traits` 两条同文本条目，单独立轮（D-247，详见 `RUNNING.md` §5.16）；④ P1a **S3 并入阶段三**（D-248）；⑤ `usage list` 暂缓、先定口径（D-249）。事件背景：P4.7 期间 1 次未授权真实调用 0.0019161 USD，累计 **0.0097980 USD**，人工账本不重置 | 已实现 / 已登记 |

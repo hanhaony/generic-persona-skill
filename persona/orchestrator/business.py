@@ -213,12 +213,19 @@ class BusinessRequest:
     `evidence_seeds` 保留为**显式覆盖通道**：给出时跳过自动抽取，原样登记
     （用于回归测试与人工校准）。两种路径都强制"证据必须绑定到本次研究登记的
     来源"。
+
+    `materials`（P4.7）是**显式材料通道**：给出时研究阶段**不做检索**，
+    只把材料登记成来源（`ResearchService.adopt`），再把它们交给抽取器。
+    它存在的理由是"检索尚未接线（H-17 / P3）"——没有它，CLI 在任何配置下
+    都产不出材料。材料必须由调用方从**用户提供的文件**读入（`load_local_materials`），
+    产品代码里没有内置的演示数据。
     """
 
     targets: list[PersonQueryTarget]
     topic: str | None = None
     max_rounds: int = 2
     evidence_seeds: list[EvidenceSeed] = field(default_factory=list)
+    materials: list[SourceMaterial] = field(default_factory=list)
     task_type: TaskType | str = TaskType.RESEARCH
     budget_limit: BudgetSpec | None = None
     retry_policy: RetryPolicy | None = None
@@ -515,7 +522,12 @@ class BusinessOrchestrator:
         与检索摘要一起进材料流——见 `_material_flow`。修复前只记住摘要，
         导致上线配置下抽取器把每份材料都判"未声明门禁结论"而全部拒收，
         模型永不被调用。
+
+        P4.7：给了 `request.materials` 就走**显式材料通道**——不检索，
+        只登记来源（见 `_step_research_provided`）。
         """
+        if request.materials:
+            return self._step_research_provided(ctx, list(request.materials))
         outcome = self.deps.research.run(ctx, list(request.targets))
         if is_err(outcome):
             return outcome
@@ -545,6 +557,32 @@ class BusinessOrchestrator:
             artifact_ids={"source_ids": list(research.source_ids)},
             warnings=warnings, message=message,
             usage=_usage_from(research.budget_used))
+
+    def _step_research_provided(
+        self, ctx: CallContext, materials: list[SourceMaterial]
+    ) -> BusinessStepResult | Err:
+        """**显式材料通道**（P4.7）：不检索，只登记来源 + 进材料流。
+
+        为什么单独一条路径而不是"给 Provider 塞个假搜索结果"：检索路径里有
+        计划、预留、结算、抓取门禁等一堆与"材料已经在我手里"无关的环节，
+        硬套进去只会让账本记上并不存在的检索费用（`_reserve` 按 `tavily` 建键）。
+        这条路径的诚实版本就是——没有检索，也不记检索的钱。
+
+        登记仍然走 `ResearchService.adopt` → `Evidence.register_source`：
+        重复接入同一文件是幂等的（命中去重，复用来源），证据的可追溯闸门不变。
+        """
+        adopted = self.deps.research.adopt(ctx, materials)
+        if is_err(adopted):
+            return adopted
+        research = adopted.value
+        self._remember(list(research.materials))
+        return BusinessStepResult(
+            name=STAGE_RESEARCH, status=STEP_EXECUTED,
+            artifact_ids={"source_ids": list(research.source_ids)},
+            warnings=list(research.warnings),
+            message=(f"接入调用方提供的材料 {len(materials)} 份，"
+                     f"登记来源 {len(research.source_ids)} 条"
+                     "（**未做检索**：本轮没有发出任何检索 / 抓取请求）"))
 
     # ================================================================ ② 证据
 
@@ -973,6 +1011,14 @@ class BusinessOrchestrator:
         cached = self._materials.get(self._task_id or "")
         if cached:
             return list(cached)
+        if request.materials:
+            # 显式材料通道同样要能回补：`adopt` 幂等（register_source 去重），
+            # 重放不会造出重复来源，也不会凭空产生材料。
+            adopted = self.deps.research.adopt(ctx, list(request.materials))
+            if is_err(adopted):
+                return adopted
+            self._remember(list(adopted.value.materials))
+            return list(adopted.value.materials)
         if not prior.get("source_ids"):
             return []
         # 研究是幂等的（register_source 会去重命中），重跑只为取回材料正文，

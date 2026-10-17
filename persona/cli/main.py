@@ -81,7 +81,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="覆盖 relationship.analyzer 配置（默认跟随配置，即 rule）")
 
     b_run = bsub.add_parser(
-        "run", help="跑一次五阶段业务链（需要已配置模型 Provider；未配置会**拒绝**且零调用）")
+        "run", help="跑一次五阶段业务链（需要已配置模型 Provider 且显式 --allow-real；"
+                    "否则**拒绝**且零调用）")
     b_run.add_argument("--names", required=True, help="人物名，逗号分隔（1 个或更多）")
     b_run.add_argument(
         "--type", dest="entity_type", default="FICTIONAL_CHARACTER",
@@ -93,9 +94,47 @@ def build_parser() -> argparse.ArgumentParser:
     b_run.add_argument("--project", default="prj_local", help="项目 ID（默认 prj_local）")
     b_run.add_argument("--task-id", default="", help="任务 ID（留空自动生成）")
     b_run.add_argument("--max-rounds", type=int, default=1, help="对话轮数（默认 1）")
+    b_run.add_argument(
+        "--material", dest="materials", action="append", default=[], metavar="PATH",
+        help="本地材料文件（可重复）。给出时研究阶段**不做检索**，只用这些文件；"
+             "文件必须通过正文质量门禁，不合格的会被列出且不进入材料流")
+    b_run.add_argument(
+        "--allow-real", dest="allow_real", action="store_true",
+        help="显式授权真实外呼（构造真实模型 Provider）。**默认拒绝**："
+             "配置里写了真实服务商也不代表本次运行被允许花钱")
     b_run.add_argument("--no-dotenv", action="store_true", help="忽略 .env 文件")
     b_run.add_argument("--analyzer", choices=("rule", "off"), default=None,
                        help="覆盖 relationship.analyzer 配置")
+
+    p_usage = sub.add_parser(
+        "usage", help="外部用量账本（人工补记；**永不发起外部调用**）")
+    usub = p_usage.add_subparsers(dest="usage_action", metavar="{backfill}")
+
+    u_back = usub.add_parser(
+        "backfill",
+        help="补记一笔**已经发生但没落库**的外部支出（必须写 reason 与 operator）")
+    u_back.add_argument(
+        "--key", required=True,
+        help="幂等键：标识**这笔支出事件**本身（重复提交不会重复记账；建议用账单号/轮次名）")
+    u_back.add_argument("--amount", required=True, type=float,
+                        help="金额（正数，单位由 --currency 决定）")
+    u_back.add_argument("--reason", required=True,
+                        help="补记原因（写进 trace_ref，必须可追溯）")
+    u_back.add_argument("--operator", required=True,
+                        help="操作人（写进 trace_ref；**不允许匿名补记**）")
+    u_back.add_argument("--currency", default="USD",
+                        help="计量单位（默认 USD；本账不做汇率换算）")
+    u_back.add_argument("--provider", default="manual", help="服务商（默认 manual）")
+    u_back.add_argument("--operation", default="CHAT",
+                        choices=("CHAT", "SEARCH", "EXTRACT"),
+                        help="调用类型（默认 CHAT）")
+    u_back.add_argument("--task-id", default="", help="归属任务（可选，供单任务上限累计）")
+    u_back.add_argument("--occurred-at", default="",
+                        help="发生时间（ISO8601；留空=现在）")
+    u_back.add_argument("--estimated", action="store_true",
+                        help="只记估算（写 cost_estimate，实际留空、状态 UNKNOWN）")
+    u_back.add_argument("--project", default="prj_local", help="项目 ID（默认 prj_local）")
+    u_back.add_argument("--no-dotenv", action="store_true", help="忽略 .env 文件")
 
     p_task = sub.add_parser("task", help="任务生命周期（创建 / 查询 / 推进 / 暂停 / 恢复 / 取消）")
     tsub = p_task.add_subparsers(dest="task_action", metavar="{create,show,list,...}")
@@ -472,6 +511,9 @@ def _run_business_action(args: Any) -> int:
                 enable_relationship_analyzer=(None if analyzer is None
                                               else analyzer == "rule"),
             ),
+            # P4.7 整改：默认禁止真实外呼。配置允许联网 ≠ 本次运行被授权花钱，
+            # 必须显式 `--allow-real`（2026-10-17 那次未授权调用就出在这里）。
+            allow_real=bool(getattr(args, "allow_real", False)),
         )
         if not is_ok(built):
             print(f"装配失败：{error_of(built)}")
@@ -538,7 +580,12 @@ def _print_business_plan(stack: Any) -> int:
 def _run_business_chain(stack: Any, args: Any) -> int:
     """跑一次五阶段业务链。**未配置抽取器时在发请求之前拒绝**（不白花钱）。"""
     from ..core.result import error_of, is_ok, unwrap
-    from ..orchestrator import BusinessRequest, TargetSpec, register_targets
+    from ..orchestrator import (
+        BusinessRequest,
+        TargetSpec,
+        materials_from_files,
+        register_targets,
+    )
 
     names = [str(n).strip() for n in str(getattr(args, "names", "")).split(",")]
     names = [n for n in names if n]
@@ -556,11 +603,20 @@ def _run_business_chain(stack: Any, args: Any) -> int:
 
     if stack.claim_extractor is None:
         print("拒绝运行：没有可用的 claim 抽取器。")
+        blocked = False
         for note in getattr(stack, "warnings", []):
-            if note.code in ("CHAT_PROVIDER_UNAVAILABLE", "EXTRACTOR_ABSENT"):
+            if note.code in ("CHAT_PROVIDER_UNAVAILABLE", "EXTRACTOR_ABSENT",
+                             "REAL_PROVIDER_BLOCKED"):
                 print(f"  装配告警：{note.message}")
-        print("  原因：未配置模型 Provider（PERSONA_MODEL_PROVIDER）或未设置密钥。")
+                blocked = blocked or note.code == "REAL_PROVIDER_BLOCKED"
+        if blocked:
+            print("  原因：**默认禁止真实外呼**——配置里有真实服务商，但本次没显式授权。")
+            print("  授权方式：加 `--allow-real`（只授权本次进程；不会自动重跑）。")
+        else:
+            print("  原因：未配置模型 Provider（PERSONA_MODEL_PROVIDER）或未设置密钥。")
         print("  影响：研究材料不会变成候选 claim，跑下去只会产生空档案（等于白跑）。")
+        print("  注意：`--material` 只解决**材料从哪来**，不替代模型——"
+              "没有抽取器时本地材料同样变不成 claim。")
         print("  建议：先 `persona business plan` 看装配快照；"
               "配置模型后用 `persona model plan` 复核单价与上限。")
         print("  说明：本次**没有发起任何请求，也没有产生费用**（真实调用需单独授权）。")
@@ -577,9 +633,31 @@ def _run_business_chain(stack: Any, args: Any) -> int:
         return 1
     targets = unwrap(registered)
 
-    print(f"业务链开跑：{len(targets)} 名目标（{entity_type}）")
+    # —— 本地材料（P4.7 离线通道）：给了 `--material` 就不做检索 ——
+    materials: list = []
+    material_paths = list(getattr(args, "materials", []) or [])
+    if material_paths:
+        materials, material_warnings = materials_from_files(
+            material_paths,
+            target_entity_ids=[t.entity_id for t in targets],
+            target_names=[t.display_name for t in targets],
+        )
+        print(f"本地材料        : 提供 {len(material_paths)} 份，"
+              f"可用 {len(materials)} 份（已过正文质量门禁）")
+        for note in material_warnings:
+            print(f"      ⚠️ [{note.code}] {note.message}")
+        if not materials:
+            print("拒绝运行：没有任何本地材料通过正文质量门禁。")
+            print("  原因：不合格的正文不能用来生成 claim"
+                  "（否则等于拿不可用材料伪造档案）。")
+            print("  建议：改成成段的中文/英文正文（每段 ≥40 字，总计 ≥200 字）。")
+            print("  说明：本次**没有发起任何请求，也没有产生费用**。")
+            return 1
+
+    print(f"业务链开跑：{len(targets)} 名目标（{entity_type}）"
+          f"{'，本地材料 ' + str(len(materials)) + ' 份（不检索）' if materials else ''}")
     result = stack.orchestrator.run(
-        stack.ctx, BusinessRequest(targets=targets,
+        stack.ctx, BusinessRequest(targets=targets, materials=materials,
                                    max_rounds=int(getattr(args, "max_rounds", 1) or 1)))
     if not is_ok(result):
         print(f"运行失败：{error_of(result)}")
@@ -596,6 +674,126 @@ def _run_business_chain(stack: Any, args: Any) -> int:
     if run.error is not None:
         print(f"  错误            : [{run.error.code}] {run.error.message}")
     return EXIT_OK if run.is_complete() else 1
+
+
+def _run_usage_action(args: Any) -> int:
+    """`persona usage backfill`（P4.7）：把**已经花掉但没落库**的钱补进账本。
+
+    为什么不许匿名补记：账本是费用闸门的唯一依据，一条来源不明的金额既不能
+    复核也无法追责。所以 `--reason` 与 `--operator` 都是必填，且都写进
+    `trace_ref`（`manual-backfill:<operator>:<reason>`），可反查到人。
+
+    幂等键**只标识这笔支出事件本身**（`manual-backfill:<key>`），不含 operator：
+    同一个账单被两个人各补一次，是比"键冲突"严重得多的错误。
+
+    `--estimated` 用于"只知道估算、还没拿到账单"的场合：写 `cost_estimate`，
+    实际值与状态留 `UNKNOWN`（D-C：未知按保守金额计入累计，绝不填 0）。
+
+    本命令**不发起任何外部调用**，也不改业务表。
+    """
+    from ..core.context import new_call_context
+    from ..core.result import error_of, is_ok, unwrap
+    from ..core.temporal import to_iso, utc_now
+    from ..core.types import (
+        COST_CONFIRMED,
+        COST_UNKNOWN,
+        OUTCOME_SUCCEEDED,
+        SOURCE_NONE,
+        SOURCE_OFFICIAL_RATE,
+        ExternalUsageRecord,
+    )
+    from ..storage.sqlite import SqliteStorage
+
+    if getattr(args, "usage_action", "") != "backfill":
+        try:
+            build_parser().parse_args(["usage", "--help"])
+        except SystemExit:
+            pass
+        return EXIT_OK
+
+    key = str(getattr(args, "key", "") or "").strip()
+    reason = str(getattr(args, "reason", "") or "").strip()
+    operator = str(getattr(args, "operator", "") or "").strip()
+    amount = float(getattr(args, "amount", 0.0) or 0.0)
+
+    problems: list[str] = []
+    if not operator:
+        problems.append("--operator 不能为空：补记必须能追溯到人（不允许匿名补记）")
+    if not reason:
+        problems.append("--reason 不能为空：补记必须写明原因")
+    if not key:
+        problems.append("--key 不能为空：补记必须能被幂等识别")
+    elif any(ch.isspace() for ch in key):
+        problems.append("--key 不能含空白：它会被拼进幂等键")
+    if not amount > 0:
+        problems.append("--amount 必须是正数（0 或负数不是一笔支出）")
+    if problems:
+        for item in problems:
+            print(f"参数有问题：{item}")
+        print("本次**没有写任何记录**。用法见 `persona usage backfill --help`。")
+        return 1
+
+    settings = _load_settings_or_report(
+        use_dotenv=not getattr(args, "no_dotenv", False))
+    if settings is None:
+        return 1
+
+    estimated = bool(getattr(args, "estimated", False))
+    currency = str(getattr(args, "currency", "USD") or "USD").strip().upper()
+    task_id = str(getattr(args, "task_id", "") or "").strip() or None
+    occurred_at = str(getattr(args, "occurred_at", "") or "").strip() or to_iso(utc_now())
+    record = ExternalUsageRecord(
+        idempotency_key=f"manual-backfill:{key}",
+        provider=str(getattr(args, "provider", "manual") or "manual").strip() or "manual",
+        operation=str(getattr(args, "operation", "CHAT") or "CHAT").strip().upper(),
+        outcome=OUTCOME_SUCCEEDED,
+        requested_at=occurred_at,
+        unit_count=1,
+        success_unit_count=1,
+        cost_estimate=amount,
+        # `--estimated` 时**故意**不写实际值：估算不等于账单（D-060 / 账本三条硬规矩）
+        cost_confirmed=None if estimated else amount,
+        currency=currency,
+        cost_source=SOURCE_NONE if estimated else SOURCE_OFFICIAL_RATE,
+        cost_status=COST_UNKNOWN if estimated else COST_CONFIRMED,
+        task_id=task_id,
+        run_id="usage-backfill",
+        trace_ref=f"manual-backfill:{operator}:{reason}",
+    )
+
+    project = str(getattr(args, "project", "prj_local") or "prj_local")
+    storage = SqliteStorage(settings.ensure_data_dir())
+    ctx = new_call_context(project_id=project, actor="cli", task_id=task_id)
+    try:
+        if not is_ok(storage.init_schema(ctx)):
+            print("数据库初始化失败")
+            return 1
+        written = storage.record_external_usage(ctx, record)
+        if not is_ok(written):
+            print(f"补记失败：{error_of(written)}")
+            return 1
+        rows = storage.external_usage_records(ctx)
+        if not is_ok(rows):
+            print(f"补记已提交，但读回账本失败：{error_of(rows)}")
+            return 1
+        collected = list(rows.value)
+        confirmed = sum(float(r.cost_confirmed or 0.0) for r in collected)
+        estimated_total = sum(float(r.cost_estimate or 0.0) for r in collected)
+
+        print("用量补记：" + ("已写入账本" if unwrap(written) else
+                          "幂等键已存在，**未重复记账**"))
+        print(f"  数据库        : {settings.database_path()}")
+        print(f"  幂等键        : {record.idempotency_key}")
+        print(f"  金额          : {amount:.7f} {currency}"
+              f"（{'估算（实际留空）' if estimated else '实际'}）")
+        print(f"  原因 / 操作者  : {reason} / {operator}")
+        print(f"  发生时间      : {occurred_at}")
+        print(f"  账本合计      : {len(collected)} 笔，"
+              f"实际 {confirmed:.7f}，估算 {estimated_total:.7f}（{currency}）")
+        print("说明：本命令**不发起任何外部调用**；只往本地账本补一笔可追溯的记录。")
+        return EXIT_OK
+    finally:
+        storage.close()
 
 
 def _open_task_service(project_id: str) -> tuple[Any, Any] | None:
@@ -789,6 +987,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 pass
             return EXIT_OK
         return _run_business_action(args)
+    if args.command == "usage":
+        return _run_usage_action(args)
     if args.command == "task":
         if not getattr(args, "task_action", ""):
             # 没有子动作时打印 task 的帮助（argparse 的 --help 会走 SystemExit）
@@ -814,7 +1014,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"命令 `persona {args.command}` 尚未实现。")
     print(f"当前阶段：{STAGE}")
     print("可用命令：persona info / persona selftest / persona config / persona model / "
-          "persona business / persona task")
+          "persona business / persona usage / persona task")
     return EXIT_NOT_IMPLEMENTED
 
 

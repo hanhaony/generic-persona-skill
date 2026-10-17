@@ -46,10 +46,11 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from ..config import AppSettings
-from ..config.spec import ResearchLimits
+from ..config.spec import NETWORK_MODEL_PROVIDER_NAMES, ResearchLimits
 from ..core.context import CallContext
 from ..core.errors import ErrorCode, new_error
 from ..core.result import Err, Ok, Result, WarningNote, error_of, is_err
+from ..core.types import SourceMaterial
 from ..core.usage_ledger import (
     ExternalUsageLedger,
     HydrationSummary,
@@ -64,7 +65,13 @@ from ..modules.relationship_analysis import (
     RelationshipAnalyzerPort,
     RuleRelationshipAnalyzer,
 )
-from ..modules.research import PersonQueryTarget, ResearchDeps, ResearchService
+from ..modules.research import (
+    PersonQueryTarget,
+    ResearchDeps,
+    ResearchService,
+    load_local_materials,
+)
+from ..modules.extract_quality import DEFAULT_MIN_EFFECTIVE_CHARS
 from ..providers.base import Provider
 from ..providers.mock import FakeProvider
 from ..storage.sqlite import SqliteStorage
@@ -85,7 +92,18 @@ WARNING_STACK_LEDGER_HYDRATION_FAILED = "LEDGER_HYDRATION_FAILED"  # 读历史�
 WARNING_STACK_SEARCH_OFFLINE = "SEARCH_PROVIDER_OFFLINE"          # 未注入检索 Provider，用离线 Fake
 WARNING_STACK_EXTRACTOR_ABSENT = "EXTRACTOR_ABSENT"               # 没有可用的 claim 抽取器
 WARNING_STACK_CHAT_PROVIDER_UNAVAILABLE = "CHAT_PROVIDER_UNAVAILABLE"  # 按配置构造聊天 Provider 失败
+WARNING_STACK_REAL_PROVIDER_BLOCKED = "REAL_PROVIDER_BLOCKED"     # 默认禁止真实外呼，未显式授权
 WARNING_STACK_ANALYZER_DISABLED = "RELATIONSHIP_ANALYZER_DISABLED"  # 按配置关闭了规则分析器
+
+
+def _config_wants_network_provider(settings: AppSettings) -> bool:
+    """配置是不是**指着**一个真实模型服务商（与"有没有密钥"无关）。
+
+    只用来决定"要不要报告被闸门拦下"：配置根本没提真实服务商时，走原来的
+    构造路径并按 `CHAT_PROVIDER_UNAVAILABLE` 降级，不制造一条无意义的拦截告警。
+    """
+    name = str(getattr(settings.model, "provider", "") or "").strip().lower()
+    return name in NETWORK_MODEL_PROVIDER_NAMES
 
 
 # --------------------------------------------------------------------------
@@ -280,6 +298,42 @@ def register_targets(
 
 
 # --------------------------------------------------------------------------
+# 本地材料（P4.7 离线通道）
+# --------------------------------------------------------------------------
+
+
+def materials_from_files(
+    paths: "list[Any]",
+    *,
+    target_entity_ids: "list[str] | tuple[str, ...]" = (),
+    target_names: "list[str] | tuple[str, ...]" = (),
+    min_effective_chars: int | None = None,
+) -> tuple[list[SourceMaterial], list[WarningNote]]:
+    """把**用户给的本地文件**变成可交给编排器的材料（`BusinessRequest.materials`）。
+
+    为什么放在装配层：CLI 只能 import `orchestrator`（F-7 / D-059），
+    而真正读文件 + 跑门禁的逻辑属于 `modules.research`。本函数是两者之间
+    唯一的那个薄转接点。
+
+    两条边界：
+
+    - **材料只能来自调用方给的路径**：产品代码里没有内置演示数据，
+      所以"CLI 能跑出档案"这件事只对**用户自己提供的材料**成立；
+    - **门禁结论随材料传递**：判不合格的文件不会出现在返回值里，
+      只能在 `warnings` 里看到原因（不静默丢弃）。
+    """
+    kwargs: dict[str, Any] = {
+        "target_entity_ids": list(target_entity_ids or ()),
+        "target_names": list(target_names or ()),
+    }
+    if min_effective_chars is not None:
+        kwargs["min_effective_chars"] = int(min_effective_chars)
+    else:
+        kwargs["min_effective_chars"] = DEFAULT_MIN_EFFECTIVE_CHARS
+    return load_local_materials(list(paths or ()), **kwargs)
+
+
+# --------------------------------------------------------------------------
 # 工厂
 # --------------------------------------------------------------------------
 
@@ -296,6 +350,7 @@ def build_business_stack(
     claim_extractor: Any = None,
     relationship_analyzer: RelationshipAnalyzerPort | None = None,
     options: StackOptions | None = None,
+    allow_real: bool = False,
 ) -> Result[BusinessStack]:
     """按配置装配整条业务链。**只装配，不发请求、不花钱。**
 
@@ -306,6 +361,15 @@ def build_business_stack(
       （此时业务链只能靠 `evidence_seeds` 显式种子，**不会凭空生成 claim**）。
     - `relationship_analyzer` > 配置：显式注入优先；否则按
       `settings.relationship.analyzer` 决定是否装 `RuleRelationshipAnalyzer`。
+
+    `allow_real`（P4.7 整改：**默认禁止真实外呼**）：
+
+    - `False`（默认）时，即使配置写着 `PERSONA_OFFLINE_ONLY=false` 且配了真实服务商，
+      本层也**不构造**真实 Provider，只记 `REAL_PROVIDER_BLOCKED` 告警——因为
+      "配置允许联网"不等于"这一次运行被授权花钱"（2026-10-17 那次未授权调用就是
+      靠"我以为没配密钥"发生的）。
+    - 显式注入的 `chat_provider` / `claim_extractor` **不受此闸门影响**：注入是
+      调用方的显式动作，闸门拦的是"按配置默默构造"。测试里的桩 Provider 照常可用。
 
     `ledger` / `storage` 允许外部注入：测试需要**同一本账**既能被装配层 hydrate、
     又能被断言读数；脚本需要复用临时库。注入的库由调用方负责 `close()`。
@@ -393,15 +457,24 @@ def build_business_stack(
 
     # ---------------- 5. 抽取器（候选生产者，不是验证者） ----------------
     if chat_provider is None and options.build_chat_provider:
-        # 只构造、不调用（`chat_provider_from_settings` 不联网）。
-        built_chat = chat_provider_from_settings(settings)
-        if is_err(built_chat):
+        if not allow_real and _config_wants_network_provider(settings):
+            # 默认拒绝：配置指向真实服务商 ≠ 本次运行被授权真实外呼。
             warnings.append(WarningNote(
-                code=WARNING_STACK_CHAT_PROVIDER_UNAVAILABLE,
-                message=f"按配置构造聊天 Provider 失败（{built_chat.error.code}）："
-                        f"{built_chat.error.message}"))
+                code=WARNING_STACK_REAL_PROVIDER_BLOCKED,
+                message=f"默认禁止真实外呼：配置指定了真实模型服务商"
+                        f"（model.provider={settings.model.provider!r}），但调用方未显式授权"
+                        f"（`allow_real=True` / CLI `--allow-real`），已拒绝构造——"
+                        f"本次装配不会产生任何外部请求与费用"))
         else:
-            chat_provider = built_chat.value
+            # 只构造、不调用（`chat_provider_from_settings` 不联网）。
+            built_chat = chat_provider_from_settings(settings)
+            if is_err(built_chat):
+                warnings.append(WarningNote(
+                    code=WARNING_STACK_CHAT_PROVIDER_UNAVAILABLE,
+                    message=f"按配置构造聊天 Provider 失败（{built_chat.error.code}）："
+                            f"{built_chat.error.message}"))
+            else:
+                chat_provider = built_chat.value
 
     extractor = claim_extractor
     if extractor is None and chat_provider is not None:

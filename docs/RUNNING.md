@@ -93,7 +93,9 @@ python -m persona selftest     # 临时库 + Mock Provider 冒烟（退出码 0�
 | `python -m persona config show --no-dotenv` | 同上，但忽略 `.env` 文件 | 0 / 1 |
 | `python -m persona config check` | 只做配置校验：通过 0，不通过 1 | 0 / 1 |
 | `python -m persona business plan [--analyzer rule\|off]` | **装配快照**：组件、两层上限、账本历史占用、装配告警（离线、零调用） | 0 / 1 |
-| `python -m persona business run --names A,B --work-title … --adaptation-version …` | 跑一次五阶段业务链；**未配置模型 Provider 时拒绝且零调用** | 0 / 1 / **2** |
+| `python -m persona business run --names A,B --work-title … --adaptation-version … --allow-real` | 跑一次五阶段业务链；**默认禁止真实外呼**，只有加 `--allow-real` 才构造真实 Provider（不加则拒绝且零调用） | 0 / 1 / **2** |
+| `python -m persona business run … --material <路径>` | 同上，但研究阶段**不做检索**：只用给定的本地材料文件（必须过正文质量门禁；可重复给） | 0 / 1 / **2** |
+| `python -m persona usage backfill --key K --amount X --reason R --operator O [--estimated]` | 人工补记一笔**已发生但没落库**的外部支出（**必须写 reason 与 operator**；幂等；零外部调用） | 0 / 1 |
 | `python -m persona task create --project X --stages A,B [--key K] [--budget-requests N]` | 建一个 `PENDING` 任务（不自动开跑） | 0 / 1 |
 | `python -m persona task show <task_id> --project X` | 看状态、阶段、进度、预算、检查点摘要 | 0 / 1 |
 | `python -m persona task list --project X` | 列出该项目下的任务 | 0 / 1 |
@@ -936,11 +938,154 @@ RelationshipService.create_relationship / revise
 6. 若累计金额本身被质疑，审计入口是每轮落盘的产物（`ledger.records[]`）与
    `cost_confirmed` 的复算结果（`scripts/verify_p4_5a_outputs.py` 的 A5.* 检查）。
 
+### 2026-10-17 补记：人工累计已与账本对齐（差额 0）
+
+C 轮核查确认：那 **0.0032838 USD 从未落库**（三个 `gps-p45a-*` 临时库的
+`external_usage_records` 全是 0 行，原因是当时脚本没传 `usage_sink`）。
+`hydrate()` 只能读库，所以"重新 hydrate"在物理上做不到 —— 只能**先补记再 hydrate**。
+已按事实补两笔（`cost_status=CONFIRMED`、`cost_source=OFFICIAL_RATE`、UTC 时间戳）：
+
+| 幂等键 | 对应 | 金额 |
+| --- | --- | --- |
+| `manual-backfill:p45a-round:2026-10-16T15:00:00Z` | P4.5-A 那一轮 | 0.0012765 |
+| `manual-backfill:p45b-c-round:2026-10-17T04:54:00Z` | P4.5-B C 轮 | 0.0032838 |
+
+由此得到一条**可自动检查的不变量**：
+
+```
+SUM(external_usage_records.cost_confirmed) == 人工累计
+```
+
+本轮（P4.6 阶段三，1 次真实 POST，confirmed 0.0033216）之后：
+`0.0012765 + 0.0032838 + 0.0033216 = 0.0078819`，库里合计 **0.0078819**，**差额 0**。
+补记详情与边界见 `docs/P4_6_REAL_RUN_AND_BOUNDARY.md` §3。
+
+### 2026-10-17 P4.7：补记已产品化
+
+上一轮的两笔补记是手写脚本完成的——那正是"每轮各写一份装配"的老毛病。
+现在有产品命令（`persona usage backfill`），规则随之收紧：
+
+1. **必须**写 `--reason` 与 `--operator`：账本是费用闸门的唯一依据，
+   来源不明的金额既不能复核也无法追责，因此**拒绝匿名补记**；
+2. 幂等键**只标识这笔支出事件**（`manual-backfill:<key>`），**不含 operator**：
+   同一张账单被两个人各补一次，比"键冲突"严重得多；
+3. `--estimated` 只写 `cost_estimate`，`cost_confirmed` 留空、状态 `UNKNOWN`
+   （估算 ≠ 账单；D-060 的"不知道就是不知道"）；
+4. 补记之后必须能被 `hydrate()` 读到——否则它进不了累计闸门，等于没记
+   （`tests/test_p4_7_usage_backfill.py` 锁住了这条）。
+
+### 2026-10-17 追加：一次**未授权**的真实调用（如实登记）
+
+P4.7 实施期间，我用 `persona business run --material …` 做 CLI 自检时，
+仓库 `.env` 里已配置的模型 Provider 被装配层按配置构造出来，**真的发出并完成了
+1 次 POST**（本轮本应零花费）。事实如下，不作任何淡化：
+
+| 项 | 值 |
+| --- | --- |
+| 幂等键 | `9e3a35479da921779f2d5cbe636ce5fa` |
+| 服务商 / 类型 | deepseek / CHAT |
+| 时间 | 2026-10-17T06:30:51Z |
+| 实际金额 | **0.0019161 USD**（`cost_status=CONFIRMED`） |
+| 落库位置 | 隔离库 `%TEMP%\gps-p47-mat\persona.db`（**不进仓库**） |
+
+它**落了库**（装配层的 `usage_sink` 已接线），所以这笔钱没有凭空消失，
+但要计入人工累计：
+
+```
+0.0078819 + 0.0019161 = 0.0097980 USD
+```
+
+防复发措施（已落地，见下节"默认禁止真实外呼"）：此后所有 CLI 五阶段测试都在
+`build_business_stack` 上注入桩抽取器 + "禁止外呼"的 Provider
+（`tests/test_p4_7_local_materials.py`），并且测试统一传 `--no-dotenv`；
+**离线自检必须显式隔离模型配置**，不能依赖"我没配密钥"这种假设。
+
+### 2026-10-17 规则登记：**默认禁止真实外呼**（D-245）
+
+> 这条规则是对上面那次未授权调用的直接整改。**任何人没有例外**。
+
+**规则（装配层）**：`build_business_stack(..., allow_real=False)` 是唯一默认值。
+即使配置写着 `PERSONA_OFFLINE_ONLY=false` 且 `PERSONA_MODEL_PROVIDER=deepseek`，
+装配层也**不构造**真实 Provider，只记 `REAL_PROVIDER_BLOCKED` 告警：
+
+```
+默认禁止真实外呼：配置指定了真实模型服务商（model.provider='deepseek'），
+但调用方未显式授权（`allow_real=True` / CLI `--allow-real`），已拒绝构造——
+本次装配不会产生任何外部请求与费用
+```
+
+**规则（CLI）**：`persona business run` 必须显式加 `--allow-real` 才可能联网；
+不给时退出码 2，并逐字打印上面那条原因 + `--allow-real` 的用法。
+
+**为什么分成两层**（这是那次事故的真正教训）：
+
+| 层 | 开关 | 回答的问题 |
+| --- | --- | --- |
+| 配置层 | `PERSONA_OFFLINE_ONLY` | **这套配置**能不能联网（加载期即拒，已有） |
+| 装配层 | `allow_real` / `--allow-real` | **这一次运行**要不要花钱（本轮新增） |
+
+"允许联网"不等于"被授权花钱"。把两者混成一个开关，就会出现"配置早配好了，
+于是任何一次自检都顺手花一次钱"。
+
+**不受闸门影响的两类**（不是例外，而是没有"按配置默默构造"这个动作）：
+
+- 显式注入的 `chat_provider` / `claim_extractor`（测试桩、脚本）；
+- `persona business plan`（`build_chat_provider=False`，本来就不构造）。
+
+**测试**：`tests/test_p4_7_real_call_gate.py`（9 项）锁住"默认不构造 / 默认不碰网络 /
+授权才构造 / 授权不伪造能力 / 注入不受闸门 / CLI 默认不传授权 / 拒绝信息指名开关"。
+其中"不碰网络"用 `urllib.request.urlopen` 断言失败的替身来证明——
+只要有任何一次真实外呼，测试就会红。
+
+
+
+> 注意：补记只写进了本轮使用的隔离库。产品默认库（`var/persona.db`）目前不存在，
+> 一旦启用，需按同样的幂等键把这两笔补进去（重复执行不会翻倍）。
+
+
 ### 本轮不做什么（避免把两件事混在一起）
 
 - **不**实现系统级累计闸门（落盘账本 + 跨进程恢复 + 累计上限）。它需要新表、
   并发写与对账语义，**另立轮次**，不混进冒烟。
 - **不**用"再跑一次"来抵消一次未入账的运行——那会让累计记账失真。
+
+---
+
+## 5.16 G12：跨源同句会让 `traits` 出现**两条同文本条目**（已登记，**未修**）
+
+**登记日期**：2026-10-17（P4.7 S1 发现，用户拍板"单独立轮，不混进 P1a"）
+
+### 事实
+
+跨源同句（同一说法出现在 ≥2 个不同来源）会被判 `REPEATED` 并进 `traits`，但
+`_build_persona_draft` 是**按证据**生成条目的（`item_id = pi_<evidence_id>`），
+于是同一句话产生**两条文本完全相同**的条目，各自引用一条证据：
+
+```
+item_id=pi_ev_aaa  text="阿雾在黄昏时分总要先点亮灯塔再锁门"  evidence_refs=[ev_aaa]
+item_id=pi_ev_bbb  text="阿雾在黄昏时分总要先点亮灯塔再锁门"  evidence_refs=[ev_bbb]
+```
+
+### 判断
+
+- **不是 AC-7 违规**：两条条目各自都有证据，没有"单源复制"；
+- **不是判定链缺陷**：`occurrences=2 / distinct_sources=2` 是对的（`tests/test_p4_7_p1a_same_claim.py`
+  的 `test_same_claim_is_repeated_and_lands_in_traits` 已钉住现状）；
+- **是档案可读性缺陷**：人读档案会看到重复条目。
+
+### 为什么不顺手修
+
+合并条目要改**档案条目身份语义**（`item_id` 从"证据"改成"说法 + 主体"），
+会影响版本 diff、既有 85 项 e2e 断言与 `PersonaService` 的稳定性闸门口径。
+这属于设计变更，不能混在"加材料 + 加断言"的一轮里。
+
+### 修复方向（下一轮评估，未拍板）
+
+1. **条目标识改为 `pi_<claim_key>`**（同一说法 + 同一主体 = 同一条目，
+   `evidence_refs` 收多条）——语义最正，但改动面最大；
+2. **保留证据级条目，出档时按文本聚合**——改动小，但"档案 = 证据投影"这条
+   不变式会变成"档案 = 聚合后的投影"，需要重新定义 diff 口径；
+3. **接受现状，只在渲染层去重**——最省，但库里的重复仍在，消费方仍会读到两份。
 
 ---
 
@@ -967,3 +1112,5 @@ RelationshipService.create_relationship / revise
 | 2026-10-14 | v0.14 | H-11A（Research 最小可运行实现，用户称 H-11A，编号差异见 DECISIONS Q-37 第八轮 / §2.23）：`persona/modules/research.py` 由 Protocol-only 推进为 **`ResearchService`**（确定性检索计划 / 经 Provider.search 检索 / 过滤排序 / 经 Evidence 登记 / run 聚合），新增独立 **`SourceRegistrarPort`（仅 `register_source`，堵死 F-10）**与 `ResearchDeps`；新增 `tests/test_research_module.py`（48 项）；测试数 563 → **611**（3.13.14 / 3.14.7 实测全过）；新增 §5.11（交付 / 调用方式与 IO / 与 Evidence 衔接 / 追溯与隔离 / 契约取舍 / 遗留 H-14~H-17 / 接真实研究服务的条件）；`INTERFACES §5.3` 回填实现状态（v0.1.4） | 已实现，**待人工验收** |
 | 2026-10-17 | v0.18 | 新增 §5.15：**G11 登记**——`ExternalUsageLedger` 纯内存、无落盘，**跨进程累计费用闸门不成立**；明确 0.25 USD 是"每次进程"上限而非累计上限；给出 C 轮之后的人工累计记账规则（不重置、新累计 = 上轮累计 + 本轮 `cost_confirmed`、基线 0.0012765 USD、未确认笔数按估算值计入并标注）；声明系统级累计闸门**另立轮次**、不混进冒烟 | 待确认 |
 | 2026-10-17 | v0.19 | **P4.6 三项落地**：① `persona/orchestrator/assembly.py`（composition root：`build_business_stack` / `register_targets`），CLI 新增 `persona business plan|run`（业务链进 CLI，D-A）；② G11 闭合——账本 `hydrate()` + `usage_sink` 接线 + **两层上限**（单任务 `max_cost` / 项目累计 `max_cost_total`，D-B/D-C）；③ 关系分析器默认装配（D-D）且失败**降级**留告警（D-E），新增配置 `PERSONA_RELATIONSHIP_ANALYZER=rule|off`。新增 `tests/test_p4_6_assembly_ledger.py`（32 项）与分析器降级用例（2 项） | 待确认 |
+| 2026-10-17 | v0.20 | **P4.6 阶段三**：提交 `6efa1b7`；**1 次真实 POST** 跑通五阶段（16 证据 / 2 人格 / 1 关系，confirmed **0.0033216 USD**）；**C 轮 0.0032838 确认从未落库**（3 个临时库均 0 行），改以两笔人工补记入账，人工累计与库内合计首次**逐位相等（0.0078819）**；§5.15 增补"补记 + 不变量"小节；新增 `P4_6_REAL_RUN_AND_BOUNDARY.md`（真实 vs Stub 边界表）与 `PLAN_P4_7_P1A.md`（P1a 方案 + 缺口审计） | 待确认 |
+| 2026-10-17 | v0.22 | **P4.7 验收 + 整改**：① 装配层**默认禁止真实外呼**（`build_business_stack(allow_real=False)`，未授权时记 `REAL_PROVIDER_BLOCKED` 且不构造；CLI `business run --allow-real` 才授权，见 §5.15 规则登记 / D-245）；② 新增 `tests/test_p4_7_real_call_gate.py`（9 项，含"默认不碰网络"的 `urlopen` 断言替身）；③ 新增 §5.16 **G12 登记**（跨源同句 ⇒ `traits` 两条同文本条目，用户拍板单独立轮）；④ 人工累计确认 **0.0097980 USD**（含 §5.15 那次未授权调用，**不重置**） | 待确认 |

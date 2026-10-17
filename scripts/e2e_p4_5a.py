@@ -235,12 +235,23 @@ E2E_URL_2 = "https://example.invalid/starlamp-festival-notes"
 E2E_TITLE_2 = "[合成样张·虚构] 雾港星灯会庆典记闻（非真实人物）"
 
 #: 5 句，主语全是"阿灯"；每段 ≥40 字，合计 ≥200 字（门禁 prose_chars 下限）。
+#:
+#: P4.7 / P1a S2：**同一句逐字出现在两份材料里**（这里是第 6 句，也在互动页里）。
+#: 为什么必须进夹具：`traits` 的空缺不是规则问题，而是"同一说法要出现在
+#: ≥2 个不同来源"这种材料在夹具里从来没有过。只加材料、不改规则，就能让
+#: `judge_stability` 走出 `REPEATED` 那条分支——这是 S1（离线桩）之外的第二次
+#: 证明，用的是同一份 e2e 夹具与同一套产品代码。
+E2E_SHARED_SENTENCE = (
+    "阿灯做事向来利落，灯会前后的每一件小事都要亲手过一遍，从灯架到灯芯都不肯假手他人。"
+)
+
 E2E_PASSAGES_2: tuple[str, ...] = (
     "阿灯是雾港星灯会的常任司仪，据雾港庆典档案记载，她自幼便随长辈学习掌灯礼数，至今未曾间断。",
     "阿灯喜欢在灯会开场前独自登上堤坝看海，随身带着一盏用贝壳拼成的小灯，灯面早已被海风吹得温润发亮。",
     "阿灯生性热烈健谈，与雾港的每一位船工都熟识，只在深夜散场之后才会独坐片刻，然后重新回到灯棚里。",
     "阿灯习惯在每次灯会结束时点燃最后一盏灯，这个习惯维持了整整九年，雾港的老住户只要看见那盏灯就知道灯会散了。",
     "阿灯曾在一次风暴夜独自护住整排灯架，直到风势减弱才离开堤坝，这件事至今仍被雾港的老住户反复提起。",
+    E2E_SHARED_SENTENCE,      # ← 与互动页逐字相同的说法（P1a S2）
 )
 E2E_TEXT_2 = "\n\n".join(E2E_PASSAGES_2)
 
@@ -266,6 +277,7 @@ E2E_PASSAGES_3: tuple[str, ...] = (
     "老住户说，阿雾敲的铜钟就是灯会的开场信号，钟声三响之后阿灯才开始掌灯，这个配合已经沿用多年。",
     "有一年风暴夜里，阿灯独自护住整排灯架，阿雾在塔上整夜守着铜钟，直到风势减弱两人才在堤坝上碰面。",
     "灯会散场之后，阿灯会点亮最后一盏灯，再上塔把当夜的情形说给阿雾听，说完便各自回到自己的位置。",
+    E2E_SHARED_SENTENCE,      # ← 与阿灯页逐字相同的说法（P1a S2）
 )
 E2E_TEXT_3 = "\n\n".join(E2E_PASSAGES_3)
 
@@ -952,7 +964,8 @@ def _orchestrator_payload_shell() -> str:
 
 
 def orchestrator_payload(name_to_id: dict[str, str], *,
-                         with_pair: bool = False) -> str:
+                         with_pair: bool = False,
+                         with_shared_trait: bool = False) -> str:
     """编排器诊断用的**模型输出**：VERBATIM 候选，摘录逐字取自对应合成正文。
 
     每个主体 5 条；第 5 条是 `TRAIT + SINGLE`（AC-7 探针）。
@@ -961,6 +974,11 @@ def orchestrator_payload(name_to_id: dict[str, str], *,
     `subject_entity_ids` 同时含两人）——这是"关系条目产出路径"的**阳性对照**：
     若连桩模型给的双人证据都变不成 `shared_experiences`，那是代码坏了，
     与真实模型是否愿意产出 RELATION 无关。
+
+    `with_shared_trait=True`（P1a S2）时追加 **2 条同说法 TRAIT**：
+    同一句 `E2E_SHARED_SENTENCE` 分别挂在阿灯页与互动页两个 `material_key` 上，
+    `stability=UNKNOWN`（**不声明**，让框架自己判）。它们应当被判成 `REPEATED`
+    并进入 `traits`——这条路径此前从未被夹具覆盖过。
 
     `material_key` 用材料的 `canonical_key`（= url）——抽取器就是这么定位的。
     """
@@ -1006,6 +1024,18 @@ def orchestrator_payload(name_to_id: dict[str, str], *,
                 "key": f"{key}_pair", "claim": claim_text, "tier": "VERBATIM",
                 "dimension": "RELATION", "subject_entity_ids": list(both),
                 "material_key": E2E_URL_3, "verbatim_quote": quote,
+                "stability": "UNKNOWN", "canon_level": "CANON", "confidence": 0.9,
+            })
+    if with_shared_trait and "阿灯" in name_to_id:
+        # 同一句、两个 material_key（阿灯页 + 互动页），stability 一律 UNKNOWN：
+        # 由框架自己判 —— 这正是 P1a 要验证的那条分支。
+        for tag, material_key in (("a", E2E_URL_2), ("b", E2E_URL_3)):
+            claims.append({
+                "key": f"c1_shared_{tag}", "claim": E2E_SHARED_SENTENCE,
+                "tier": "VERBATIM", "dimension": "TRAIT",
+                "subject_entity_ids": [name_to_id["阿灯"]],
+                "material_key": material_key,
+                "verbatim_quote": E2E_SHARED_SENTENCE,
                 "stability": "UNKNOWN", "canon_level": "CANON", "confidence": 0.9,
             })
     return json.dumps({"claims": claims}, ensure_ascii=False)
