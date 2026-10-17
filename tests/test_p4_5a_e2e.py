@@ -36,6 +36,7 @@ import json
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -64,6 +65,10 @@ from persona.modules.extraction import (                                # noqa: 
     RejectedClaim,
 )
 from persona.core.enums import Cardinality, ProfileStatus              # noqa: E402
+from persona.modules.evidence import EvidenceDraft, SourceDraft         # noqa: E402
+from persona.modules.relationship_analysis import (                     # noqa: E402
+    RuleRelationshipAnalyzer,
+)
 from persona.modules.persona import (                                   # noqa: E402
     WARNING_PROFILE_DEGRADED_SKIPPED,
 )
@@ -86,6 +91,7 @@ from persona.orchestrator import (                                      # noqa: 
     BusinessOrchestrator,
 )
 from persona.providers.mock import network_blocked                      # noqa: E402
+import persona.orchestrator.business as runner_business                # noqa: E402
 
 #: **假**密钥占位值，仅用于验证"不会被打印"。不是任何真实凭据。
 SECRET_PLACEHOLDER = "placeholder-not-a-real-key-p45a"
@@ -781,20 +787,21 @@ class TestOrchestratorRealRunWiring(unittest.TestCase):
 
 
 class TestKnownGapStabilityNotWired(unittest.TestCase):
-    """**已知缺口锁（G6，本轮发现，未授权修复）**：`stability` 链路断在中间。
+    """**G6 回归锁（已接线）**：`stability` 链路曾经断在中间。
 
-    两个事实叠加，导致经编排器路径产出的档案里 `traits` **结构性为空**：
-
-    1. 抽取器**刻意不解析**模型自报的 `stability`（`CandidateClaim.stability`
-       默认 `UNKNOWN`，docstring 明写"不得编造"）——模型无权宣布自己的说法稳定；
-    2. 框架自带的确定性判定器 `Evidence.judge_stability()`（1 条=SINGLE、
-       ≥2=REPEATED、≥3 个不同来源=PATTERN）在生产代码里**零调用点**。
+    历史事实（修复前）：
+      1. 抽取器**刻意不解析**模型自报的 `stability`（`CandidateClaim.stability`
+         默认 `UNKNOWN`，docstring 明写"不得编造"）——模型无权宣布自己的说法稳定；
+      2. 框架自带的确定性判定器 `Evidence.judge_stability()`（1 条=SINGLE、
+         ≥2=REPEATED、≥3 个不同来源=PATTERN）在生产代码里**零调用点**。
 
     结果：TRAIT 维度证据的 stability 恒为 `UNKNOWN` → 按 AC-7 全部落
-    `single_events`。AC-7 因此是**保守满足**的（安全侧），但这正是
-    "`traits` 可能全空"更硬的原因：**不是可能，是当前接线下的必然**。
+    `single_events` → `traits` 在真实链路上**结构性为空**。
 
-    一旦接线补齐，本测试会变红 —— 那时请更新本测试与设计稿。
+    **现在已接线**（`business._assess_stabilities`）：本类里的
+    `test_judge_stability_has_a_product_call_site` 从"断言缺口存在"
+    **反转**为"断言接线存在"，防止将来有人把接线删掉而没人发现。
+    抽取器仍然不解析模型自报的 stability（那一条**不变**，是 PF-V2 的要求）。
     """
 
     @staticmethod
@@ -810,11 +817,18 @@ class TestKnownGapStabilityNotWired(unittest.TestCase):
                     found.append(f"{path.relative_to(_REPO_ROOT)}:{node.lineno}")
         return found
 
-    def test_judge_stability_has_no_product_call_site(self):
+    def test_judge_stability_has_a_product_call_site(self):
+        """G6 已接线：判定器**必须**有产品调用点，且落在编排器里。
+
+        反转自修复前的 `test_judge_stability_has_no_product_call_site`。
+        """
         calls = self._judge_stability_callers()
-        self.assertEqual(
-            calls, [],
-            f"产品代码里出现了 judge_stability() 调用点，G6 可能已接线：{calls}")
+        self.assertTrue(
+            calls,
+            "产品代码里找不到 judge_stability() 调用点——G6 的接线被删掉了？")
+        self.assertTrue(
+            any("orchestrator" in c for c in calls),
+            f"判定器应在编排器里被调用（它是 L5 协调层），实际：{calls}")
 
     def test_model_reported_stability_is_not_parsed(self):
         """抽取器不解析模型自报的 stability：无论载荷写什么，候选一律 UNKNOWN。"""
@@ -1202,6 +1216,364 @@ class TestG10DumpPath(unittest.TestCase):
             path = runner.resolve_dump_path(args.dump)
             self.assertNotIn(self.REPO, path.resolve().parents,
                              f"{argv} 的默认落点不得在仓库内")
+
+
+class TestG9RelationEvidenceClassification(unittest.TestCase):
+    """G9 回归锁：没被档案消费的 RELATION 证据必须**按原因分类**报出来。
+
+    修复前的三个毛病：
+      1. `covered < 2` 直接 `continue`，一条痕迹都不留；
+      2. "有证据但主体不足"与"根本没有证据"共用一句
+         `NO_RELATION_EVIDENCE`，运维无法分辨该补材料还是该查抽取；
+      3. 单人物时阶段 SKIPPED，而已登记的 RELATION 证据**没有任何消费者**
+         （人物档案没有 RELATION 维度），那条证据等于凭空消失。
+    """
+
+    def setUp(self) -> None:
+        self.out = runner.Out(SECRET_PLACEHOLDER, quiet=True)
+        self.settings = settings_for()
+        self.stack = runner.Stack(self.settings, ExternalUsageLedger(), self.out)
+        self.orch = self.stack.orchestrator()
+        self._source_id = ""
+        self._targets: list = []
+
+    def tearDown(self) -> None:
+        self.stack.teardown()
+
+    # ---------------------------------------------------------------- 工具
+
+    def _source(self) -> str:
+        if not self._source_id:
+            ref = unwrap(self.stack.evidence.register_source(
+                self.stack.ctx,
+                SourceDraft(
+                    title="合成互动页（G9 夹具）",
+                    canonical_key="https://example.test/g9-relation",
+                    url="https://example.test/g9-relation")))
+            self._source_id = str(ref.id)
+        return self._source_id
+
+    def _evidence(self, text: str, subjects: list[str],
+                  dimension: str = "RELATION") -> str:
+        """登记一条**归纳型**证据（不带摘录，绕开 EV-V2 的原话核验）。"""
+        ref = unwrap(self.stack.evidence.add_evidence(
+            self.stack.ctx,
+            EvidenceDraft(
+                claim=text, tier="PROFILE_BACKGROUND", dimension=dimension,
+                subject_entity_ids=subjects, source_id=self._source(),
+                extraction_confidence=0.9)))
+        return str(ref.id)
+
+    @staticmethod
+    def _codes(step) -> list[str]:
+        return [str(w.code) for w in step.warnings]
+
+    def _run_relationship(self, evidence_ids: list[str], targets=None):
+        return self.orch._step_relationship(
+            self.stack.ctx,
+            self.stack.request(targets=targets or self._targets
+                               or [self.stack.target]),
+            {"evidence_ids": evidence_ids})
+
+    def _pair(self) -> tuple[str, str]:
+        """登记阿雾 / 阿灯两名参与者，并把 targets 记下来供请求用。"""
+        self._targets = self.stack.ensure_targets(["阿雾", "阿灯"])
+        return self._targets[0].entity_id, self._targets[1].entity_id
+
+    # ---------------------------------------------------------------- 用例
+
+    def test_single_subject_evidence_is_reported_not_silently_dropped(self):
+        """主体只含 1 名参与者 ⇒ 分类告警，且带数量。"""
+        a, b = self._pair()
+        ev = self._evidence("阿雾独自在塔顶守了一夜", [a])
+        step = self._run_relationship([ev])
+        self.assertFalse(is_err(step), step)
+        codes = self._codes(step)
+        self.assertIn(runner_business.WARNING_RELATION_SUBJECT_INSUFFICIENT, codes)
+        message = " ".join(str(w.message) for w in step.warnings
+                           if str(w.code) == runner_business.WARNING_RELATION_SUBJECT_INSUFFICIENT)
+        self.assertIn("1 条", message, "告警必须带数量，不能只说'有证据没用上'")
+        self.assertIn(ev, message, "告警必须带证据 ID，否则无法定位")
+
+    def test_subject_insufficient_does_not_masquerade_as_no_evidence(self):
+        """有证据、只是主体不足时，**不得**再说"没有 RELATION 证据"。"""
+        a, b = self._pair()
+        ev = self._evidence("阿灯只是路过雾港", [b])
+        step = self._run_relationship([ev])
+        self.assertFalse(is_err(step), step)
+        codes = self._codes(step)
+        self.assertIn(runner_business.WARNING_RELATION_SUBJECT_INSUFFICIENT, codes)
+        self.assertNotIn(runner_business.WARNING_NO_RELATION_EVIDENCE, codes,
+                         "明明有 RELATION 证据，不能说'没有可用的 RELATION 证据'")
+
+    def test_no_relation_evidence_still_reports_the_classic_code(self):
+        """真的一条 RELATION 证据都没有 ⇒ 仍报 NO_RELATION_EVIDENCE。"""
+        a, b = self._pair()
+        ev = self._evidence("阿雾在雾港长大", [a], dimension="BACKGROUND")
+        step = self._run_relationship([ev])
+        self.assertFalse(is_err(step), step)
+        codes = self._codes(step)
+        self.assertIn(runner_business.WARNING_NO_RELATION_EVIDENCE, codes)
+        self.assertNotIn(runner_business.WARNING_RELATION_SUBJECT_INSUFFICIENT, codes)
+
+    def test_both_subjects_are_consumed_without_classification_noise(self):
+        """覆盖 2 名参与者的证据正常进档案，不产生"未消费"告警。"""
+        a, b = self._pair()
+        ev = self._evidence("两人在灯会当夜共同值守堤坝", [a, b])
+        step = self._run_relationship([ev])
+        self.assertFalse(is_err(step), step)
+        codes = self._codes(step)
+        self.assertNotIn(runner_business.WARNING_RELATION_SUBJECT_INSUFFICIENT, codes)
+        self.assertNotIn(runner_business.WARNING_RELATION_EVIDENCE_UNUSED_OTHER, codes)
+
+    def test_single_person_reports_suspended_relation_evidence(self):
+        """单人物：阶段 SKIPPED，但已登记的 RELATION 证据必须被点名。"""
+        a = self.stack.ensure_entity("阿雾")
+        ev = self._evidence("阿雾曾与阿灯约定在灯塔见面", [a])
+        step = self._run_relationship([ev])
+        self.assertFalse(is_err(step), step)
+        self.assertEqual(step.status, STEP_SKIPPED)
+        codes = self._codes(step)
+        self.assertIn(runner_business.WARNING_RELATION_STAGE_SKIPPED_WITH_EVIDENCE, codes)
+        message = " ".join(str(w.message) for w in step.warnings)
+        self.assertIn("1 条", message)
+        self.assertIn(ev, message)
+
+    def test_single_person_without_relation_evidence_stays_quiet(self):
+        """单人物且没有 RELATION 证据 ⇒ 不报悬空告警（避免噪声）。"""
+        a = self.stack.ensure_entity("阿雾")
+        ev = self._evidence("阿雾习惯在夜里检查灯芯", [a], dimension="HABIT")
+        step = self._run_relationship([ev])
+        self.assertFalse(is_err(step), step)
+        self.assertEqual(step.status, STEP_SKIPPED)
+        self.assertNotIn(runner_business.WARNING_RELATION_STAGE_SKIPPED_WITH_EVIDENCE,
+                         self._codes(step))
+
+    def test_analyzer_path_propagates_its_own_classification(self):
+        """注入分析器时，它内部的"主体不足"计数必须透传到步骤告警（G5 同型）。"""
+        self.orch.deps = replace(
+            self.orch.deps, relationship_analyzer=RuleRelationshipAnalyzer())
+        a, b = self._pair()
+        ev_bad = self._evidence("阿雾在灯塔里独自醒来", [a])
+        ev_good = self._evidence("两人在堤坝上并肩守到天亮", [a, b])
+        step = self._run_relationship([ev_bad, ev_good])
+        self.assertFalse(is_err(step), step)
+        codes = self._codes(step)
+        self.assertIn("RELATION_EVIDENCE_SUBJECT_INSUFFICIENT", codes,
+                      "分析器自己的分类告警被丢掉了（G5 同型回归）")
+
+    def test_analyzer_with_no_usable_evidence_reports_analysis_failed(self):
+        """证据全被主体筛掉 ⇒ 分析器产出为空 ⇒ 报'分析失败'而不是装作没事。"""
+        self.orch.deps = replace(
+            self.orch.deps, relationship_analyzer=RuleRelationshipAnalyzer())
+        a, b = self._pair()
+        ev = self._evidence("阿雾独自修了一夜灯", [a])
+        step = self._run_relationship([ev])
+        self.assertFalse(is_err(step), step)
+        codes = self._codes(step)
+        self.assertIn(runner_business.WARNING_RELATION_ANALYSIS_FAILED, codes)
+
+
+class TestG6StabilityAssessment(unittest.TestCase):
+    """G6 回归锁：稳定性判定**已接线**，且按 7 项拍板的口径工作。
+
+    拍板口径：
+      - D1 落库，作为证据的**附加字段**（不覆盖 `stability` 列）；
+      - D2 同来源不算多次（组内按 `source_id` 去重）；
+      - D3 分组键 = 归一化文本 + 主体集合；
+      - D4 无判定时保持 `UNKNOWN`，不进 `traits`，并记录为"未判定"。
+
+    核心结论（已证明、此处的测试就是它的证据）：**单来源下 `traits` 必然为空**
+    —— 同来源的同一说法只会有一个代表，`occurrences` 恒为 1，按 D-109 判
+    `SINGLE`，而 `SINGLE` 按 AC-7 绝不进 `traits`。
+    """
+
+    def setUp(self) -> None:
+        self.out = runner.Out(SECRET_PLACEHOLDER, quiet=True)
+        self.settings = settings_for()
+        self.stack = runner.Stack(self.settings, ExternalUsageLedger(), self.out)
+        self.orch = self.stack.orchestrator()
+        self._sources: dict[str, str] = {}
+
+    def tearDown(self) -> None:
+        self.stack.teardown()
+
+    # ---------------------------------------------------------------- 工具
+
+    def _source(self, key: str) -> str:
+        if key not in self._sources:
+            ref = unwrap(self.stack.evidence.register_source(
+                self.stack.ctx,
+                SourceDraft(
+                    title=f"合成材料-{key}",
+                    canonical_key=f"https://example.test/{key}",
+                    url=f"https://example.test/{key}")))
+            self._sources[key] = str(ref.id)
+        return self._sources[key]
+
+    def _trait(self, text: str, subject: str, source_key: str) -> str:
+        ref = unwrap(self.stack.evidence.add_evidence(
+            self.stack.ctx,
+            EvidenceDraft(
+                claim=text, tier="PROFILE_BACKGROUND", dimension="TRAIT",
+                subject_entity_ids=[subject], source_id=self._source(source_key),
+                extraction_confidence=0.9)))
+        return str(ref.id)
+
+    def _view(self, evidence_id: str):
+        return unwrap(self.stack.evidence.get_evidence(self.stack.ctx, evidence_id))
+
+    def _judge(self, evidence_ids: list[str]):
+        items = [self._view(i) for i in evidence_ids]
+        warnings: list[WarningNote] = []
+        judged = self.orch._assess_stabilities(self.stack.ctx, items, warnings)
+        return judged, warnings
+
+    def _draft(self, entity_id: str, evidence_ids: list[str], judged=None):
+        items = [self._view(i) for i in evidence_ids]
+        return BusinessOrchestrator._build_persona_draft(
+            entity_id, items, "FICTIONAL_CHARACTER", judged)
+
+    # ---------------------------------------------------------------- 用例
+
+    def test_single_source_trait_never_reaches_traits(self):
+        """单来源 ⇒ occurrences=1 ⇒ SINGLE ⇒ 落 single_events（traits 空）。"""
+        a = self.stack.ensure_entity("阿雾")
+        ev = self._trait("阿雾总在深夜修灯", a, "src-a")
+        judged, warnings = self._judge([ev])
+        self.assertEqual(str(judged[ev]), "SINGLE")
+        self.assertEqual(warnings, [])
+        draft = self._draft(a, [ev], judged)
+        self.assertEqual(draft.traits, [], "单来源的 TRAIT 证据绝不可进 traits")
+        self.assertEqual(len(draft.single_events), 1)
+        self.assertEqual(str(draft.single_events[0].stability), "SINGLE",
+                         "标签应从'没判过(UNKNOWN)'变成'判过且是单次(SINGLE)'")
+
+    def test_same_wording_from_two_sources_becomes_repeated(self):
+        """两个来源说同一句话 ⇒ REPEATED ⇒ 进 traits（AC-7 允许的情形）。"""
+        a = self.stack.ensure_entity("阿雾")
+        ev1 = self._trait("阿雾总在深夜修灯", a, "src-a")
+        ev2 = self._trait("阿雾总在深夜修灯", a, "src-b")
+        judged, _ = self._judge([ev1, ev2])
+        self.assertEqual(str(judged[ev1]), "REPEATED")
+        self.assertEqual(str(judged[ev2]), "REPEATED")
+        draft = self._draft(a, [ev1, ev2], judged)
+        self.assertEqual(len(draft.traits), 2, "多来源佐证的性格才允许进 traits")
+        self.assertEqual(draft.single_events, [])
+
+    def test_whitespace_variant_from_same_source_does_not_count_twice(self):
+        """**D2 的核心**：同来源的空白变体不得凑成"多次出现"。
+
+        幂等键用**精确** claim、分组键用**归一化** claim，两者的差集就是这类
+        近似重复。若原样喂给 `judge_stability`，`occurrences=2/distinct=1`
+        会被判 REPEATED 并进 traits —— 等于一条材料自己给自己作证两次，
+        绕过 AC-7。按 `source_id` 去重后这扇门就关上了。
+        """
+        a = self.stack.ensure_entity("阿雾")
+        ev1 = self._trait("阿雾总在深夜修灯", a, "src-a")
+        ev2 = self._trait("阿雾总在深夜  修灯", a, "src-a")   # 仅多一个空格
+        self.assertNotEqual(ev1, ev2, "前提：两条证据都真的登记下来了")
+        judged, _ = self._judge([ev1, ev2])
+        self.assertEqual(str(judged[ev1]), "SINGLE")
+        self.assertEqual(str(judged[ev2]), "SINGLE")
+        draft = self._draft(a, [ev1, ev2], judged)
+        self.assertEqual(draft.traits, [],
+                         "同来源的近似重复不得被算成 REPEATED（那会绕过 AC-7）")
+        self.assertEqual(len(draft.single_events), 2)
+
+    def test_three_sources_become_pattern(self):
+        """三个不同来源 ⇒ PATTERN。"""
+        a = self.stack.ensure_entity("阿雾")
+        ids = [self._trait("阿雾总在深夜修灯", a, k)
+               for k in ("src-a", "src-b", "src-c")]
+        judged, _ = self._judge(ids)
+        self.assertEqual({str(v) for v in judged.values()}, {"PATTERN"})
+
+    def test_verdict_is_persisted_as_extra_field_without_touching_stability(self):
+        """**D1**：判定作为附加字段落库，`stability` 列仍是登记值 `UNKNOWN`。"""
+        a = self.stack.ensure_entity("阿雾")
+        ev1 = self._trait("阿雾总在深夜修灯", a, "src-a")
+        ev2 = self._trait("阿雾总在深夜修灯", a, "src-b")
+        self._judge([ev1, ev2])
+
+        view = self._view(ev1)
+        self.assertEqual(view.stability, "UNKNOWN",
+                         "登记时的声明必须原样保留（不得被判定覆盖）")
+        self.assertIsInstance(view.stability_verdict, dict)
+        self.assertEqual(view.stability_verdict["stability"], "REPEATED")
+        self.assertEqual(view.stability_verdict["occurrences"], 2)
+        self.assertEqual(view.stability_verdict["distinct_sources"], 2)
+        self.assertIn("reason", view.stability_verdict)
+        self.assertEqual(view.effective_stability, "REPEATED",
+                         "消费方读 effective_stability，判定优先于登记值")
+
+    def test_verdict_survives_reread_from_storage(self):
+        """判定必须是**真的落库**（重开一次读取仍在），不是内存里的临时值。"""
+        a = self.stack.ensure_entity("阿雾")
+        ev = self._trait("阿雾总在深夜修灯", a, "src-a")
+        self._judge([ev])
+        row = unwrap(self.stack.storage.get(self.stack.ctx, "EvidenceItem", ev))
+        self.assertIsInstance(row.get("stability_verdict"), dict)
+        self.assertEqual(row["stability_verdict"]["stability"], "SINGLE")
+
+    def test_without_judgement_behaviour_is_unchanged(self):
+        """**D4**：拿不到判定时保持 `UNKNOWN`，仍不进 traits。"""
+        a = self.stack.ensure_entity("阿雾")
+        ev = self._trait("阿雾总在深夜修灯", a, "src-a")
+        draft = self._draft(a, [ev], None)          # 传 None = 旧行为
+        self.assertEqual(draft.traits, [])
+        self.assertEqual(str(draft.single_events[0].stability), "UNKNOWN",
+                         "无判定时必须如实记 UNKNOWN（不猜）")
+
+    def test_declared_stability_is_never_overwritten_by_the_judge(self):
+        """已**明确声明**的 stability 不被机械判定覆盖（与 G7 不降级覆盖同精神）。
+
+        真实链路里抽取器永远给 `UNKNOWN`（PF-V2 不允许模型自评），所以判定该跑；
+        但夹具 / 显式种子 / 人工标注写了 `REPEATED` 时那是更强的信息，
+        机械规则把它盖成 `SINGLE` 会把本该进 `traits` 的证据踢出去。
+        """
+        a = self.stack.ensure_entity("阿雾")
+        declared = unwrap(self.stack.evidence.add_evidence(
+            self.stack.ctx,
+            EvidenceDraft(
+                claim="阿雾总在深夜修灯", tier="PROFILE_BACKGROUND", dimension="TRAIT",
+                subject_entity_ids=[a], source_id=self._source("src-a"),
+                extraction_confidence=0.9, stability="REPEATED")))
+        judged, _ = self._judge([str(declared.id)])
+        self.assertEqual(judged, {}, "已声明的证据不该被重新判定")
+        self.assertIsNone(self._view(str(declared.id)).stability_verdict,
+                          "已声明的证据不该被写入判定字段")
+        draft = self._draft(a, [str(declared.id)], judged)
+        self.assertEqual(len(draft.traits), 1, "已声明 REPEATED 的 TRAIT 必须留在 traits")
+
+    def test_declared_members_still_count_towards_occurrences(self):
+        """已声明的成员参与计数：声明 + 未声明同说法 ⇒ 未声明那条判 REPEATED。"""
+        a = self.stack.ensure_entity("阿雾")
+        declared = unwrap(self.stack.evidence.add_evidence(
+            self.stack.ctx,
+            EvidenceDraft(
+                claim="阿雾总在深夜修灯", tier="PROFILE_BACKGROUND", dimension="TRAIT",
+                subject_entity_ids=[a], source_id=self._source("src-a"),
+                extraction_confidence=0.9, stability="REPEATED")))
+        pending = self._trait("阿雾总在深夜修灯", a, "src-b")
+        judged, _ = self._judge([str(declared.id), pending])
+        self.assertEqual(str(judged[pending]), "REPEATED",
+                         "另一个来源的佐证必须算进 occurrences（否则会低估）")
+
+    def test_step_persona_wires_judgement_end_to_end(self):
+        """整链：`_step_persona` 必须把判定接进档案，而不只是库里有字段。"""
+        a = self.stack.ensure_entity("阿雾")
+        ev1 = self._trait("阿雾总在深夜修灯", a, "src-a")
+        ev2 = self._trait("阿雾总在深夜修灯", a, "src-b")
+        step = self.orch._step_persona(
+            self.stack.ctx, self.stack.request(), {"evidence_ids": [ev1, ev2]})
+        self.assertFalse(is_err(step), step)
+        loaded = unwrap(self.stack.persona.get_persona(self.stack.ctx, a))
+        self.assertEqual(len(loaded.traits), 2,
+                         "多来源佐证的 TRAIT 必须真的写进 traits")
+        self.assertEqual(loaded.single_events, [])
+        for item in loaded.traits:
+            self.assertIn(str(item.stability), ("REPEATED", "PATTERN"))
 
 
 if __name__ == "__main__":

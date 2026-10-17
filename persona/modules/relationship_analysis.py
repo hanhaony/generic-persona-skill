@@ -71,6 +71,10 @@ WARNING_NO_RELATION_INPUT = "NO_RELATION_INPUT"          # 没有可用 RELATION
 WARNING_CO_OCCURRENCE_NOT_ALLIANCE = "CO_OCCURRENCE_NOT_ALLIANCE"
 WARNING_SINGLE_NOT_PATTERN = "SINGLE_BEHAVIOR_NOT_PATTERN"
 WARNING_POSSIBLE_CONTRADICTION = "POSSIBLE_CONTRADICTION"
+# G9：覆盖 <2 名参与者的证据不再静默跳过，按数量报出来。
+# 与 `orchestrator.business` 里同名常量**同值**——模块层不得 import 编排层（F-1），
+# 所以各自定义，值保持一致即可让运维按码统一筛。
+WARNING_SUBJECT_INSUFFICIENT = "RELATION_EVIDENCE_SUBJECT_INSUFFICIENT"
 
 
 # --------------------------------------------------------------------------
@@ -371,11 +375,26 @@ class RuleRelationshipAnalyzer:
 
         # —— 收集覆盖 ≥2 名参与者的 RELATION 证据 ——
         covered_items: list[tuple[list[str], Any]] = []
+        insufficient_ids: list[str] = []
         for ev in request.relation_evidence:
             covered = _covered(participants,
                                getattr(ev, "subject_entity_ids", []) or [])
             if len(covered) >= 2:
                 covered_items.append((covered, ev))
+            else:
+                # G9：修复前这里是无声跳过，调用方只知道"没产出条目"，
+                # 无从判断是材料里没有双人句、还是分析规则没命中。
+                insufficient_ids.append(str(getattr(ev, "id", "") or ""))
+
+        if insufficient_ids:
+            warnings.append(WarningNote(
+                code=WARNING_SUBJECT_INSUFFICIENT,
+                message=f"{len(insufficient_ids)} 条 RELATION 证据未覆盖 ≥2 名本次"
+                        f"参与者（{', '.join(i for i in insufficient_ids[:3] if i)}"
+                        + (f" 等 {len(insufficient_ids)} 条"
+                           if len(insufficient_ids) > 3 else "")
+                        + "），未参与研判——这些证据支撑不了'共同经历'，"
+                          "但数量本身说明材料里确实有 RELATION 维度内容"))
 
         perspectives: dict[str, RelationshipAnalysisPerspective] = {
             p: RelationshipAnalysisPerspective(entity_id=p) for p in participants}
@@ -392,7 +411,13 @@ class RuleRelationshipAnalyzer:
         for covered, ev in covered_items:
             ev_id = str(getattr(ev, "id", "") or "")
             claim = str(getattr(ev, "claim", "") or "")
-            stability = _norm_stability(getattr(ev, "stability", Stability.UNKNOWN))
+            # G6：优先读稳定性**判定**结果（`effective_stability` = 判定优先，
+            # 没有判定时退回登记值）。不这么做的话，判定落库了却没人读，
+            # `interaction_patterns` 的模式闸门（只放 REPEATED/PATTERN）
+            # 会因为 `stability` 恒为 UNKNOWN 而永远打不开。
+            stability = _norm_stability(
+                getattr(ev, "effective_stability", None)
+                or getattr(ev, "stability", Stability.UNKNOWN))
             stated_at = getattr(ev, "stated_at", None)
             for cid in (getattr(ev, "conflict_ids", []) or []):
                 if cid not in conflict_ids:

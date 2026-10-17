@@ -311,6 +311,23 @@ class EvidenceView:
     applicable_variant_ids: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
     created_at: str = ""
+    #: G6：稳定性判定的**附加字段**。与 `stability` 分开存，是因为
+    #: `stability` 是**登记时**由抽取侧声明的值（模型无权宣布自己的说法稳定，
+    #: 一律 `UNKNOWN`），而这里是框架用确定性规则**事后判定**的结果。
+    #: 两者语义不同，覆盖写会抹掉"当时登记了什么"这一事实。
+    stability_verdict: dict | None = None
+
+    @property
+    def effective_stability(self) -> str:
+        """消费方该用的稳定性：**有判定就用判定，没有才退回登记值**。
+
+        返回字符串（与 `stability` 同类型），便于 `_stability_of()` 直接吃。
+        """
+        if isinstance(self.stability_verdict, dict):
+            judged = self.stability_verdict.get("stability")
+            if judged:
+                return str(judged)
+        return self.stability
 
 
 @dataclass
@@ -1074,6 +1091,54 @@ class EvidenceService:
                                    distinct_sources=distinct_sources,
                                    time_span=time_span, reason=reason))
 
+    def record_stability_verdict(
+        self, ctx: CallContext, evidence_ids: list[str], verdict: StabilityVerdict
+    ) -> Result[int]:
+        """把稳定性判定作为**附加字段**落库（G6）。
+
+        只写 `stability_verdict`，**不动 `stability` 列**——后者是登记时抽取侧
+        声明的值（按 PF-V2 / D-012，模型无权宣布自己的说法稳定，一律 `UNKNOWN`），
+        覆盖它等于抹掉"当时登记了什么"这一事实，也就毁掉了可追溯性。
+
+        因此一条证据上会同时存在两个值：
+          - `stability = UNKNOWN`         ← 登记时的声明（历史事实）
+          - `stability_verdict.SINGLE`    ← 框架事后用确定性规则判的结论（可审计）
+
+        消费方应读 `EvidenceView.effective_stability`（判定优先）。
+
+        `judge_stability` 本身仍是**只读**的（D-109），写库是这一步的职责。
+        """
+        ids = _str_list(evidence_ids)
+        if not ids:
+            return Err(new_error(ErrorCode.VALIDATION_EMPTY_EVIDENCE,
+                                 "稳定性判定结果没有可写的证据",
+                                 trace_ref=ctx.trace_ref))
+        payload = {
+            "stability": str(verdict.stability),
+            "occurrences": int(verdict.occurrences),
+            "distinct_sources": int(verdict.distinct_sources),
+            "time_span": (list(verdict.time_span) if verdict.time_span else None),
+            "reason": str(verdict.reason),
+            "evaluated_at": to_iso(utc_now()),
+        }
+        written = 0
+        for evidence_id in ids:
+            row = self._get_row(ctx, "EvidenceItem", evidence_id)
+            if is_err(row):
+                return row
+            if row.value is None:
+                return Err(new_error(ErrorCode.VALIDATION_DANGLING_REFERENCE,
+                                     f"证据不存在，无法写入稳定性判定：{evidence_id}",
+                                     trace_ref=ctx.trace_ref))
+            updated = self.storage.update(ctx, "EvidenceItem", evidence_id,
+                                          {"stability_verdict": dict(payload)})
+            if is_err(updated):
+                return updated
+            written += 1
+        self._audit(ctx, "evidence.record_stability_verdict",
+                    f"{written} 条 / {payload['stability']}")
+        return Ok(written)
+
     # ------------------------------------------------------------ 去重
 
     def detect_duplicates(self, ctx: CallContext,
@@ -1587,4 +1652,7 @@ class EvidenceService:
             applicable_variant_ids=_str_list(row.get("applicable_variant_ids")),
             tags=_str_list(row.get("tags")),
             created_at=str(row.get("created_at", "")),
+            stability_verdict=(row.get("stability_verdict")
+                               if isinstance(row.get("stability_verdict"), dict)
+                               else None),
         )

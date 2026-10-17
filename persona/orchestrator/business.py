@@ -157,6 +157,22 @@ WARNING_MATERIAL_UNBOUND = "MATERIAL_SOURCE_UNBOUND"       # 抓取正文找不�
 WARNING_MATERIAL_SUPERSEDED = "MATERIAL_SUPERSEDED"        # 同来源的检索摘要被抓取正文取代
 WARNING_MATERIAL_NOT_USABLE = "NO_MATERIAL_FROM_EXTRACTS"  # 有抓取正文但没有一份可用，退回摘要
 
+# G9：RELATION 证据未被档案消费时的**分类**告警
+# 修复前这些证据被 `continue` 静默丢弃，运维只能看到一句笼统的
+# NO_RELATION_EVIDENCE（"关系档案是空的"），无法区分"材料里没有双人句"、
+# "分析器没产出"、还是"其他"。三类分开记，且各带**数量 + 样例 ID**。
+WARNING_RELATION_SUBJECT_INSUFFICIENT = "RELATION_EVIDENCE_SUBJECT_INSUFFICIENT"  # 主体不足：覆盖 <2 名参与者
+WARNING_RELATION_ANALYSIS_FAILED = "RELATION_ANALYSIS_FAILED"                    # 分析失败：分析器没产出条目
+WARNING_RELATION_EVIDENCE_UNUSED_OTHER = "RELATION_EVIDENCE_UNUSED_OTHER"        # 其他未消费情形
+# 单人物：阶段按语义跳过，但本次**确实登记了** RELATION 证据 ⇒ 它们不会被任何
+# 档案消费（人物档案没有 RELATION 维度，关系档案没建立）。必须显式说出来，
+# 否则这条证据就等于凭空消失。
+WARNING_RELATION_STAGE_SKIPPED_WITH_EVIDENCE = "RELATION_STAGE_SKIPPED_WITH_EVIDENCE"
+
+# G6：稳定性判定（`judge_stability`）的接线结果
+WARNING_STABILITY_UNASSESSED = "STABILITY_UNASSESSED"          # 有 TRAIT 证据，但没拿到判定
+WARNING_STABILITY_JUDGED = "STABILITY_JUDGED"                  # 判定完成（含降级/单次结论）
+
 # 冲突记录在检查点里的键（阶段间传递 ID 仍走已落盘的检查点，D-210）
 ARTIFACT_CONFLICT_IDS = "conflict_ids"
 
@@ -314,6 +330,21 @@ def _first_ref(item: Any) -> str:
     """取研判条目的首个证据引用，作为确定性 `item_id` 种子（保证重跑幂等）。"""
     refs = _str_list(getattr(item, "evidence_refs", None))
     return refs[0] if refs else "x"
+
+
+def _id_sample(ids: list[str], limit: int = 3) -> str:
+    """告警里展示少量 ID 样例（不把几百个 ID 塞进一条消息）。"""
+    shown = ", ".join(ids[:limit])
+    return shown + (f" 等 {len(ids)} 条" if len(ids) > limit else "")
+
+
+def _fold_whitespace(text: Any) -> str:
+    """只折空白（D-104 的归一化口径）。**不做任何语义处理**。
+
+    刻意与 `evidence.detect_duplicates` 的归一化保持一致：稳定性判定按"同一说法"
+    分组，如果这里做了别的事（小写化、去标点），就会和去重器的分组口径分叉。
+    """
+    return " ".join(str(text or "").split())
 
 
 def _dimension_of(value: Any) -> EvidenceDimension:
@@ -994,11 +1025,21 @@ class BusinessOrchestrator:
 
         profile_ids: list[str] = []
         warnings: list[WarningNote] = []
+        # G6：判定必须在**全部证据上一次性完成**，不能放进 per-target 循环——
+        # 一条双主体证据会同时出现在两个目标的 `items` 里，逐目标判定会对它
+        # 判两次（后一次可能只有它自己 ⇒ 判成 SINGLE 并覆盖前一次的 REPEATED），
+        # 既多写一遍库，结果也不稳定。
+        _unique: dict[str, Any] = {}
+        for _items in by_entity.values():
+            for _item in _items:
+                _unique[str(_item.id)] = _item
+        stabilities = self._assess_stabilities(
+            ctx, list(_unique.values()), warnings)
         for target in request.targets:
             entity_id = _text(target.entity_id)
             items = by_entity.get(entity_id, [])
             draft = self._build_persona_draft(
-                entity_id, items, types.get(entity_id, ""))
+                entity_id, items, types.get(entity_id, ""), stabilities)
             if not items:
                 warnings.append(WarningNote(
                     code=WARNING_NO_EVIDENCE_FOR_ENTITY,
@@ -1041,14 +1082,121 @@ class BusinessOrchestrator:
                 by_entity.setdefault(subject, []).append(item)
         return by_entity
 
+    def _relation_evidence_of(
+        self, ctx: CallContext, request: BusinessRequest, evidence_ids: list[str]
+    ) -> list[Any] | Err:
+        """本次登记的、`dimension=RELATION` 的证据（按 ID 去重，保持首次出现顺序）。
+
+        G9：抽出来是因为**两条路径都要它** —— 主路径要喂给分析器/兜底，
+        单人物路径要在阶段跳过之前数一遍"有多少证据会被悬空"。
+        """
+        loaded = self._load_evidence(ctx, request, evidence_ids)
+        if isinstance(loaded, Err):
+            return loaded
+        seen: dict[str, Any] = {}
+        for target in request.targets:
+            for item in loaded.get(_text(target.entity_id), []):
+                key = str(item.id)
+                if key in seen:
+                    continue
+                if _dimension_of(item.dimension) != EvidenceDimension.RELATION:
+                    continue
+                seen[key] = item
+        return list(seen.values())
+
+    # ============================================================ G6 稳定性判定
+
+    @staticmethod
+    def _stability_groups(items: list[Any]) -> dict[tuple, list[Any]]:
+        """按「归一化说法 + 主体集合」把证据归组（G6-D3）。
+
+        **不含 `dimension`**：同一句话被抽成两个维度（如同时是 HABIT 与 TRAIT）
+        仍是**同一个说法的同一次出现**，按维度切开会人为压低 `occurrences`。
+
+        归一化只折空白（与 `evidence._normalize_claim`、D-104 同口径）：
+        这是"确定性可判定"的上限，语义级聚类需要模型，本实现不含。
+        """
+        groups: dict[tuple, list[Any]] = {}
+        for item in items:
+            key = (_fold_whitespace(_text(item.claim)),
+                   frozenset(_str_list(item.subject_entity_ids)))
+            groups.setdefault(key, []).append(item)
+        return groups
+
+    def _assess_stabilities(
+        self, ctx: CallContext, items: list[Any], warnings: list[WarningNote]
+    ) -> dict[str, Stability]:
+        """判定每条证据的稳定性并**落库为附加字段**（G6-D1）。
+
+        G6-D2：组内**按 `source_id` 去重**，每个来源只留一条代表。
+        原因是幂等键用**精确** claim、分组键用**归一化** claim，两者的差集
+        就是"仅空白差异的近似重复"——同一来源里这类变体会各占一个证据 ID。
+        若原样喂给 `judge_stability`，`occurrences=2 / distinct_sources=1`
+        会被判成 `REPEATED` 并进 `traits`，等于**一条材料自己给自己作证两次**，
+        绕过 AC-7。按来源去重后 `occurrences` 恒等于 `distinct_sources`。
+
+        失败不致命：判定拿不到就退回 `UNKNOWN`（继续按 AC-7 不进 `traits`），
+        但必须留告警（G6-D4：记录为"未判定"）。
+
+        **只判定没有明确声明的证据**（`stability == UNKNOWN`）。真实链路里抽取器
+        永远给 `UNKNOWN`（PF-V2 不允许模型自评），所以生产路径都会判；而测试夹具、
+        显式种子、将来的人工标注若已经写了 `REPEATED` / `PATTERN`，那是**更强的
+        信息**，机械规则不该把它盖掉（与 G7「不降级覆盖」同一精神）。
+        计数时**仍把已声明的成员算作一次出现**——它确实是一个独立来源的佐证，
+        只是不需要再判一次。
+        """
+        judged: dict[str, Stability] = {}
+        if not items:
+            return judged
+        unassessed: list[str] = []
+        for (claim_key, _subjects), members in self._stability_groups(items).items():
+            pending = [i for i in members
+                       if _stability_of(getattr(i, "stability", None)) == Stability.UNKNOWN]
+            if not pending:
+                continue          # 全都已明确声明，无需判定也不需要写库
+            by_source: dict[str, Any] = {}
+            for item in members:      # ← 用**全部**成员计数，不只 pending
+                sid = _text(getattr(item, "source_id", "")) or f"__no_source__:{item.id}"
+                by_source.setdefault(sid, item)
+            representatives = list(by_source.values())
+            subject_id = next(iter(_str_list(members[0].subject_entity_ids)), "")
+            verdict = self.deps.evidence.judge_stability(
+                ctx, subject_id, claim_key, [str(i.id) for i in representatives])
+            if isinstance(verdict, Err):
+                unassessed.extend(str(i.id) for i in pending)
+                continue
+            # 只把结论写给**未声明**的那些；已声明的行保持原样（不覆盖）
+            recorded = self.deps.evidence.record_stability_verdict(
+                ctx, [str(i.id) for i in pending], verdict.value)
+            if isinstance(recorded, Err):
+                unassessed.extend(str(i.id) for i in pending)
+                continue
+            for item in pending:
+                judged[str(item.id)] = verdict.value.stability
+        if unassessed:
+            warnings.append(WarningNote(
+                code=WARNING_STABILITY_UNASSESSED,
+                message=f"{len(unassessed)} 条证据未取得稳定性判定"
+                        f"（{_id_sample(unassessed)}），按 `UNKNOWN` 处理——"
+                        "这些证据**不会**进入 `traits`（AC-7 保守口径）"))
+        return judged
+
     @staticmethod
     def _build_persona_draft(
-        entity_id: str, items: list[Any], entity_type: str
+        entity_id: str, items: list[Any], entity_type: str,
+        stabilities: dict[str, Stability] | None = None,
     ) -> PersonaProfileDraft:
         """证据 → 档案条目（**按维度搬运，不做语义理解**）。
 
         AC-7：`stability` 为 `SINGLE` / `UNKNOWN` 的 TRAIT 证据进 `single_events`，
         **绝不**进 `traits`（PF-V2 / D-012：单次行为不得固化成稳定性格）。
+
+        `stabilities`（G6）是 `{证据 ID: 判定结果}`，来自 `judge_stability`；
+        为 `None` 时**逐字**退回旧行为（读证据自身登记的 `stability`）——
+        脚本与既有测试直接调本方法，不能因为加参数就改变它们的结果。
+
+        取值优先级：**判定结果 > 证据自带的 `effective_stability`**。
+        后者见 `EvidenceView.effective_stability`（附加字段优先，其次是登记值）。
 
         PF-V5 / D-115：虚构角色必须声明适用版本且**必须包含自身**；
         真人没有改编版本，`applicable_variant_ids` 与 `canon_boundary` 必须为空。
@@ -1068,7 +1216,11 @@ class BusinessOrchestrator:
         for item in items:
             evidence_id = str(item.id)
             claim = _text(item.claim)
-            stability = _stability_of(item.stability)
+            if stabilities is not None and evidence_id in stabilities:
+                stability = stabilities[evidence_id]
+            else:
+                stability = _stability_of(
+                    getattr(item, "effective_stability", None) or item.stability)
             refs = [evidence_id]
             variants.extend(_str_list(item.applicable_variant_ids))
             dimension = _dimension_of(item.dimension)
@@ -1192,27 +1344,39 @@ class BusinessOrchestrator:
         两条路径共用 RL-V3 / RL-V6 等校验，都不伪造证据。
         """
         participants = [_text(t.entity_id) for t in request.targets if _text(t.entity_id)]
+        evidence_ids = list(prior.get("evidence_ids", []))
+        warnings: list[WarningNote] = []
+
         if len(participants) < 2:
+            # G9：单人物时阶段按语义跳过 —— 但**本次可能确实登记了 RELATION 证据**。
+            # 这些证据既不进人物档案（`_build_persona_draft` 没有 RELATION 分支），
+            # 也进不了关系档案（没建立），因此**不会被任何档案消费**。
+            # 修复前这条路悄无声息，运维只能看到"阶段 SKIPPED"，
+            # 完全不知道那几条证据去哪了。这里必须显式说出来。
+            suspended = self._relation_evidence_of(ctx, request, evidence_ids)
+            if isinstance(suspended, Err):
+                warnings.append(WarningNote(
+                    code=WARNING_RELATION_EVIDENCE_UNUSED_OTHER,
+                    message="参与者不足 2 人，关系阶段跳过；但统计本次 RELATION 证据"
+                            f"失败（{error_of(suspended).code}），无法确认是否存在"
+                            "被悬空的证据——请检查证据读取"))
+            elif suspended:
+                warnings.append(WarningNote(
+                    code=WARNING_RELATION_STAGE_SKIPPED_WITH_EVIDENCE,
+                    message=f"参与者只有 {len(participants)} 人，关系阶段按语义跳过；"
+                            f"但本次登记了 {len(suspended)} 条 RELATION 证据"
+                            f"（{_id_sample([str(i.id) for i in suspended])}），"
+                            "它们不会被任何档案消费（人物档案没有 RELATION 维度，"
+                            "关系档案未建立）——要消费请提供 ≥2 名参与者"))
             return BusinessStepResult(
                 name=STAGE_RELATIONSHIP, status=STEP_SKIPPED,
+                warnings=warnings,
                 message=f"参与者不足 2 人（{len(participants)}），无法建立关系档案。")
 
-        evidence_ids = list(prior.get("evidence_ids", []))
-        loaded = self._load_evidence(ctx, request, evidence_ids)
-        if isinstance(loaded, Err):
-            return loaded
-        by_entity = loaded
-
-        seen: dict[str, Any] = {}
-        relation_items: list[Any] = []
-        for entity_id in participants:
-            for item in by_entity.get(entity_id, []):
-                if str(item.id) in seen:
-                    continue
-                if _dimension_of(item.dimension) != EvidenceDimension.RELATION:
-                    continue
-                seen[str(item.id)] = item
-                relation_items.append(item)
+        loaded_relation = self._relation_evidence_of(ctx, request, evidence_ids)
+        if isinstance(loaded_relation, Err):
+            return loaded_relation
+        relation_items: list[Any] = loaded_relation
 
         cardinality = Cardinality.GROUP if len(participants) >= 3 else Cardinality.PAIR
         types = self._entity_types(ctx, participants)
@@ -1221,8 +1385,6 @@ class BusinessOrchestrator:
         # PF-V5 / D-115：覆盖全部虚构参与者，且不得含真人
         variants = sorted({p for p in participants
                            if types.get(p) != EntityType.REAL_PERSON})
-
-        warnings: list[WarningNote] = []
 
         if self.deps.relationship_analyzer is not None and relation_items:
             # —— G-4 路径：注入的语义分析器做研判 ——
@@ -1233,8 +1395,18 @@ class BusinessOrchestrator:
                     cardinality=cardinality))
             if isinstance(outcome, Err):
                 return outcome
+            # G5 同型：分析器自己的告警（含它内部"主体不足"的分类计数）必须透传，
+            # 否则"为什么关系档案是空的"在任务视图里又变成一句笼统话。
+            warnings.extend(getattr(outcome.value, "warnings", []) or [])
             draft = self._draft_from_analysis(
                 outcome.value, participants, cardinality, variants)
+            # 分析失败：证据交进去了，分析器却一个条目都没产出
+            if relation_items and not RelationshipService._has_any_content(draft):
+                warnings.append(WarningNote(
+                    code=WARNING_RELATION_ANALYSIS_FAILED,
+                    message=f"{len(relation_items)} 条 RELATION 证据已交给分析器，"
+                            "但未产出任何条目（分析失败）——关系档案仅记 "
+                            "open_questions，不补全、不臆造"))
         else:
             # —— 兜底路径（未注入分析器）：不做语义判断 ——
             draft = self._relationship_draft_fallback(
@@ -1249,6 +1421,15 @@ class BusinessOrchestrator:
             warnings.append(WarningNote(
                 code=WARNING_PROFILE_ALREADY_CURRENT,
                 message="关系档案已是最新，未生成新版本（不重复更新）"))
+        if already and relation_items:
+            # G9 的"其他"落点：本次证据一条都没写进新版本（复用既有版本）。
+            # 可能是内容本来就一致（无害重跑），也可能是空产出被降级拦下（G7）。
+            # 两种情况都该让运维看见"这 N 条证据本次没有产生任何写入"。
+            warnings.append(WarningNote(
+                code=WARNING_RELATION_EVIDENCE_UNUSED_OTHER,
+                message=f"本次 {len(relation_items)} 条 RELATION 证据未写入新版本"
+                        "（关系档案复用了既有版本）——若这非预期，检查是否"
+                        "重复运行或写入被拦下"))
         return BusinessStepResult(
             name=STAGE_RELATIONSHIP, status=STEP_EXECUTED,
             artifact_ids={"relationship_profile_ids": [profile_id]},
@@ -1268,17 +1449,29 @@ class BusinessOrchestrator:
         群体互动仅记 note，不做任何语义断言（与 G-4 之前的行为一致）。"""
         shared: list[SharedExperienceItem] = []
         group: GroupDynamics | None = None
+        # G9：主体不足的证据不再"凭空消失"，按 ID 收集后统一报数
+        insufficient: list[str] = []
 
         for item in relation_items:
             covered = [p for p in participants
                        if p in set(_str_list(item.subject_entity_ids))]
             if len(covered) < 2:
+                insufficient.append(str(item.id))
                 continue
             shared.append(SharedExperienceItem(
                 item_id=f"pi_{item.id}", text=_text(item.claim),
                 confidence=0.0, evidence_refs=[str(item.id)],
-                stability=_stability_of(item.stability),
+                stability=_stability_of(
+                    getattr(item, "effective_stability", None) or item.stability),
                 participant_entity_ids=covered))
+
+        if insufficient:
+            warnings.append(WarningNote(
+                code=WARNING_RELATION_SUBJECT_INSUFFICIENT,
+                message=f"{len(insufficient)} 条 RELATION 证据未覆盖 ≥2 名本次参与者"
+                        f"（{_id_sample(insufficient)}），未进关系档案——"
+                        "常见原因：材料只描述了单人的事，或只提到本次之外的第三人。"
+                        "这不是丢数据，是这些证据不能支撑'共同经历'"))
 
         if cardinality == Cardinality.GROUP:
             # RL-V3 强制：≥3 人必须有 group_dynamics。
@@ -1289,7 +1482,10 @@ class BusinessOrchestrator:
                      "编排器未注入关系分析器，不做语义判断，群体级证据已记入 "
                      "shared_experiences（G-4 缺口待注入分析器后闭合）。")
 
-        if not shared:
+        if not relation_items:
+            # 只有"本次一条 RELATION 证据都没有"才配这句话。
+            # 修复前它也在"有证据但全被筛掉"时出现，把
+            # "材料里没有双人句" 误报成 "没有 RELATION 证据"，运维无从判断。
             warnings.append(WarningNote(
                 code=WARNING_NO_RELATION_EVIDENCE,
                 message="没有可用的 RELATION 维度证据，关系档案各维度留空并记 open_questions"))

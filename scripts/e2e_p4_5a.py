@@ -674,11 +674,16 @@ class Stack:
         """登记**多个**目标并返回它们（`self.target` 停在最后一个）。
 
         双人物诊断用它——单目标 `ensure_entity` 会把 `self.target` 覆盖掉。
+
+        注意：`ensure_entity` **内部已经**把目标 append 进 `self.targets`，
+        这里必须复用它返回的那个对象，不能另造一个（否则 `self.targets`
+        会出现重复条目，后续按 targets 构造请求时人名会重复）。
         """
         targets: list[PersonQueryTarget] = []
         for name in names:
-            targets.append(PersonQueryTarget(
-                entity_id=self.ensure_entity(name), display_name=name))
+            self.ensure_entity(name)
+            if self.target is not None:
+                targets.append(self.target)
         return targets
 
     # -------------------------------------------------------------- 抽取器
