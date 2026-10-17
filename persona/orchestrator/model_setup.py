@@ -38,10 +38,12 @@ from typing import Any, Sequence
 from ..config import (
     DEFAULT_MODEL_ID,
     ENV_PROVIDER_API_KEY,
+    ENV_SEARCH_API_KEY,
     NETWORK_MODEL_PROVIDER_NAMES,
     AppSettings,
     ModelSettings,
 )
+from ..config.spec import NETWORK_PROVIDER_NAMES
 from ..core.errors import ErrorCode, new_error
 from ..core.result import Err, Ok, Result
 from ..core.types import CURRENCY_UNKNOWN, SourceMaterial
@@ -55,6 +57,7 @@ from ..modules.extraction import ProviderClaimExtractor, admit_materials
 from ..modules.research import PersonQueryTarget
 from ..providers.base import ChatRequest, Provider, ProviderConfig
 from ..providers.deepseek import DEFAULT_BASE_URL, DeepSeekProvider
+from ..providers.tavily import TavilyProvider
 
 # --------------------------------------------------------------------------
 # 常量
@@ -248,6 +251,54 @@ def chat_provider_from_settings(
         base_url=base_url or DEFAULT_BASE_URL,
         model_id=model.model_id or DEFAULT_MODEL_ID,
     ))
+
+
+# --------------------------------------------------------------------------
+# 3.5 真实检索 Provider 的装配（P4.8 / R3）
+#
+# 与聊天同一套纪律：**只构造、不发请求、不回显密钥**。三条边界：
+#
+# 1. **`max_retries` 强制 0**：检索是**按次计费**的，重试等于再付一次钱；
+#    与模型同口径（D-0xx），"忘了改配置"不该变成"重复付费"。
+# 2. **不构造必然失败的对象**：没配服务商 / 没配密钥 → `Err`，直接说清缺什么。
+# 3. **不改记账口径**：检索以 **credit** 计量（`CURRENCY_CREDIT`），
+#    本模块**不做** credits→货币换算（账本层同一条规矩：混用币种会让累计闸门失真）。
+# --------------------------------------------------------------------------
+
+
+def search_provider_config(settings: AppSettings) -> ProviderConfig:
+    """检索的 `ProviderConfig`：沿用超时/退避，但 `max_retries` 强制 0。
+
+    为什么不直接 `settings.retry.to_provider_config()`：那份默认 `max_retries=3`。
+    对**按次计费**的检索，一次失败自动再发三次 = 多买三次；失败的那次到底
+    计不计费由服务商决定，我们不能假设"重试免费"。
+    """
+    return replace(settings.retry.to_provider_config(), max_retries=0)
+
+
+def search_provider_from_settings(settings: AppSettings) -> Result[Provider]:
+    """按配置装配一个真实检索 Provider（**只装配，不发请求、不花钱**）。
+
+    返回 `Err` 的两种情形（都**不构造**对象）：
+      - `provider_name` 为空或不是已登记的联网检索服务商（默认 `fake` 也算）；
+      - 未设置检索密钥（`PERSONA_SEARCH_API_KEY` / 别名 `TAVILY_API_KEY`）。
+
+    ⚠️ 密钥只判断"有没有设置"，绝不打印、绝不出现在返回值或异常信息里（D-078）。
+    """
+    name = str(settings.provider_name or "").strip()
+    if not name or name not in NETWORK_PROVIDER_NAMES:
+        return Err(new_error(
+            ErrorCode.VALIDATION_REQUIRED_FIELD,
+            f"未启用真实检索 Provider（provider_name={name!r}）；"
+            f"已登记的联网检索服务商：{list(NETWORK_PROVIDER_NAMES)}"
+            "（安全默认：什么都不配就走离线 FakeProvider，不联网、不花钱）"))
+    key = str(settings.secrets.search_api_key or "")
+    if not key:
+        return Err(new_error(
+            ErrorCode.VALIDATION_REQUIRED_FIELD,
+            f"未设置检索密钥（{ENV_SEARCH_API_KEY}）：拒绝构造 {name} Provider"
+            "——没有密钥只能得到 401，不构造比构造一个必然失败的对象更清楚"))
+    return Ok(TavilyProvider(api_key=key, config=search_provider_config(settings)))
 
 
 # --------------------------------------------------------------------------

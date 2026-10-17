@@ -42,6 +42,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -344,6 +345,49 @@ def _id_sample(ids: list[str], limit: int = 3) -> str:
     """告警里展示少量 ID 样例（不把几百个 ID 塞进一条消息）。"""
     shown = ", ".join(ids[:limit])
     return shown + (f" 等 {len(ids)} 条" if len(ids) > limit else "")
+
+
+_STABILITY_STRENGTH = {
+    Stability.UNKNOWN: 0,
+    Stability.SINGLE: 1,
+    Stability.REPEATED: 2,
+    Stability.PATTERN: 3,
+}
+
+
+def _strongest_stability(values: list[Stability]) -> Stability:
+    """合并条目时取**最强**判定（PATTERN > REPEATED > SINGLE > UNKNOWN）。
+
+    为什么取最强而不是"取第一条"：同一说法来自两个来源时，`judge_stability`
+    会把同一个结论写给**每一条**成员（`record_stability_verdict`），正常情况下
+    它们相等；不相等只可能来自夹具/人工**已声明**的成员——那种声明是更强的信息
+    （G6-D4 同精神），不该被同组里未判定的成员拉低。
+    """
+    best = Stability.UNKNOWN
+    for value in values:
+        if _STABILITY_STRENGTH.get(value, 0) > _STABILITY_STRENGTH.get(best, 0):
+            best = value
+    return best
+
+
+def _profile_item_id(dimension: EvidenceDimension, claim_key: str,
+                     subjects: tuple[str, ...]) -> str:
+    """档案条目 ID = `pi_<维度 + 归一化说法 + 主体集合的摘要>`（G12 / D-250，登记 D-247）。
+
+    为什么不再用 `pi_<evidence_id>`：那等于"一条证据 = 一个条目"，跨源同句
+    必然产出两条**同文本**条目，档案读起来是重复的。身份改成"说法 + 主体"后，
+    同一说法的多条证据合并成一条，`evidence_refs` 变长——"这条特征有几个来源
+    支持"从不可见变成可读，也正是 AC-7 想要的方向。
+
+    用摘要而不是原文拼 ID：说法是中文长句，直接拼会让 ID 极长；
+    `sha256` 前 16 位足够区分，且**跨进程稳定**（不用内置 `hash()`，
+    那个随 `PYTHONHASHSEED` 变化，会破坏"重跑同一份材料得到同一份档案"）。
+
+    `dimension` 进摘要：同一句话若被抽成 TRAIT 与 HABIT 两个维度，
+    它们会落在两个不同板块里，ID 必须不同（否则 diff 口径会打架）。
+    """
+    payload = "\x00".join((dimension.value, claim_key, ",".join(subjects)))
+    return "pi_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def _fold_whitespace(text: Any) -> str:
@@ -1247,18 +1291,30 @@ class BusinessOrchestrator:
 
         PF-V5 / D-115：虚构角色必须声明适用版本且**必须包含自身**；
         真人没有改编版本，`applicable_variant_ids` 与 `canon_boundary` 必须为空。
+
+        G12 / D-250（本次修正，登记于 D-247）：条目身份 = **维度 + 归一化说法 + 主体集合**。
+        同一说法的多条证据合并成**一个**条目、`evidence_refs` 收全部；
+        此前按证据生成会让跨源同句产出两条同文本条目。合并只认
+        "归一化（折空白）完全相同"的说法——措辞不同的同义句仍各自成条，
+        那是语义聚类（P1b），不在本方法的能力范围内。
+        **旧档案不做 id 迁移**：档案是版本化的，新口径只影响新生成的版本。
         """
         background: list[str] = []
         background_refs: list[str] = []
-        traits: list[ProfileItem] = []
-        single_events: list[ProfileItem] = []
-        habits: list[ProfileItem] = []
         expression: list[str] = []
         expression_refs: list[str] = []
-        experiences: list[TimelineItem] = []
         canon_refs: list[str] = []
         non_canon_refs: list[str] = []
         variants: list[str] = []
+
+        # G12 / D-250：条目身份 = **维度 + 归一化说法 + 主体集合**，不再按证据。
+        # 此前 `item_id = pi_<evidence_id>` 意味着"一条证据 = 一个条目"，
+        # 跨源同句（同一说法来自两个来源）必然产出两条**同文本**条目。
+        # 现在先归组、再出条目：同一说法的多条证据合并为一条，
+        # `evidence_refs` 变长——"几个来源支持"成为可读事实（AC-7 的方向）。
+        groups: dict[tuple, dict[str, Any]] = {}
+        seen_background: set[str] = set()
+        seen_expression: set[str] = set()
 
         for item in items:
             evidence_id = str(item.id)
@@ -1268,18 +1324,51 @@ class BusinessOrchestrator:
             else:
                 stability = _stability_of(
                     getattr(item, "effective_stability", None) or item.stability)
-            refs = [evidence_id]
             variants.extend(_str_list(item.applicable_variant_ids))
             dimension = _dimension_of(item.dimension)
 
-            # item_id 由证据 ID 推导——**可复现**：重跑时条目身份不变，
-            # `PersonaService` 才能判定"内容与最新版一致"而不生成空转版本。
-            item_id = f"pi_{evidence_id}"
             if dimension == EvidenceDimension.BACKGROUND:
-                background.append(claim)
+                # 文本板块没有 item_id：重复文本只留一次，但**证据引用一条不丢**
+                key = _fold_whitespace(claim)
+                if key not in seen_background:
+                    seen_background.add(key)
+                    background.append(claim)
                 background_refs.append(evidence_id)
-            elif dimension == EvidenceDimension.TRAIT:
-                entry = ProfileItem(item_id=item_id, text=claim,
+                continue
+            if dimension == EvidenceDimension.SPEECH_STYLE:
+                key = _fold_whitespace(claim)
+                if key not in seen_expression:
+                    seen_expression.add(key)
+                    expression.append(claim)
+                expression_refs.append(evidence_id)
+                continue
+            if dimension == EvidenceDimension.CANON_FACT:
+                if item.canon_level == CanonLevel.CANON and item.source_id:
+                    canon_refs.append(str(item.source_id))
+                elif item.source_id:
+                    non_canon_refs.append(str(item.source_id))
+                continue
+
+            subjects = tuple(sorted(_str_list(item.subject_entity_ids)))
+            bucket = groups.get((dimension, _fold_whitespace(claim), subjects))
+            if bucket is None:
+                bucket = {"text": claim, "refs": [], "stabilities": []}
+                groups[(dimension, _fold_whitespace(claim), subjects)] = bucket
+            bucket["refs"].append(evidence_id)
+            bucket["stabilities"].append(stability)
+
+        traits: list[ProfileItem] = []
+        single_events: list[ProfileItem] = []
+        habits: list[ProfileItem] = []
+        experiences: list[TimelineItem] = []
+
+        for (dimension, claim_key, subjects), bucket in groups.items():
+            item_id = _profile_item_id(dimension, claim_key, subjects)
+            refs = list(dict.fromkeys(bucket["refs"]))   # 去重且保序
+            stability = _strongest_stability(bucket["stabilities"])
+            text = bucket["text"]
+            if dimension == EvidenceDimension.TRAIT:
+                entry = ProfileItem(item_id=item_id, text=text,
                                     confidence=0.0, evidence_refs=refs,
                                     stability=stability)
                 if stability in _NON_TRAIT_STABILITIES:
@@ -1287,21 +1376,13 @@ class BusinessOrchestrator:
                 else:
                     traits.append(entry)
             elif dimension == EvidenceDimension.HABIT:
-                habits.append(ProfileItem(item_id=item_id, text=claim,
+                habits.append(ProfileItem(item_id=item_id, text=text,
                                           confidence=0.0, evidence_refs=refs,
                                           stability=stability))
-            elif dimension == EvidenceDimension.SPEECH_STYLE:
-                expression.append(claim)
-                expression_refs.append(evidence_id)
             elif dimension == EvidenceDimension.EXPERIENCE:
-                experiences.append(TimelineItem(item_id=item_id, text=claim,
+                experiences.append(TimelineItem(item_id=item_id, text=text,
                                                 confidence=0.0, evidence_refs=refs,
                                                 stability=stability))
-            elif dimension == EvidenceDimension.CANON_FACT:
-                if item.canon_level == CanonLevel.CANON and item.source_id:
-                    canon_refs.append(str(item.source_id))
-                elif item.source_id:
-                    non_canon_refs.append(str(item.source_id))
 
         fictional = entity_type != EntityType.REAL_PERSON
         canon = None

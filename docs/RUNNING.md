@@ -1051,9 +1051,15 @@ P4.7 实施期间，我用 `persona business run --material …` 做 CLI 自检�
 
 ---
 
-## 5.16 G12：跨源同句会让 `traits` 出现**两条同文本条目**（已登记，**未修**）
+## 5.16 G12：跨源同句会让 `traits` 出现**两条同文本条目**（**已修，P4.8**）
 
 **登记日期**：2026-10-17（P4.7 S1 发现，用户拍板"单独立轮，不混进 P1a"）
+**修复日期**：2026-10-17（P4.8 / R1，方案 A，见 D-250）
+
+> **状态：已修复。** 条目身份不再是 `pi_<evidence_id>`，而是
+> `pi_<sha256(维度|归一化说法|主体集合)[:16]>`；同一说法的多条证据合并成
+> **一个**条目、`evidence_refs` 收全部。下面"事实 / 判断 / 修复方向"保留为
+> 登记当时的真实状态（不删史）。
 
 ### 事实
 
@@ -1089,6 +1095,33 @@ item_id=pi_ev_bbb  text="阿雾在黄昏时分总要先点亮灯塔再锁门"  e
 
 ---
 
+## 5.17 真实检索的装配点（P4.8 / R3，**已接线，未跑真实检索**）
+
+**登记日期**：2026-10-17
+
+三件事在这一轮补齐，都**零成本、只构造不发请求**：
+
+1. **检索出口有了装配点**：`search_provider_from_settings()`（`orchestrator/model_setup.py`）。
+   此前 `TavilyProvider` 虽然在 P4.2 就写好了（search + extract、`_urlopen` 可替换、
+   20+ 项合规测试），但**产品路径上没有任何地方构造它**——`business run` 永远只告警
+   `SEARCH_PROVIDER_OFFLINE`。"能力存在但装不起来"和"没有能力"是两件事。
+2. **同一把闸门管两类外呼**：`allow_real=False` 时既不建模型出口，也不建检索出口
+   （`REAL_PROVIDER_BLOCKED`）。否则"只授权模型"会顺手把检索打开——检索按次计费，
+   更容易花超。`max_retries` 对检索同样强制 **0**（重试 = 再买一次）。
+3. **顺手修了一个真缺口**：装配层此前把 `research_limits=None` 传下去，研究阶段
+   回落到模块默认值（5/5/3），于是 `PERSONA_RESEARCH_MAX_QUERIES` /
+   `PERSONA_RESEARCH_MAX_EXTRACTS` 在**产品路径上被静默忽略**（e2e 脚本显式传了
+   limits，所以一直没暴露）。现在默认取 `settings.research`，显式传参仍优先。
+
+**执行前的调用清单**（`plan_calls()`，用户要求"授权必须看过账再签"）：
+`business run` 在开跑前打印检索 / 抓取 / 模型各几次、金额估算与计量单位，
+并写明"清单之外不会有任何调用"。检索以 **credit** 计、模型以 **USD** 计，
+两者**不可直接相加**（账本不做汇率换算）。
+
+**仍未做**：真实检索一次都没跑过。跑之前需要单独授权（见 `PLAN_P4_8_RANGE.md` §4）。
+
+---
+
 ## 6. 变更历史
 
 | 日期 | 版本 | 变更 |
@@ -1114,3 +1147,4 @@ item_id=pi_ev_bbb  text="阿雾在黄昏时分总要先点亮灯塔再锁门"  e
 | 2026-10-17 | v0.19 | **P4.6 三项落地**：① `persona/orchestrator/assembly.py`（composition root：`build_business_stack` / `register_targets`），CLI 新增 `persona business plan|run`（业务链进 CLI，D-A）；② G11 闭合——账本 `hydrate()` + `usage_sink` 接线 + **两层上限**（单任务 `max_cost` / 项目累计 `max_cost_total`，D-B/D-C）；③ 关系分析器默认装配（D-D）且失败**降级**留告警（D-E），新增配置 `PERSONA_RELATIONSHIP_ANALYZER=rule|off`。新增 `tests/test_p4_6_assembly_ledger.py`（32 项）与分析器降级用例（2 项） | 待确认 |
 | 2026-10-17 | v0.20 | **P4.6 阶段三**：提交 `6efa1b7`；**1 次真实 POST** 跑通五阶段（16 证据 / 2 人格 / 1 关系，confirmed **0.0033216 USD**）；**C 轮 0.0032838 确认从未落库**（3 个临时库均 0 行），改以两笔人工补记入账，人工累计与库内合计首次**逐位相等（0.0078819）**；§5.15 增补"补记 + 不变量"小节；新增 `P4_6_REAL_RUN_AND_BOUNDARY.md`（真实 vs Stub 边界表）与 `PLAN_P4_7_P1A.md`（P1a 方案 + 缺口审计） | 待确认 |
 | 2026-10-17 | v0.22 | **P4.7 验收 + 整改**：① 装配层**默认禁止真实外呼**（`build_business_stack(allow_real=False)`，未授权时记 `REAL_PROVIDER_BLOCKED` 且不构造；CLI `business run --allow-real` 才授权，见 §5.15 规则登记 / D-245）；② 新增 `tests/test_p4_7_real_call_gate.py`（9 项，含"默认不碰网络"的 `urlopen` 断言替身）；③ 新增 §5.16 **G12 登记**（跨源同句 ⇒ `traits` 两条同文本条目，用户拍板单独立轮）；④ 人工累计确认 **0.0097980 USD**（含 §5.15 那次未授权调用，**不重置**） | 待确认 |
+| 2026-10-17 | v0.23 | **P4.8：R1 + R3（均零成本）**。① **G12 已修**（方案 A）：档案条目身份 = `pi_<sha256(维度\|归一化说法\|主体集合)[:16]>`，跨源同句合并成一个条目、`evidence_refs` 收全部；background/expression 重复文本只留一次（引用不丢）；旧档案不做 id 迁移。改 **3 处**断言（P1a 1 处、e2e 2 处），新增 2 项边界用例（P1a 共 8 项）。② **Tavily 接线**：`search_provider_from_settings`（`max_retries` 强制 0）＋装配层 `build_search_provider` 同受 `allow_real` 管（§5.17）。③ 顺手修 `research.*` 配置在产品路径被忽略的缺口。④ `plan_calls()`：执行前打印检索/抓取/模型调用次数与估算。新增 `tests/test_p4_8_search_wiring.py`（20 项）；全量 **1301 项**通过 | 待确认 |

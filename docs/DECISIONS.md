@@ -484,6 +484,15 @@ D-020）、`status=AMBIGUOUS/INSUFFICIENT_EVIDENCE/CONFLICTED`（D-008）、
 | D-248 | **P1a S3 并入阶段三**：S1（离线桩）+ S2（e2e 夹具）已证明规则层与编排层"跨源同句 ⇒ REPEATED ⇒ traits"成立；S3 剩下的未知是"真实模型会不会逐字复用同一句"，属模型行为而非代码，一次 POST 只能观察不能保证。故**本轮止步 S2**，S3 与真实检索接线一起做 | 用户 P4.7 拍板第 2 项 | 已决定 |
 | D-249 | **`usage list` 暂缓**：当前 `usage backfill` 只打印账本合计，没有逐笔列表；要做需先定筛选口径（按项目 / 按任务 / 按时间窗 / 按 `cost_status`），否则会先做出一个"看起来能对账、实际口径不明"的命令 | 用户 P4.7 拍板第 3 项 | **暂缓，待定口径** |
 
+### 2.28 P4.8：G12 修复 + 检索接线 + 调用清单（2026-10-17，用户拍板）
+
+| 编号 | 决定 | 依据 | 状态 |
+| --- | --- | --- | --- |
+| D-250 | **G12 修复采用方案 A**：档案条目身份从"证据"改为"**维度 + 归一化说法 + 主体集合**"的摘要（`pi_<sha256(...)[:16]>`），同一说法的多条证据合并成**一个**条目、`evidence_refs` 收全部；background / expression 的重复文本只留一次但证据引用一条不丢；**旧档案不做 id 迁移**（档案版本化，新口径只影响新版本）。诚实边界：只合并**归一化（折空白）完全相同**的说法，措辞不同的同义句仍各自成条（那是 P1b 语义聚类）。用 `sha256` 而非内置 `hash()`：后者随 `PYTHONHASHSEED` 变化，会让每次重跑都变成"删一条 + 增一条" | 用户拍板 R1 = 方案 A；`RUNNING.md` §5.16 | 已实现（P1a 8 项、e2e 85 项） |
+| D-251 | **检索出口的装配点补齐，且与模型共用同一把闸门**：新增 `search_provider_from_settings()`（`max_retries` **强制 0**——按次计费，重试等于再买一次）；装配层新增 `StackOptions.build_search_provider`，同样只有 `allow_real=True` 才构造，否则记 `REAL_PROVIDER_BLOCKED`。**不给 `--material` 才建检索出口**（材料通道不检索） | 用户拍板"allow_real 兼管检索"；Q-02 已批准 | 已实现（`test_p4_8_search_wiring.py` 20 项），**未跑真实检索** |
+| D-252 | **执行前必须打印调用清单**：`plan_calls()` 给出检索次数（来自 `plan_queries`，不是猜）、抓取上限（`max_extracts`）、模型调用（1 次批量抽取 + 多目标时才有的对话）、金额估算与**计量单位**。检索按 credit、模型按 USD，**不可直接相加**；"清单之外不会有任何调用，出现即缺陷"写成输出的一部分 | 用户拍板第 3 项 | 已实现 |
+| D-253 | **顺手修的真缺口（行为变更，需登记）**：装配层此前传 `research_limits=None`，研究阶段回落到模块默认 5/5/3，导致 `PERSONA_RESEARCH_MAX_QUERIES` / `PERSONA_RESEARCH_MAX_EXTRACTS` 在**产品路径上被静默忽略**（e2e 脚本显式传 limits，所以一直没暴露）。现在默认取 `settings.research`，显式传参仍优先；默认值与旧行为一致（5/5/3），因此不影响既有测试 | 实现 R3 时发现 | 已实现 |
+
 ---
 
 ## 3. 尚未确定的开放问题
@@ -592,3 +601,4 @@ D-020）、`status=AMBIGUOUS/INSUFFICIENT_EVIDENCE/CONFLICTED`（D-008）、
 | 2026-10-14 | v0.16 | 新增 §2.24（D-206 ~ D-220）：H-10A 业务编排型 Orchestrator 的实现口径——编号映射 Q-37 第九轮、保留既有任务 Orchestrator 并新增独立 `BusinessOrchestrator`（实现 `UnitHandler` 被既有 `TaskRunner` 驱动）、不复制第二套六态机/预算/检查点（源码级静态断言）、五阶段复用 `TaskType` 同名 stage（`TaskType` 无全流程成员 → 缺口 G-1）、阶段间数据只经检查点 `artifact_ids`、证据 claim 不由编排器生成（缺口 G-2，用 `EvidenceSeed` 绑定来源）、证据与档案写入的幂等守卫（`item_id` 由证据 ID 推导）、Persona 按维度机械搬运且 `SINGLE` 不进 traits（AC-7）、Relationship 只用 RELATION 维度证据且不为群体关系臆造语义（RL-V3/RL-V6）、`entity_type` 只读判定（PF-V5/D-115）、结果三态自述且部分成功不算全流程成功、失败即上报且后续步骤 `NOT_REACHED`、`resume` 需重传请求（缺口 G-3）；Q-37 扩展覆盖第九轮"H-10A → 仓库 H-10 业务编排器" |
 | 2026-10-14 | v0.15 | 新增 §2.23（D-191 ~ D-205）：P2 的 `Research` 部分最小可运行实现（用户称 H-11A）的实现口径——编号映射 Q-37 第八轮、保留 `ResearchPort` 并按 INTERFACES §5.2 更正签名（D-110 同口径）、只注入 `SourceRegistrarPort`（仅 `register_source`，结构性堵死 F-10）、**不注入 Storage 不落自己的表**、确定性模板检索计划（Q-29）、0 结果为业务结果而非错误、过滤排序确定性且被拒项必带原因、登记只经 Evidence 且失败整体传播、run 的失败纪律（单查询失败继续 / 全失败上报 / `BUDGET_EXCEEDED` 立即传播 / `budget` 参数不记账）、隔离（只产 `Source` 恒 `PUBLIC_SOURCE`、不产 `EvidenceItem`）、`NO_RESULT` 用模块常量不改已审 `FetchStatus`、`VALIDATION.empty_targets` 未登记故复用 `required_field`（零新增错误码）、`RankedCandidate.score` → `rank_weight`（配合 INV-4 而不放宽不变式）、Mock Research Provider 放测试侧；Q-37 扩展覆盖第八轮"H-11A → 仓库 P2 Research" | 已实现，**待人工验收** |
 | 2026-10-17 | v0.18 | 新增 §2.27（D-245 ~ D-249）：P4.7 验收与整改——① **装配层默认禁止真实外呼**（`allow_real=False`，未授权记 `REAL_PROVIDER_BLOCKED`；CLI `--allow-real` 才授权；配置层与装配层是两个开关，D-245）；② `--material` 不替代模型（D-246）；③ **G12 登记**：跨源同句 ⇒ `traits` 两条同文本条目，单独立轮（D-247，详见 `RUNNING.md` §5.16）；④ P1a **S3 并入阶段三**（D-248）；⑤ `usage list` 暂缓、先定口径（D-249）。事件背景：P4.7 期间 1 次未授权真实调用 0.0019161 USD，累计 **0.0097980 USD**，人工账本不重置 | 已实现 / 已登记 |
+| 2026-10-17 | v0.19 | 新增 §2.28（D-250 ~ D-253）：P4.8 R1 + R3——① **G12 修复采用方案 A**（条目身份 = 维度+归一化说法+主体的 sha256 摘要，跨源同句合并、引用全收，旧档案不迁移，只合并归一化完全相同者）；② **检索出口接线**（`search_provider_from_settings`，`max_retries` 强制 0，与模型共用 `allow_real` 闸门，`--material` 时不建检索出口）；③ **调用清单**（`plan_calls`：检索/抓取/模型次数 + 金额 + 计量单位，清单外调用即缺陷）；④ 顺手修 `research.*` 配置在产品路径被忽略的缺口（D-253）。全量 1301 项通过；**未跑真实检索** | 已实现 |

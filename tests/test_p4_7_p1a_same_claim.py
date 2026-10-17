@@ -149,16 +149,31 @@ class SameClaimAcrossSourcesTest(TestCase):
         # 只有这一条是跨源重复的：不同说法一条都不许混进来
         self.assertEqual(set(trait_texts), {SAME_CLAIM}, f"traits={trait_texts}")
 
-        # 已知行为（本轮**不改**，如实钉住）：档案条目按**证据**生成
-        # （`item_id = pi_<evidence_id>`），所以跨源同句会产出两个同文本条目，
-        # 各自引用一条证据。合并成一条需要改档案身份语义，不在 P1a 范围内。
-        self.assertEqual(len(trait_texts), 2,
-                         "同句跨两源 ⇒ 每条证据各生成一个条目（未合并，已知）")
-        refs = {ref for item in profile.traits for ref in item.evidence_refs}
-        self.assertEqual(len(refs), 2, "两个条目必须分别指向两条不同证据")
+        # G12 / D-250（已修，登记于 D-247）：档案条目身份 = **维度 + 归一化说法 + 主体集合**，
+        # 所以跨源同句只产出**一个**条目，两条证据都收进同一个 `evidence_refs`。
+        # 这正是"有多少来源支持"变得可读的地方（AC-7 的方向）。
+        self.assertEqual(len(trait_texts), 1,
+                         f"同句跨两源 ⇒ 合并成一个条目，traits={trait_texts}")
+        self.assertEqual(len(profile.traits[0].evidence_refs), 2,
+                         "合并后的条目必须保留**两条**证据引用（不是留一条）")
 
         for item in profile.traits:
             self.assertEqual(str(item.stability), Stability.REPEATED)
+
+    def test_merged_item_id_is_stable_across_reruns(self):
+        """合并后的 `item_id` 必须**可复现**（重跑同一份材料 → 同一身份）。
+
+        用内置 `hash()` 会随 `PYTHONHASHSEED` 变化，每次重跑都会判定成
+        "删一条 + 增一条"，版本 diff 变成噪声。这里用同一份材料**再跑一次**
+        来钉住：条目身份与"一条说法一个条目"都必须保持不变。
+        """
+        self.result = self._run(self._fixtures())
+        first = [(item.item_id, item.text) for item in self._profile().traits]
+        self.assertRegex(first[0][0], r"^pi_[0-9a-f]{16}$")
+
+        self.result = self._run(self._fixtures())
+        second = [(item.item_id, item.text) for item in self._profile().traits]
+        self.assertEqual(second, first, "同一份材料重跑必须得到同一个条目身份")
 
     def test_verdict_is_written_back_to_every_member(self):
         """判定结论要落库（G6-D1），否则重启后档案会重算成另一副样子。"""
@@ -234,4 +249,38 @@ class SameClaimAcrossSourcesTest(TestCase):
         verdict = unwrap(self.fx.evidence.judge_stability(
             self.fx.ctx, self.entity_id, SAME_CLAIM, [str(r.id) for r in rows]))
         self.assertEqual(str(verdict.stability), Stability.PATTERN)
-        self.assertIn(SAME_CLAIM, [item.text for item in self._profile().traits])
+        traits = self._profile().traits
+        self.assertEqual([item.text for item in traits], [SAME_CLAIM])
+        # G12 / D-250：3 个来源合并成**一个**条目，引用 3 条证据
+        self.assertEqual(len(traits[0].evidence_refs), 3,
+                         "合并后的条目必须保留全部 3 条证据引用")
+        self.assertEqual(str(traits[0].stability), Stability.PATTERN)
+
+    # ---------------------------------------------------------------- G12 边界
+
+    def test_only_whitespace_equal_claims_are_merged(self):
+        """G12 的诚实边界：**归一化完全相同**才合并，标点不同就不合并。
+
+        `_fold_whitespace` 只折空白（D-104）。两句仅差一个句号时是**两个说法**，
+        各自成一个条目——这正是"M 只能合并同句，不能聚类同义句"的可执行证据。
+        如果这里合并了，说明有人在归一化里偷偷做了语义处理（红线 3）。
+        """
+        punctuated = SAME_CLAIM + "。"
+        claim_a = CandidateClaim(claim=SAME_CLAIM, tier=EvidenceTier.PROFILE_BACKGROUND,
+                                 dimension=EvidenceDimension.TRAIT,
+                                 subject_entity_ids=[self.entity_id], confidence=0.8)
+        claim_b = CandidateClaim(claim=punctuated, tier=EvidenceTier.PROFILE_BACKGROUND,
+                                 dimension=EvidenceDimension.TRAIT,
+                                 subject_entity_ids=[self.entity_id], confidence=0.8)
+        fixtures = {self.material_a.canonical_key: [claim_a, claim_b],
+                    self.material_b.canonical_key: [claim_a, claim_b]}
+        self.result = self._run(fixtures)
+
+        self.assertEqual(len(self._evidence_of(SAME_CLAIM)), 2)
+        self.assertEqual(len(self._evidence_of(punctuated)), 2)
+        trait_texts = sorted(item.text for item in self._profile().traits)
+        self.assertEqual(trait_texts, sorted([SAME_CLAIM, punctuated]),
+                         "两个不同说法必须各自成条（不得语义聚类）")
+        for item in self._profile().traits:
+            self.assertEqual(len(item.evidence_refs), 2,
+                             "每个条目各自有 2 条证据支撑")

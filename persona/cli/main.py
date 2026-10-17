@@ -508,6 +508,9 @@ def _run_business_action(args: Any) -> int:
                 # `run` 才按配置构造真实 Provider（只构造、不发请求）；
                 # `plan` 必须保持"什么都不建"，否则快照命令也可能踩到密钥/网络配置。
                 build_chat_provider=(action == "run"),
+                # 检索同理：给了 `--material` 就不构造检索出口（材料通道本来不检索）
+                build_search_provider=(action == "run"
+                                       and not bool(getattr(args, "materials", []) or [])),
                 enable_relationship_analyzer=(None if analyzer is None
                                               else analyzer == "rule"),
             ),
@@ -584,6 +587,7 @@ def _run_business_chain(stack: Any, args: Any) -> int:
         BusinessRequest,
         TargetSpec,
         materials_from_files,
+        plan_calls,
         register_targets,
     )
 
@@ -656,6 +660,11 @@ def _run_business_chain(stack: Any, args: Any) -> int:
 
     print(f"业务链开跑：{len(targets)} 名目标（{entity_type}）"
           f"{'，本地材料 ' + str(len(materials)) + ' 份（不检索）' if materials else ''}")
+    plan = plan_calls(stack, targets, materials=materials,
+                      max_rounds=int(getattr(args, "max_rounds", 1) or 1))
+    print("真实调用清单（执行前核对：授权 = 看过这份账再签）")
+    for line in plan.as_lines():
+        print(line)
     result = stack.orchestrator.run(
         stack.ctx, BusinessRequest(targets=targets, materials=materials,
                                    max_rounds=int(getattr(args, "max_rounds", 1) or 1)))

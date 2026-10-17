@@ -46,10 +46,14 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from ..config import AppSettings
-from ..config.spec import NETWORK_MODEL_PROVIDER_NAMES, ResearchLimits
+from ..config.spec import (
+    NETWORK_MODEL_PROVIDER_NAMES,
+    NETWORK_PROVIDER_NAMES,
+    ResearchLimits,
+)
 from ..core.context import CallContext
 from ..core.errors import ErrorCode, new_error
-from ..core.result import Err, Ok, Result, WarningNote, error_of, is_err
+from ..core.result import Err, Ok, Result, WarningNote, error_of, is_err, is_ok
 from ..core.types import SourceMaterial
 from ..core.usage_ledger import (
     ExternalUsageLedger,
@@ -80,6 +84,7 @@ from .model_setup import (
     chat_provider_from_settings,
     claim_extractor_from_settings,
     model_limits_from_settings,
+    search_provider_from_settings,
 )
 from .tasks import TaskService
 
@@ -90,6 +95,7 @@ from .tasks import TaskService
 WARNING_STACK_LEDGER_NOT_HYDRATED = "LEDGER_NOT_HYDRATED"        # 主动关闭了 hydrate
 WARNING_STACK_LEDGER_HYDRATION_FAILED = "LEDGER_HYDRATION_FAILED"  # 读历史失败（无累计上限时降级）
 WARNING_STACK_SEARCH_OFFLINE = "SEARCH_PROVIDER_OFFLINE"          # 未注入检索 Provider，用离线 Fake
+WARNING_STACK_SEARCH_PROVIDER_UNAVAILABLE = "SEARCH_PROVIDER_UNAVAILABLE"  # 按配置构造检索 Provider 失败
 WARNING_STACK_EXTRACTOR_ABSENT = "EXTRACTOR_ABSENT"               # 没有可用的 claim 抽取器
 WARNING_STACK_CHAT_PROVIDER_UNAVAILABLE = "CHAT_PROVIDER_UNAVAILABLE"  # 按配置构造聊天 Provider 失败
 WARNING_STACK_REAL_PROVIDER_BLOCKED = "REAL_PROVIDER_BLOCKED"     # 默认禁止真实外呼，未显式授权
@@ -104,6 +110,16 @@ def _config_wants_network_provider(settings: AppSettings) -> bool:
     """
     name = str(getattr(settings.model, "provider", "") or "").strip().lower()
     return name in NETWORK_MODEL_PROVIDER_NAMES
+
+
+def _config_wants_network_search(settings: AppSettings) -> bool:
+    """配置是不是**指着**一个真实检索服务商（与"有没有密钥"无关）。
+
+    与 `_config_wants_network_provider` 同一用途：只决定"要不要报告被闸门拦下"，
+    配置根本没提真实服务商时走原来的构造路径并降级为 `SEARCH_PROVIDER_OFFLINE`。
+    """
+    name = str(getattr(settings, "provider_name", "") or "").strip().lower()
+    return name in NETWORK_PROVIDER_NAMES
 
 
 # --------------------------------------------------------------------------
@@ -126,6 +142,9 @@ class StackOptions:
     #: 默认 `False`：装配层不该"顺手"把一个会花钱的出口建出来，
     #: 必须由调用方显式要求（`persona business run` 才这么做）。
     build_chat_provider: bool = False
+    #: `True` = 按配置构造**真实检索** Provider（只构造，不发请求）。
+    #: 默认 `False`；且同样受 `allow_real` 约束（一条规则管住两类外呼）。
+    build_search_provider: bool = False
     enable_relationship_analyzer: bool | None = None
     research_limits: ResearchLimits | None = None
     extraction_strategy: Any = None
@@ -215,6 +234,158 @@ class BusinessStack:
         """只关闭自己开的库（外部传进来的由调用方负责）。"""
         if self.owns_storage:
             self.storage.close()
+
+
+# --------------------------------------------------------------------------
+# 执行前的"调用清单"（P4.8 / R4 的前置条件）
+# --------------------------------------------------------------------------
+
+#: Tavily **basic** 口径（官方 api-credits，2026-10-15 核对）：
+#: Search 1 credit/次；Extract 每 5 条成功 URL 1 credit → 0.2 credit/条。
+#: 只用于**事前估算**，实际以响应里的 `usage.credits` 为准（账本口径不变）。
+SEARCH_CREDITS_PER_CALL = 1.0
+EXTRACT_CREDITS_PER_CALL = 0.2
+
+
+@dataclass(frozen=True)
+class CallPlan:
+    """一次业务链运行**将要发出**的真实调用（执行前给用户看的账）。
+
+    为什么要有它：授权必须"看过账再签"。一次真实运行会同时触发检索、正文抓取
+    与模型调用，三者的计量单位还不一样（credit / USD）。只喊一句
+    "要花点钱"不算授权——必须说清"几次、哪一类、大概多少"。
+    """
+
+    search_online: bool
+    model_online: bool
+    searches: int
+    extracts_upper_bound: int
+    extractions: int
+    dialogues: int
+    est_search_credits: float | None
+    est_model_cost: float | None
+    currency: str
+    reasons: list[str]
+
+    def as_lines(self) -> list[str]:
+        """给 CLI 直接打印的行（**不含**任何密钥与单价明细）。"""
+        lines: list[str] = []
+        if self.searches == 0:
+            lines.append("  检索            : 0 次")
+        else:
+            lines.append(f"  检索            : {self.searches} 次"
+                         f"（模板查询，basic ≈{self.est_search_credits:g} credits）")
+        if self.extracts_upper_bound == 0:
+            lines.append("  抓取正文        : 0 次")
+        else:
+            lines.append(f"  抓取正文        : ≤{self.extracts_upper_bound} 次"
+                         f"（`max_extracts` 上限；单条失败官方不计费）")
+        calls = self.extractions + self.dialogues
+        if calls == 0:
+            lines.append("  模型调用        : 0 次")
+        else:
+            parts = []
+            if self.extractions:
+                parts.append(f"{self.extractions} 次抽取（批量）")
+            if self.dialogues:
+                parts.append(f"{self.dialogues} 次对话")
+            lines.append(f"  模型调用        : {' + '.join(parts)}")
+        if self.est_model_cost is None:
+            lines.append("  预估费用        : 模型侧估不出来（缺单价或 token 估算）")
+        elif self.extractions + self.dialogues == 0:
+            lines.append("  预估费用        : 0.000000（本次没有模型调用）")
+        else:
+            lines.append(f"  预估费用        : 模型 ≈{self.est_model_cost:.6f}"
+                         f" {self.currency}"
+                         + (f"；检索 ≈{self.est_search_credits:g} credits"
+                            if self.est_search_credits else ""))
+        lines.append("  计量单位        : 检索按 **credit**、模型按 **USD** ——"
+                     "两者不可直接相加（账本不做汇率换算）")
+        for reason in self.reasons:
+            lines.append(f"  说明            : {reason}")
+        lines.append("  边界            : 清单之外不会有任何调用；出现清单外的调用即为缺陷")
+        return lines
+
+
+def plan_calls(
+    stack: BusinessStack,
+    targets: list[Any],
+    *,
+    materials: list[SourceMaterial] | None = None,
+    max_rounds: int = 1,
+) -> CallPlan:
+    """估算本次运行**会发出**的检索 / 抓取 / 模型调用次数。
+
+    - 给了本地材料 → 研究阶段**不检索**，也不抓取（文件已在盘上）；
+    - 检索 Provider 是离线的 `FakeProvider` → 0 次（不联网）；
+    - 抓取次数只能给**上限**：要等检索结果才知道有几条可用正文；
+    - 模型抽取是**一次批量**（全部材料与目标一个请求）；
+    - 对话只在**多目标**时生成（单目标按语义跳过），上限 `目标数 × 轮数`。
+    """
+    materials = list(materials or [])
+    search_provider = getattr(getattr(stack.research, "deps", None), "provider", None)
+    search_online = search_provider is not None and not isinstance(
+        search_provider, FakeProvider)
+    extractor = getattr(stack, "claim_extractor", None)
+    model_online = extractor is not None and not isinstance(
+        getattr(extractor, "provider", None), FakeProvider)
+
+    reasons: list[str] = []
+    limits = stack.research.deps.effective_limits
+    searches = 0
+    extracts = 0
+    if materials:
+        reasons.append(f"本次用本地材料 {len(materials)} 份：材料通道**不检索、不抓取**")
+    elif not search_online:
+        reasons.append("检索 Provider 离线（FakeProvider）：不联网、不产生检索费用")
+    else:
+        planned = stack.research.plan_queries(
+            stack.ctx, [_query_target(t) for t in targets])
+        searches = len(planned.value) if is_ok(planned) else len(targets)
+        extracts = int(limits.max_extracts)
+        reasons.append(f"检索上限 {limits.max_queries} 次 / 抓取上限 {limits.max_extracts} 次"
+                       "（配置 research.*）")
+
+    extractions = 1 if model_online and (materials or searches) else 0
+    dialogues = (len(targets) * max(0, int(max_rounds))
+                 if model_online and len(targets) >= 2 else 0)
+    if model_online and len(targets) < 2:
+        reasons.append("单目标：关系与对话按语义跳过，只做 1 次批量抽取")
+
+    per_call = estimate_model_cost(model_limits_from_settings(stack.settings))
+    total_calls = extractions + dialogues
+    if total_calls == 0:
+        est_model: float | None = 0.0
+    elif per_call is None:
+        est_model = None
+    else:
+        est_model = per_call * total_calls
+    est_credits = (searches * SEARCH_CREDITS_PER_CALL
+                   + extracts * EXTRACT_CREDITS_PER_CALL) if searches else 0.0
+    return CallPlan(
+        search_online=search_online,
+        model_online=model_online,
+        searches=searches,
+        extracts_upper_bound=extracts,
+        extractions=extractions,
+        dialogues=dialogues,
+        est_search_credits=est_credits,
+        est_model_cost=est_model,
+        currency=model_limits_from_settings(stack.settings).currency,
+        reasons=reasons,
+    )
+
+
+def _query_target(target: Any) -> PersonQueryTarget:
+    """把已登记的目标转成检索目标（只填检索真正用到的字段）。"""
+    return PersonQueryTarget(
+        entity_id=str(getattr(target, "entity_id", "")),
+        display_name=str(getattr(target, "display_name", "") or ""),
+        entity_type=str(getattr(target, "entity_type", "") or ""),
+        work_titles=[str(getattr(target, "work_title", "")) or ""]
+        if getattr(target, "work_title", "") else [],
+        adaptation_version=getattr(target, "adaptation_version", None),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -435,17 +606,40 @@ def build_business_stack(
     task_service = TaskService(storage)
 
     # ---------------- 4. 研究（检索 + 正文抓取） ----------------
+    if search_provider is None and options.build_search_provider:
+        if not allow_real and _config_wants_network_search(settings):
+            # 同一条闸门管住两类外呼：只授权模型、不授权检索，等于悄悄开了检索。
+            warnings.append(WarningNote(
+                code=WARNING_STACK_REAL_PROVIDER_BLOCKED,
+                message=f"默认禁止真实外呼：配置指定了真实检索服务商"
+                        f"（provider_name={settings.provider_name!r}），但调用方未显式授权"
+                        f"（`allow_real=True` / CLI `--allow-real`），已拒绝构造——"
+                        f"本次装配不会产生任何检索请求与费用"))
+        else:
+            built_search = search_provider_from_settings(settings)
+            if is_err(built_search):
+                warnings.append(WarningNote(
+                    code=WARNING_STACK_SEARCH_PROVIDER_UNAVAILABLE,
+                    message=f"按配置构造检索 Provider 失败（{built_search.error.code}）："
+                            f"{built_search.error.message}"))
+            else:
+                search_provider = built_search.value
     if search_provider is None:
         warnings.append(WarningNote(
             code=WARNING_STACK_SEARCH_OFFLINE,
             message="未注入检索 Provider，使用离线 FakeProvider（需要 fixture_key，"
-                    "不会联网）。真实检索（H-17 / P3）需单独授权并先定 Q-02/Q-03"))
+                    "不会联网）。真实检索需显式 `--allow-real`，且先过 Q-02 的渠道约束"))
     research_deps = ResearchDeps(
         provider=search_provider or FakeProvider(),
         evidence=evidence,
         search_metadata=dict(options.search_metadata),
         extraction_strategy=options.extraction_strategy,
-        limits=options.research_limits,
+        # P4.8 / R3 修的一个真缺口：此前 `options.research_limits` 默认 None，
+        # 研究阶段就回落到模块默认值（5/5/3）——**配置里的
+        # `PERSONA_RESEARCH_MAX_QUERIES/MAX_EXTRACTS` 在产品路径上被静默忽略**
+        # （只有 e2e 脚本显式传了 limits，所以一直没被发现）。
+        # 现在默认取 `settings.research`，显式传参仍然优先。
+        limits=options.research_limits or settings.research,
         usage_sink=storage,                     # 逐笔用量落库（P4.5 端口，P4.6 才接线）
         task_id=options.task_id,
     )

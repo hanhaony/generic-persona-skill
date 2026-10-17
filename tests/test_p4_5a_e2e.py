@@ -1453,7 +1453,11 @@ class TestG6StabilityAssessment(unittest.TestCase):
                          "标签应从'没判过(UNKNOWN)'变成'判过且是单次(SINGLE)'")
 
     def test_same_wording_from_two_sources_becomes_repeated(self):
-        """两个来源说同一句话 ⇒ REPEATED ⇒ 进 traits（AC-7 允许的情形）。"""
+        """两个来源说同一句话 ⇒ REPEATED ⇒ 进 traits（AC-7 允许的情形）。
+
+        G12 / D-250 之后：同一说法跨源合并成**一个**条目、`evidence_refs` 收 2 条。
+        此前按证据建条目会产出两条同文本条目（档案读起来是重复的）。
+        """
         a = self.stack.ensure_entity("阿雾")
         ev1 = self._trait("阿雾总在深夜修灯", a, "src-a")
         ev2 = self._trait("阿雾总在深夜修灯", a, "src-b")
@@ -1461,7 +1465,9 @@ class TestG6StabilityAssessment(unittest.TestCase):
         self.assertEqual(str(judged[ev1]), "REPEATED")
         self.assertEqual(str(judged[ev2]), "REPEATED")
         draft = self._draft(a, [ev1, ev2], judged)
-        self.assertEqual(len(draft.traits), 2, "多来源佐证的性格才允许进 traits")
+        self.assertEqual(len(draft.traits), 1, "多来源佐证的同一说法 ⇒ 合并成一个条目")
+        self.assertEqual(sorted(draft.traits[0].evidence_refs), sorted([ev1, ev2]),
+                         "合并后的条目必须保留**两条**证据引用")
         self.assertEqual(draft.single_events, [])
 
     def test_whitespace_variant_from_same_source_does_not_count_twice(self):
@@ -1572,8 +1578,10 @@ class TestG6StabilityAssessment(unittest.TestCase):
             self.stack.ctx, self.stack.request(), {"evidence_ids": [ev1, ev2]})
         self.assertFalse(is_err(step), step)
         loaded = unwrap(self.stack.persona.get_persona(self.stack.ctx, a))
-        self.assertEqual(len(loaded.traits), 2,
-                         "多来源佐证的 TRAIT 必须真的写进 traits")
+        self.assertEqual(len(loaded.traits), 1,
+                         "多来源佐证的同一说法 ⇒ 合并成一个 traits 条目（G12）")
+        self.assertEqual(len(loaded.traits[0].evidence_refs), 2,
+                         "合并后仍要能看出有 2 条证据支持")
         self.assertEqual(loaded.single_events, [])
         for item in loaded.traits:
             self.assertIn(str(item.stability), ("REPEATED", "PATTERN"))
