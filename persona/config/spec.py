@@ -194,6 +194,37 @@ class ResearchLimits:
 
 
 # ---------------------------------------------------------------------------
+# 关系研判（G-4 / P4.6）的配置
+# ---------------------------------------------------------------------------
+
+#: 装配离线规则分析器（默认）：确定性、零成本、条目全部可追溯到已登记证据。
+RELATIONSHIP_ANALYZER_RULE = "rule"
+#: 明确关闭：关系阶段退回"只搬共享经历"的兜底路径（D-D 的开关）。
+RELATIONSHIP_ANALYZER_OFF = "off"
+RELATIONSHIP_ANALYZER_MODES: tuple[str, ...] = (
+    RELATIONSHIP_ANALYZER_RULE, RELATIONSHIP_ANALYZER_OFF)
+
+
+@dataclass(frozen=True)
+class RelationshipSettings:
+    """关系语义分析器的装配开关（P4.6 / D-D：**默认装配，可关闭**）。
+
+    `rule` = 注入 `RuleRelationshipAnalyzer`（离线确定性实现，不调模型、不花钱）；
+    `off`  = 不注入，关系阶段走兜底（与 P4.6 之前的行为一致）。
+
+    ⚠️ 关闭只影响"是否装配分析器"，**不影响** RELATION 证据的登记与消费口径：
+    兜底路径仍然产出 `shared_experiences`，只是 `perspectives` / `feeling_toward`
+    这些需要方向性研判的字段留空（并记 `open_questions`，不伪造）。
+    """
+
+    analyzer: str = RELATIONSHIP_ANALYZER_RULE
+
+    def analyzer_enabled(self) -> bool:
+        """是否装配规则分析器。未知取值一律按**关闭**处理（安全默认）。"""
+        return str(self.analyzer or "").strip() == RELATIONSHIP_ANALYZER_RULE
+
+
+# ---------------------------------------------------------------------------
 # 模型抽取（G-2 / P4.4-B）的配置
 # ---------------------------------------------------------------------------
 
@@ -277,6 +308,7 @@ class AppSettings:
     budget: BudgetLimits = field(default_factory=BudgetLimits)
     retry: RetryLimits = field(default_factory=RetryLimits)
     research: ResearchLimits = field(default_factory=ResearchLimits)
+    relationship: RelationshipSettings = field(default_factory=RelationshipSettings)
     model: ModelSettings = field(default_factory=ModelSettings)
     secrets: Secrets = field(default_factory=Secrets)
     sources: Mapping[str, str] = field(default_factory=dict)
@@ -333,6 +365,10 @@ class AppSettings:
                 "max_extracts": self.research.max_extracts,
                 "max_remediations": self.research.max_remediations,
                 "max_cost": self.research.max_cost,
+            },
+            "relationship": {
+                "analyzer": self.relationship.analyzer,
+                "analyzer_enabled": self.relationship.analyzer_enabled(),
             },
             "model": {
                 "enabled": self.model.enabled(),
@@ -426,6 +462,12 @@ CONFIG_FIELDS: tuple[FieldSpec, ...] = (
               minimum=0, maximum=5),
     FieldSpec("PERSONA_RESEARCH_MAX_COST", "research.max_cost", "float", None,
               "一次研究的金额上限；留空表示不限制", minimum=0, nullable=True),
+    # ---- 关系研判（G-4 / P4.6，D-D）----
+    FieldSpec("PERSONA_RELATIONSHIP_ANALYZER", "relationship.analyzer", "enum",
+              RELATIONSHIP_ANALYZER_RULE,
+              "关系语义分析器：rule=装配离线规则分析器（默认，零成本）；"
+              "off=不装配，关系阶段走兜底",
+              choices=RELATIONSHIP_ANALYZER_MODES),
     # ---- 模型抽取（G-2 / P4.4-B）：用谁 ----
     FieldSpec("PERSONA_MODEL_PROVIDER", "model.provider", "str", None,
               "模型服务商（当前只有 deepseek）；**留空 = 不启用模型抽取**（离线、不花钱）",
@@ -539,6 +581,12 @@ def _to_enum(spec: FieldSpec, text: str):
         return RunMode(text)
     if spec.path == "log_level":
         return LogLevel(text)
+    if spec.path == "relationship.analyzer":
+        # 存纯字符串（理由同下面的模型枚举）：装配层按字符串比较决定是否注入分析器，
+        # 变成枚举成员后 str() 会带上类名，比较就会永远不相等。
+        if text not in RELATIONSHIP_ANALYZER_MODES:
+            raise AssertionError(f"未登记的分析器取值：{text}")
+        return text
     model_enum = _MODEL_ENUM_PATHS.get(spec.path)
     if model_enum is not None:
         # **存纯字符串**（不是枚举成员）：币种/档位要原样流进

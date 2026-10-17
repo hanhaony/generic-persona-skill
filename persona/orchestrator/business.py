@@ -163,6 +163,7 @@ WARNING_MATERIAL_NOT_USABLE = "NO_MATERIAL_FROM_EXTRACTS"  # 有抓取正文但�
 # "分析器没产出"、还是"其他"。三类分开记，且各带**数量 + 样例 ID**。
 WARNING_RELATION_SUBJECT_INSUFFICIENT = "RELATION_EVIDENCE_SUBJECT_INSUFFICIENT"  # 主体不足：覆盖 <2 名参与者
 WARNING_RELATION_ANALYSIS_FAILED = "RELATION_ANALYSIS_FAILED"                    # 分析失败：分析器没产出条目
+WARNING_RELATION_ANALYZER_DEGRADED = "RELATION_ANALYZER_DEGRADED"                # 分析器返回 Err，已降级到兜底（P4.6 / D-E）
 WARNING_RELATION_EVIDENCE_UNUSED_OTHER = "RELATION_EVIDENCE_UNUSED_OTHER"        # 其他未消费情形
 # 单人物：阶段按语义跳过，但本次**确实登记了** RELATION 证据 ⇒ 它们不会被任何
 # 档案消费（人物档案没有 RELATION 维度，关系档案没建立）。必须显式说出来，
@@ -1394,19 +1395,36 @@ class BusinessOrchestrator:
                     relation_evidence=relation_items,
                     cardinality=cardinality))
             if isinstance(outcome, Err):
-                return outcome
-            # G5 同型：分析器自己的告警（含它内部"主体不足"的分类计数）必须透传，
-            # 否则"为什么关系档案是空的"在任务视图里又变成一句笼统话。
-            warnings.extend(getattr(outcome.value, "warnings", []) or [])
-            draft = self._draft_from_analysis(
-                outcome.value, participants, cardinality, variants)
-            # 分析失败：证据交进去了，分析器却一个条目都没产出
-            if relation_items and not RelationshipService._has_any_content(draft):
+                # P4.6 / D-E：分析器失败**降级到兜底 + 留告警**，不整体失败。
+                #
+                # 为什么不是"整体失败"：分析器是增强项（它只补 perspectives /
+                # feeling_toward 这类方向性视角），而 shared_experiences 这类
+                # 底线条目**不依赖**它。让一次分析失败把整条链判成 FAILED，
+                # 等于用可选能力的故障否定已经成立的事实（证据已登记、登记已校验）。
+                # 但也不能静默：告警里必须带上是哪一类失败，否则运维无法区分
+                # "分析器坏了" 和 "材料本来就没有双人句"。
                 warnings.append(WarningNote(
-                    code=WARNING_RELATION_ANALYSIS_FAILED,
-                    message=f"{len(relation_items)} 条 RELATION 证据已交给分析器，"
-                            "但未产出任何条目（分析失败）——关系档案仅记 "
-                            "open_questions，不补全、不臆造"))
+                    code=WARNING_RELATION_ANALYZER_DEGRADED,
+                    message=f"关系分析器返回失败（{error_of(outcome).code}："
+                            f"{error_of(outcome).message}），已降级为兜底路径："
+                            "只搬 RELATION 证据进 shared_experiences，"
+                            "perspectives / feeling_toward 留空并记 open_questions"
+                            "（不臆造、不整体失败）"))
+                draft = self._relationship_draft_fallback(
+                    participants, cardinality, relation_items, variants, warnings)
+            else:
+                # G5 同型：分析器自己的告警（含它内部"主体不足"的分类计数）必须透传，
+                # 否则"为什么关系档案是空的"在任务视图里又变成一句笼统话。
+                warnings.extend(getattr(outcome.value, "warnings", []) or [])
+                draft = self._draft_from_analysis(
+                    outcome.value, participants, cardinality, variants)
+                # 分析失败：证据交进去了，分析器却一个条目都没产出
+                if relation_items and not RelationshipService._has_any_content(draft):
+                    warnings.append(WarningNote(
+                        code=WARNING_RELATION_ANALYSIS_FAILED,
+                        message=f"{len(relation_items)} 条 RELATION 证据已交给分析器，"
+                                "但未产出任何条目（分析失败）——关系档案仅记 "
+                                "open_questions，不补全、不臆造"))
         else:
             # —— 兜底路径（未注入分析器）：不做语义判断 ——
             draft = self._relationship_draft_fallback(

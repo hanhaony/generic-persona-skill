@@ -1582,5 +1582,74 @@ class TestG4RelationshipSemantic(BusinessTestCase):
                       "编排器应依赖 RelationshipAnalyzerPort 端口")
 
 
+# ==========================================================================
+# 8.6 P4.6 / D-E：分析器失败**降级**而不是整体失败
+# ==========================================================================
+
+
+class _FailingAnalyzer:
+    """总是返回 `Err` 的分析器桩：模拟"分析器坏了"这条路径。"""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def analyze(self, ctx, request):
+        self.calls += 1
+        return Err(new_error(ErrorCode.EXTERNAL_UNAVAILABLE,
+                             "分析器故障（测试桩）", trace_ref=ctx.trace_ref))
+
+
+class TestRelationshipAnalyzerDegradation(BusinessTestCase):
+    """D-E：分析器是**增强项**，它失败不能让整条链判成失败。
+
+    红线同时保留：失败必须留告警（不允许静默降级），底线条目照常产出。
+    """
+
+    def _run_with(self, analyzer):
+        a = self.fx.entity("阿雾")
+        b = self.fx.entity("阿灯")
+        self.fx.use_analyzer(analyzer)
+        request = BusinessRequest(
+            targets=[self.fx.target(a, "阿雾"), self.fx.target(b, "阿灯")],
+            max_rounds=1,
+            evidence_seeds=[self.fx.seed(
+                "key_mist_harbor", "阿雾与阿灯每天在灯塔下交谈", [a, b],
+                dimension=EvidenceDimension.RELATION,
+                stability=Stability.REPEATED)])
+        return unwrap(self.fx.orch.run(self.fx.ctx, request))
+
+    def test_analyzer_error_degrades_to_fallback_with_warning(self):
+        from persona.orchestrator.business import WARNING_RELATION_ANALYZER_DEGRADED
+
+        analyzer = _FailingAnalyzer()
+        result = self._run_with(analyzer)
+
+        self.assertEqual(result.status, RUN_SUCCEEDED,
+                         "分析器失败不应把整条链判成失败（D-E）")
+        self.assertGreater(analyzer.calls, 0, "分析器应确实被调用过")
+
+        step = result.step_of(STAGE_RELATIONSHIP)
+        self.assertIsNotNone(step)
+        self.assertEqual(step.status, STEP_EXECUTED)
+        codes = {note.code for note in step.warnings}
+        self.assertIn(WARNING_RELATION_ANALYZER_DEGRADED, codes,
+                      "降级必须留告警，不得静默")
+
+        view = unwrap(self.fx.relationship.get_relationship(
+            self.fx.ctx, result.relationship_profile_ids[0]))
+        self.assertTrue(view.shared_experiences,
+                        "兜底路径仍应把 RELATION 证据搬进共享经历")
+
+    def test_degraded_relationship_stays_insufficient_not_fabricated(self):
+        """降级后不得凭空产出方向性视角（兜底不做语义判断）。"""
+        result = self._run_with(_FailingAnalyzer())
+        view = unwrap(self.fx.relationship.get_relationship(
+            self.fx.ctx, result.relationship_profile_ids[0]))
+        for block in (view.perspectives or {}).values():
+            self.assertEqual(dict(block.view_of_targets or {}), {},
+                             "分析器失败时 perspectives 必须留空，不得臆造")
+        self.assertEqual(list(view.interaction_patterns or []), [])
+
+
 if __name__ == "__main__":
     unittest.main()

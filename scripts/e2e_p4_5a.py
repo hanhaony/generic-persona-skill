@@ -78,6 +78,7 @@ import shutil
 import sys
 import tempfile
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -92,6 +93,7 @@ from persona.core.result import (                                          # noq
     Err,
     Ok,
     UsageDelta,
+    error_of,
     is_err,
     is_ok,
 )
@@ -136,7 +138,9 @@ from persona.orchestrator import (                                          # no
     BusinessDeps,
     BusinessOrchestrator,
     BusinessRequest,
+    StackOptions,
     TaskService,
+    build_business_stack,
 )
 from persona.orchestrator.model_setup import (                              # noqa: E402
     chat_provider_config,
@@ -656,6 +660,11 @@ class Stack:
     与产品代码的**唯一差异**在材料交接（见模块 docstring 的 G4）：脚本显式调用
     `materials_from_extracts()` 并把 `source_id` 绑上；证据登记、门禁、人格档案
     全部复用 `BusinessOrchestrator` 的**同一批方法**，不另写一套。
+
+    P4.6 / P0-1 之后，服务装配**不再由脚本自己写**：改为调用产品侧的装配层
+    `build_business_stack()`，只在它给的组件上做脚本特有的事（登记目标实体、
+    注入桩 Provider、按需换抽取器）。这样"脚本跑通"与"产品装配"是同一份代码，
+    不会再出现"脚本传了 usage_sink、产品没传"这种漂移。
     """
 
     def __init__(self, settings, ledger, out: Out, *,
@@ -668,30 +677,37 @@ class Stack:
         self.storage = SqliteStorage(self.path)
         self.ctx: CallContext = new_call_context(
             project_id=PROJECT, actor="p45a-e2e", task_id=TASK_ID)
-        if is_err(self.storage.init_schema(self.ctx)):
-            raise RuntimeError("临时库 schema 初始化失败")
 
         self.ledger = ledger
         self.search_provider = source_provider or StubSearchExtractProvider()
         self.dialogue_provider = chat_provider or StubChatProvider()
 
-        self.evidence = EvidenceService(self.storage)
-        self.persona = PersonaService(self.storage)
-        self.relationship = RelationshipService(self.storage)
-        self.dialogue = DialogueService(DialogueDeps(
-            profiles=self.persona, relations=self.relationship,
-            evidence=self.evidence, memory=MemoryService(self.storage),
-            storage=self.storage, provider=self.dialogue_provider,
-            memory_reader=MemoryService(self.storage)))
-        self.task_service = TaskService(self.storage)
-
-        self.research = ResearchService(ResearchDeps(
-            provider=self.search_provider,
-            evidence=self.evidence,
-            search_metadata={"fixture_key": "p45a"},
-            extraction_strategy=TopNExtractionStrategy(),
-            limits=research_limits or E2E_RESEARCH_LIMITS,
-            task_id=TASK_ID))
+        built = build_business_stack(
+            settings, self.ctx,
+            storage=self.storage,
+            ledger=ledger,
+            search_provider=self.search_provider,
+            dialogue_provider=self.dialogue_provider,
+            # 抽取器由脚本按需注入（use_real_extractor / use_stub_extractor）；
+            # 账本 hydrate 在临时库上没有意义（每次都是新库），关掉以免误判。
+            options=StackOptions(
+                task_id=TASK_ID,
+                hydrate_ledger=False,
+                research_limits=research_limits or E2E_RESEARCH_LIMITS,
+                extraction_strategy=TopNExtractionStrategy(),
+                search_metadata={"fixture_key": "p45a"},
+            ),
+        )
+        if is_err(built):
+            raise RuntimeError(f"业务链装配失败：{error_of(built)}")
+        stack = built.value
+        self.stack = stack
+        self.evidence = stack.evidence
+        self.persona = stack.persona
+        self.relationship = stack.relationship
+        self.dialogue = stack.dialogue
+        self.research = stack.research
+        self.task_service = stack.task_service
         self._extractor = None
         self.entity_id: str = ""
         self.target: PersonQueryTarget | None = None
@@ -740,22 +756,33 @@ class Stack:
 
     # -------------------------------------------------------------- 抽取器
     def use_real_extractor(self, provider) -> ProviderClaimExtractor:
+        # P4.6 / G11：`usage_sink` 必须与产品装配一致（装配层现在会传它）。
+        # 不传的话，脚本花掉的钱只活在内存里——正是 C 轮 0.0032838 USD
+        # 没有落进任何库的那个缺口。
         self._extractor = claim_extractor_from_settings(
-            self.settings, provider, ledger=self.ledger, task_id=TASK_ID)
+            self.settings, provider, ledger=self.ledger,
+            usage_sink=self.storage, task_id=TASK_ID)
         return self._extractor
 
     def use_stub_extractor(self, chat_provider) -> ProviderClaimExtractor:
         self._extractor = claim_extractor_from_settings(
-            self.settings, chat_provider, ledger=self.ledger, task_id=TASK_ID)
+            self.settings, chat_provider, ledger=self.ledger,
+            usage_sink=self.storage, task_id=TASK_ID)
         return self._extractor
 
     # -------------------------------------------------------------- 编排器
     def orchestrator(self, *, analyzer=None) -> BusinessOrchestrator:
-        return BusinessOrchestrator(BusinessDeps(
-            research=self.research, evidence=self.evidence, persona=self.persona,
-            relationship=self.relationship, dialogue=self.dialogue,
-            task_service=self.task_service, storage=self.storage,
-            claim_extractor=self._extractor, relationship_analyzer=analyzer))
+        """用**装配层给出的**依赖重建编排器，只替换抽取器 / 分析器。
+
+        为什么要重建而不是复用：脚本按需切换抽取器
+        （`use_real_extractor` / `use_stub_extractor`），而装配时还没有抽取器。
+        重建时只 `replace` 两个字段，其余依赖（服务、存储）仍是装配层那一份，
+        不会出现"两个 EvidenceService 指向同一个库"的隐性重复。
+        """
+        deps = replace(self.stack.orchestrator.deps,
+                       claim_extractor=self._extractor,
+                       relationship_analyzer=analyzer)
+        return BusinessOrchestrator(deps)
 
     def request(self, *, max_rounds: int = 1,
                 targets: list[PersonQueryTarget] | None = None) -> BusinessRequest:

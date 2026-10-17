@@ -18,10 +18,10 @@
 2. **单价只有一个换算点**：配置里的单价是"每 100 万 token"，账本要的是"每 1000
    token"。换算只在本模块的 `unit_price_per_1k()` 里做一次；别处再乘再除，
    迟早会差 1000 倍。
-3. **上限取更严的那个**（`effective_max_cost`）：既有闸门（`_budget_block`）只有
-   **一个**金额上限参数，所以当"本轮总上限"和"单任务上限"同时配置时，本模块传
-   **更小的那个**。这样两个上限都不可能被突破（详见 `effective_max_cost` 的说明）。
-   把两个上限做成两层账需要共享账本之外的第二层计数，属新增机制，本轮不做。
+3. **两层上限各算各的**（P4.6 / D-B）：`max_cost` 是**单任务**上限（按 `task_id`
+   累计，含该任务的历史），`max_cost_total` 是**项目累计**上限（按整本账累计，
+   含 hydrate 读回的历史）。修复前只有一个上限参数，只能取两者的 `min` 近似，
+   于是"项目累计封顶"从未真正独立生效——现在是两层各自判断、任一层超限即停。
 
 # 本模块**不**做的事
 
@@ -95,17 +95,17 @@ def unit_price_per_1k(price_per_1m: float | None) -> float | None:
 
 
 def effective_max_cost(model: ModelSettings) -> float | None:
-    """两个金额上限里**真正会被执行**的那一个（更严的那个）。
+    """**单任务**这一层真正会被执行的金额上限（两个配置里更严的那个）。
 
-    既有闸门的金额判断是 `本账已占用 + 本次估算 > 上限`，只有一个上限参数。
-    所以：
+    修复前本函数的说明是"既有闸门只有一个金额上限，所以取更严的近似两层"；
+    P4.6（D-B）之后闸门**真的有两层**了：
 
-    - 只配了总上限 → 用总上限；
-    - 只配了单任务上限 → 用单任务上限；
-    - 两个都配 → 用**较小**的那个。因为账本的"已占用"是累计的，
-      取较小值意味着两件事同时成立：单任务不会超它，累计也不会超它
-      —— 代价是比"允许多任务累计到总上限"更保守（**宁可少花，不可超支**）。
-    - 都没配 → `None`（不限制；此时闸门只剩次数上限与"单价缺失即拒"）。
+    - 单任务层 = 本函数（`min(总上限, 单任务上限)`，两个都没配则为 `None`）；
+    - 项目累计层 = `model.max_cost`（见 `model_limits_from_settings` 的
+      `max_cost_total`），由账本的累计口径执行。
+
+    单任务层仍然取更严的值是刻意的：`max_cost_per_task` 配得比总上限还大是
+    配置矛盾（校验会拒），取 `min` 只是不让"单任务"这一层成为总上限的漏洞。
     """
     candidates = [value for value in (model.max_cost, model.max_cost_per_task)
                   if value is not None]
@@ -127,7 +127,10 @@ def model_limits_from_settings(settings: AppSettings) -> ModelCallLimits:
     currency = str(model.currency or "").strip() or CURRENCY_UNKNOWN
     return ModelCallLimits(
         max_calls=model.max_calls,
+        # 单任务层：更严的那个（见 effective_max_cost）
         max_cost=effective_max_cost(model),
+        # 项目累计层：配置里的总上限，由账本累计口径（含 hydrate 的历史）执行
+        max_cost_total=model.max_cost,
         price_per_1k_in=unit_price_per_1k(model.price_in_per_1m),
         price_per_1k_out=unit_price_per_1k(model.price_out_per_1m),
         currency=currency,
@@ -158,11 +161,12 @@ def claim_extractor_from_settings(
 
     - `provider`：外部出口（D-054）。本模块不构造任何具体 Provider——
       用什么 Provider 由装配层上层决定，这里只要求它满足 `Provider` 协议。
-    - `ledger`：不传就新建一本**本次装配独占**的账本。P4.4-C 拍板：总上限与
-      单任务上限**暂取同一个值**（0.25 USD，见 `effective_max_cost`）；
-      "$1.00 总预算"是项目级封顶，两层独立计数列为遗留项，本轮不实现。
-    - `usage_sink`：跨轮幂等与逐笔用量的持久化出口（可选）。
-    - `task_id`：写进用量记录，便于对账。
+    - `ledger`：不传就新建一本**本次装配独占**的账本。P4.6（G11）之后，装配层
+      应当传入一本**已 hydrate 过历史**的账本（见 `assembly.build_business_stack`），
+      否则项目累计上限只会看到本次进程的支出。
+    - `usage_sink`：跨轮幂等与逐笔用量的持久化出口（建议传 `SqliteStorage`；
+      不传就只有内存账本，换个进程就不知道上一轮花过什么）。
+    - `task_id`：写进用量记录，便于对账，也用于**单任务上限**的归属判断。
     """
     return ProviderClaimExtractor(
         provider,
@@ -319,6 +323,7 @@ def model_plan(settings: AppSettings) -> dict[str, Any]:
         "max_cost_total": model.max_cost,
         "max_cost_per_task": model.max_cost_per_task,
         "max_cost_effective": limits.max_cost,
+        "max_cost_total_effective": limits.max_cost_total,
         "max_calls": limits.max_calls,
         "est_tokens_in": limits.est_tokens_in,
         "est_tokens_out": limits.est_tokens_out,
@@ -349,16 +354,15 @@ def _plan_notes(model: ModelSettings) -> list[str]:
         effective = effective_max_cost(model)
         if model.max_cost == model.max_cost_per_task:
             notes.append(
-                f"总上限与单任务上限暂取同一个值 {model.max_cost}"
-                f"（P4.4-C 拍板：先用保守的单任务上限，总预算暂用同一值）。"
-                f"既有闸门只执行一个金额上限，本装配层取更严的 {effective}；"
-                f"两层独立计数（共享账本 + 任务级计数）是遗留项，本轮未做。")
+                f"总上限与单任务上限当前都是 {model.max_cost}：两层都会被判断，"
+                f"但数值相同 ⇒ 单任务上限实际上就是累计上限（P4.6 / D-B）。"
+                f"要让'单任务 0.25、项目累计 1.00'真正分层，把 "
+                f"PERSONA_MODEL_MAX_COST 调大即可。")
         else:
             notes.append(
-                f"两个金额上限同时存在（总 {model.max_cost} / 单任务 "
-                f"{model.max_cost_per_task}）；既有闸门只执行一个，本装配层取"
-                f"更严的 {effective}。要让总上限独立生效需第二层计数，"
-                f"属新增机制，本轮未做。")
+                f"两层上限同时生效（P4.6 / D-B）：单任务 {effective}（该 task_id 累计，"
+                f"含同任务历史）、项目累计 {model.max_cost}（整本账，含 hydrate 历史）；"
+                f"任一层超限即停，不需要取更严的那个来近似。")
     if str(model.provider or "").strip() in NETWORK_MODEL_PROVIDER_NAMES:
         notes.append(
             "Provider 内部重试已**强制为 0**（max_retries=0，D3）：对按 token 计费的聊天"

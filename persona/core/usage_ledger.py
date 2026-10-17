@@ -90,12 +90,21 @@ class ModelCallLimits:
 
     三个闸门各管一件事，互不替代：
         - `max_calls`：次数上限（防"无限重试把额度打光"）；
-        - `max_cost`：金额上限（按官方单价估算后比较）；
+        - `max_cost`：**单任务**金额上限（该任务累计估算值不得超过它）；
         - `price_per_1k_*`：把 token 换成金额的唯一依据；缺它就**无法保证**不超上限。
+
+    P4.6（D-B）新增 `max_cost_total`：**项目累计封顶**。两层同时生效——
+
+    - `max_cost` 看的是"这个任务（`task_id`）累计花了多少"；
+    - `max_cost_total` 看的是"这本账（含 hydrate 读回的历史）累计花了多少"。
+
+    修复前只有一个上限参数，装配层只能取两者中更严的那个来近似"两层"，
+    于是"项目累计 1.00 USD"从来没有真正独立生效过。
     """
 
     max_calls: int | None = None          # 一次流程最多几次模型调用（None = 不限制）
-    max_cost: float | None = None         # 费用上限（None = 不限制）
+    max_cost: float | None = None         # **单任务**费用上限（None = 不限制）
+    max_cost_total: float | None = None   # **项目累计**费用上限（含历史；None = 不限制）
     price_per_1k_in: float | None = None  # 输入单价（每 1K token；官方价目表）
     price_per_1k_out: float | None = None
     currency: str = CURRENCY_UNKNOWN      # 单价的计价单位（如 CNY / USD）
@@ -254,6 +263,38 @@ def extract_key_parts(
 
 
 @dataclass
+class HydrationSummary:
+    """一次**跨进程 hydrate** 的结果（P4.6 / G11）。
+
+    存在的意义：把"这次启动到底读到了多少历史支出"变成可打印的事实，
+    而不是让"闸门为什么拦我"变成一句没有依据的话。
+    """
+
+    loaded: int = 0                      # 实际读进账本的历史笔数
+    skipped: int = 0                     # 与本次已记/已读重复，跳过
+    confirmed_cost: float = 0.0          # 历史里已确认的实际费用
+    estimated_cost: float = 0.0          # 历史里只有估算的金额
+    unknown_requests: int = 0            # 历史里费用状态未知的笔数
+    unpriced_unknown: int = 0            # 未知且**无任何估算可用**的笔数（金额无法界定）
+    occupied: float = 0.0                # 计入累计闸门的总金额（保守口径）
+    currencies: tuple[str, ...] = ()      # 历史记录里出现过的计量单位
+    already_hydrated: bool = False       # 之前已经 hydrate 过（本次不重复累加）
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "loaded": self.loaded,
+            "skipped": self.skipped,
+            "confirmed_cost": self.confirmed_cost,
+            "estimated_cost": self.estimated_cost,
+            "unknown_requests": self.unknown_requests,
+            "unpriced_unknown": self.unpriced_unknown,
+            "occupied": self.occupied,
+            "currencies": list(self.currencies),
+            "already_hydrated": self.already_hydrated,
+        }
+
+
+@dataclass
 class UsageTotals:
     """账本汇总：估算、实际、未知三者分开报。"""
 
@@ -279,6 +320,20 @@ class ExternalUsageLedger:
 
     生命周期与既有四段式闸门（D-089）对齐：
         `reserve(估算)` → 发请求 → `settle(记录)` 或 `release(仅未发出时)`
+
+    # 本次 vs 历史（G11，P4.6）
+
+    账本把记录分成**两本**，这是刻意为之，不是实现细节：
+
+    - `_records`：**本次进程**记下的笔（`records()` 只返回这些）；
+    - `_history`：`hydrate()` 从持久层读回的**历史**笔。
+
+    为什么必须分开：`_chat_calls()` 用 `records()` 数"本次调用了几次"来对
+    `max_calls` 限流。如果把历史笔混进去，昨天花过的 1 次会让今天一启动就
+    "次数已用尽"——那是一个真实的 bug，不是保守。
+
+    但**费用口径必须累计**：`occupied_cost()` 把两本加起来，所以项目级累计
+    上限（`ModelCallLimits.max_cost_total`）看到的是"历史上花过的 + 本次已经花的"。
     """
 
     def __init__(
@@ -290,8 +345,99 @@ class ExternalUsageLedger:
         self.max_unknown_requests = max_unknown_requests
         self.unknown_hold_credits = unknown_hold_credits
         self._records: dict[str, ExternalUsageRecord] = {}
+        self._history: dict[str, ExternalUsageRecord] = {}
         self._reservations: dict[str, float] = {}
         self._unknown_holds: dict[str, float] = {}
+        #: 历史笔计入累计闸门的金额（保守口径，见 `hydrate()`）
+        self._history_cost: float = 0.0
+        #: 历史里"未知且无任何估算可用"的笔数——金额无法界定，不能当 0
+        self._history_unpriced: int = 0
+        self._hydrated: bool = False
+
+    # ---------------------------------------------------------------- 跨进程
+
+    def hydrate(
+        self,
+        records: "list[ExternalUsageRecord] | tuple[ExternalUsageRecord, ...]",
+        *,
+        unknown_fallback_cost: float | None = None,
+    ) -> HydrationSummary:
+        """把**历史笔**读进账本，让累计闸门在重启后仍然成立（G11）。
+
+        计入口径（D-C：宁可保守）：
+
+        1. `cost_confirmed` 有值 → 用实际值（历史确认过的就是事实）；
+        2. 只有 `cost_estimate` → 用估算值，并与 `unknown_fallback_cost`（装配层
+           按当前单价算出的一次调用估算）取**较大者**——因为估算填低了会让累计
+           闸门少算，而少算是唯一不可接受的误差方向；
+        3. 状态 `UNKNOWN` 且两个值都没有 → 用 `unknown_fallback_cost`；
+           若连它也没有 → 记进 `unpriced_unknown`，金额按 0 累加但**单独计数**，
+           由发送前的闸门决定是否停手（见 `ProviderClaimExtractor._budget_block`）。
+           绝不把它静默当成"没花钱"（D-060）；
+        4. `NOT_CHARGED` → 0（账户被明确告知没有产生费用）。
+
+        幂等：同一个 `idempotency_key` 只读一次；重复调用本方法不会重复累加
+        （返回的 `HydrationSummary.already_hydrated=True`）。
+        """
+        if self._hydrated:
+            return HydrationSummary(already_hydrated=True,
+                                    occupied=self._history_cost,
+                                    unpriced_unknown=self._history_unpriced)
+        summary = HydrationSummary()
+        fallback = (float(unknown_fallback_cost)
+                    if unknown_fallback_cost is not None else None)
+        currencies: set[str] = set()
+        for record in records or []:
+            key = str(record.idempotency_key or "")
+            if not key or key in self._history or key in self._records:
+                summary.skipped += 1
+                continue
+            self._history[key] = record
+            summary.loaded += 1
+            if record.currency:
+                currencies.add(str(record.currency))
+            if record.cost_status == COST_UNKNOWN:
+                summary.unknown_requests += 1
+
+            cost: float
+            if record.cost_confirmed is not None:
+                cost = float(record.cost_confirmed)
+                summary.confirmed_cost += cost
+            elif record.cost_estimate is not None:
+                candidates = [float(record.cost_estimate)]
+                if fallback is not None:
+                    candidates.append(fallback)
+                cost = max(candidates)
+                summary.estimated_cost += float(record.cost_estimate)
+            elif record.cost_status == COST_UNKNOWN:
+                if fallback is not None:
+                    cost = fallback
+                else:
+                    cost = 0.0
+                    summary.unpriced_unknown += 1
+                    self._history_unpriced += 1
+            elif record.cost_status == COST_NOT_CHARGED:
+                cost = 0.0
+            else:
+                cost = 0.0                       # 既无金额也非未知：按 0（不猜）
+            self._history_cost += cost
+        summary.occupied = self._history_cost
+        summary.unpriced_unknown = self._history_unpriced
+        summary.currencies = tuple(sorted(currencies))
+        self._hydrated = True
+        return summary
+
+    def historical_records(self) -> list[ExternalUsageRecord]:
+        """历史笔（不含本次进程记下的）。"""
+        return list(self._history.values())
+
+    def unpriced_unknown_requests(self) -> int:
+        """历史里"未知且无估算"的笔数：金额无法界定，闸门必须据此停手。"""
+        return self._history_unpriced
+
+    def history_cost(self) -> float:
+        """历史笔按保守口径计入的金额。"""
+        return self._history_cost
 
     # ---------------------------------------------------------------- 预留
 
@@ -364,11 +510,15 @@ class ExternalUsageLedger:
         覆盖三种状态：已结算（`_records`）、费用未知占位（`_unknown_holds`）、
         预留中（`_reservations`）——后两者说明这笔已经花过（或正在花），
         同样不能重发。
+
+        G11：还覆盖 `hydrate()` 读回的历史笔——否则换个进程重跑，同一请求
+        会再花一次钱，而内存账本是空的。
         """
         return (key in self._records or key in self._unknown_holds
-                or key in self._reservations)
+                or key in self._reservations or key in self._history)
 
     def totals(self) -> UsageTotals:
+        """**本次进程**的汇总（不含历史笔；历史见 `history_cost()`）。"""
         t = UsageTotals()
         for r in self._records.values():
             t.requests += 1
@@ -384,9 +534,50 @@ class ExternalUsageLedger:
         t.unknown_hold_cost = sum(self._unknown_holds.values())
         return t
 
+    def _charged_cost(self, record: ExternalUsageRecord) -> float:
+        """单笔记录在当前账本里"占用了多少额度"。
+
+        与实际/估算的优先级一致：实际 > 估算 > 未知占位 > 0。
+        """
+        if record.cost_confirmed is not None:
+            return float(record.cost_confirmed)
+        if record.cost_estimate is not None:
+            return float(record.cost_estimate)
+        if record.cost_status == COST_UNKNOWN:
+            return float(self._unknown_holds.get(record.idempotency_key, 0.0))
+        return 0.0
+
     def occupied_cost(self) -> float:
-        """当前已被占用的成本（实际 + 预留 + 未知占位），用于请求前的保守判断。"""
+        """**累计**已占用成本（历史 + 本次实际 + 预留 + 未知占位）。
+
+        这是项目级累计闸门（`max_cost_total`）看到的那个数：它回答的是
+        "这个库从头到现在已经花掉（或必须预留）多少"，不是"本次花了多少"。
+        """
+        return self.totals().accountable_cost() + self._history_cost
+
+    def session_occupied_cost(self) -> float:
+        """**本次进程**已占用成本（不含历史笔）；单任务上限用它。"""
         return self.totals().accountable_cost()
+
+    def occupied_cost_for_task(self, task_id: str | None) -> float:
+        """某个任务累计占用的成本（含该任务的历史笔）。
+
+        `task_id` 为空 → 退化为 `occupied_cost()`（无法归属时按最保守口径）。
+        单任务上限（`max_cost`）用这个数：它限定的是"这个任务能花多少"，
+        不是"这本账能花多少"。
+        """
+        wanted = str(task_id or "")
+        if not wanted:
+            return self.occupied_cost()
+        total = 0.0
+        for store in (self._history, self._records):
+            for record in store.values():
+                if str(record.task_id or "") != wanted:
+                    continue
+                total += self._charged_cost(record)
+        # 预留没有 task 归属（本进程内只有一个任务在花），计入本次的单任务口径
+        total += sum(self._reservations.values())
+        return total
 
     # ---------------------------------------------------------------- 闸门
 
@@ -400,12 +591,17 @@ class ExternalUsageLedger:
         """保守策略：**宁可停手，不可透支**。
 
         两种停手：
-        1. 会超成本上限；
-        2. 未知费用的请求累计达到上限 → 费用状态不明，停下来等人工核对。
+        1. 会超成本上限（累计口径）；
+        2. 本次进程里未知费用的请求累计达到上限 → 费用状态不明，停下来等人工核对。
+
+        ⚠️ 第 2 条**只数本次进程的未知笔**：历史未知已经按保守金额计入
+        `occupied_cost()`（见 `hydrate()`），不需要让闸门**永久**关闭——
+        否则一条历史未知记录会让这本账再也无法使用，而 `confirm()` 只作用于
+        内存，永远补不上。历史未知的责任落在"金额按上限估"，不是"永久停机"。
         """
         totals = self.totals()
-        if max_cost is not None and (totals.accountable_cost() + need) > max_cost:
-            return True, f"费用上限：已占用 {totals.accountable_cost():.2f} + 本次 {need:.2f}"
+        if max_cost is not None and (self.occupied_cost() + need) > max_cost:
+            return True, f"费用上限：已占用 {self.occupied_cost():.2f} + 本次 {need:.2f}"
         if totals.unknown_requests >= self.max_unknown_requests:
             return True, (f"存在 {totals.unknown_requests} 笔费用状态未知的请求"
                           f"（上限 {self.max_unknown_requests}），需人工核对后再继续")

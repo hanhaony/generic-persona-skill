@@ -755,12 +755,15 @@ class ProviderClaimExtractor:
                    if record.operation == OP_CHAT)
 
     def _budget_block(self, ctx: CallContext, key: str) -> "Err | None":
-        """**发送之前**的闸门（P4.4-A 第五步）。
+        """**发送之前**的闸门（P4.4-A 第五步；P4.6 / G11 扩成两层）。
 
-        三条规矩：
+        四条规矩：
           1. 次数上限用满 → 停手；
-          2. 设了费用上限但**单价未知** → 无法估算 → **不自动发起请求**；
-          3. 估算会超上限 / 账本已被未知费用占满 → 停手等人工。
+          2. 设了费用上限（任一层）但**单价未知** → 无法估算 → **不自动发起请求**；
+          3. **单任务**上限（`max_cost`）：该 `task_id` 的累计（含同任务历史）超限 → 停；
+          4. **项目累计**上限（`max_cost_total`）：整本账（含 hydrate 读回的历史）超限 → 停；
+             若历史里存在"未知且无任何估算"的笔数，金额无法界定 → 同样停手
+             （D-060：不知道不等于零）。
 
         返回 `Err(BUDGET_EXCEEDED)` 是**可恢复的暂停信号**（D-089），不是"跳过继续"。
         """
@@ -773,28 +776,53 @@ class ProviderClaimExtractor:
                 f"模型调用次数已达上限 {limits.max_calls}：不再自动发起请求",
                 trace_ref=ctx.trace_ref))
         estimate = estimate_model_cost(limits)
-        if limits.max_cost is not None:
-            if estimate is None:
-                return Err(new_error(
-                    ErrorCode.BUDGET_EXCEEDED,
-                    "未配置模型单价（price_per_1k_*），无法估算费用；"
-                    "在设了费用上限的情况下不能保证不超支 → 不自动发起请求"
-                    "（费用未知不等于零）",
-                    trace_ref=ctx.trace_ref))
-            if self.ledger is not None and self.ledger.would_exceed(
-                    limits.max_cost, estimate):
-                return Err(new_error(
-                    ErrorCode.BUDGET_EXCEEDED,
-                    f"模型费用上限：已占用 {self.ledger.occupied_cost():.4f}"
-                    f"{limits.currency} + 本次估算 {estimate:.4f} 超过 {limits.max_cost}",
-                    trace_ref=ctx.trace_ref))
-        if self.ledger is not None:
-            pause, why = self.ledger.should_pause(limits.max_cost)
+        has_cost_cap = (limits.max_cost is not None
+                        or limits.max_cost_total is not None)
+        if has_cost_cap and estimate is None:
+            return Err(new_error(
+                ErrorCode.BUDGET_EXCEEDED,
+                "未配置模型单价（price_per_1k_*），无法估算费用；"
+                "在设了费用上限的情况下不能保证不超支 → 不自动发起请求"
+                "（费用未知不等于零）",
+                trace_ref=ctx.trace_ref))
+        ledger = self.ledger
+        if ledger is not None and estimate is not None:
+            # ① 单任务上限：这个任务累计（含同任务历史）不能超
+            if limits.max_cost is not None:
+                task_cost = ledger.occupied_cost_for_task(self.task_id)
+                if task_cost + estimate > limits.max_cost:
+                    return Err(new_error(
+                        ErrorCode.BUDGET_EXCEEDED,
+                        f"单任务费用上限：该任务已占用 {task_cost:.4f}"
+                        f"{limits.currency} + 本次估算 {estimate:.4f}"
+                        f" 超过 {limits.max_cost}",
+                        trace_ref=ctx.trace_ref))
+            # ② 项目累计上限：整本账（含历史）不能超
+            if limits.max_cost_total is not None:
+                if ledger.unpriced_unknown_requests() > 0:
+                    return Err(new_error(
+                        ErrorCode.BUDGET_EXCEEDED,
+                        f"项目累计费用上限已设，但账本里有 "
+                        f"{ledger.unpriced_unknown_requests()} 笔历史费用状态未知、"
+                        "且没有任何估算可用——金额无法界定，不能保证不超累计上限 "
+                        f"{limits.max_cost_total}（费用未知不等于零）",
+                        trace_ref=ctx.trace_ref))
+                total = ledger.occupied_cost()
+                if total + estimate > limits.max_cost_total:
+                    return Err(new_error(
+                        ErrorCode.BUDGET_EXCEEDED,
+                        f"项目累计费用上限：账本已占用 {total:.4f}"
+                        f"{limits.currency}（含历史）+ 本次估算 {estimate:.4f}"
+                        f" 超过 {limits.max_cost_total}",
+                        trace_ref=ctx.trace_ref))
+        if ledger is not None:
+            # 只判"本次进程的未知笔数"；费用上限已在上面分层判过
+            pause, why = ledger.should_pause()
             if pause:
                 return Err(new_error(
                     ErrorCode.BUDGET_EXCEEDED, f"模型调用暂停：{why}",
                     trace_ref=ctx.trace_ref))
-            self.ledger.reserve(key, estimate)
+            ledger.reserve(key, estimate)
         return None
 
     def _settle(self, ctx: CallContext, key: str, *, outcome_kind: str,

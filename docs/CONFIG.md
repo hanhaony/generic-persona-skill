@@ -219,8 +219,8 @@ settings = test_settings(data_dir="/tmp/x")      # 覆盖单项
 | `PERSONA_MODEL_PRICE_OUT_PER_1M` | `model.price_out_per_1m` | 数字 | 空 | 输出单价（同上） |
 | `PERSONA_MODEL_PRICE_SOURCE` | `model.price_source` | 字符串 | 空 | 单价来源（官方价目表地址） |
 | `PERSONA_MODEL_PRICE_CHECKED_AT` | `model.price_checked_at` | 字符串 | 空 | 单价核对日期 |
-| `PERSONA_MODEL_MAX_COST` | `model.max_cost` | 数字 | 空 | 本轮/本账本的总额上限（原币） |
-| `PERSONA_MODEL_MAX_COST_PER_TASK` | `model.max_cost_per_task` | 数字 | 空 | 单任务上限（原币） |
+| `PERSONA_MODEL_MAX_COST` | `model.max_cost` | 数字 | 空 | **项目累计**上限（原币；含从库里 hydrate 的历史支出，P4.6 / D-B） |
+| `PERSONA_MODEL_MAX_COST_PER_TASK` | `model.max_cost_per_task` | 数字 | 空 | **单任务**上限（原币；按 `task_id` 累计，含同任务历史） |
 | `PERSONA_MODEL_MAX_CALLS` | `model.max_calls` | 整数 | 空 | 一条流程最多几次模型调用 |
 | `PERSONA_MODEL_EST_TOKENS_IN` | `model.est_tokens_in` | 整数 | `0` | 事前估算输入 token（只用于**预留**） |
 | `PERSONA_MODEL_EST_TOKENS_OUT` | `model.est_tokens_out` | 整数 | `0` | 事前估算输出 token |
@@ -243,15 +243,36 @@ settings = test_settings(data_dir="/tmp/x")      # 覆盖单项
   → 拒绝加载。检索摘要天生没有正文门禁结论，这个组合会让**材料永远进不了抽取器、
   模型一次都不会被调用**，而运行日志看起来像"业务流程正常跑完了"。
 
-### 11.5.2 金额闸门只执行**一个**上限（**已知缺口，已登记**）
+### 11.5.2 金额闸门**两层**（P4.6 / D-B：缺口已闭合）
 
-`ExternalUsageLedger` 的金额判断只有**一个**上限参数，所以当"总上限"与"单任务上限"
-同时配置时，装配层（`persona/orchestrator/model_setup.py` 的 `effective_max_cost()`）
-取**更严的那个**——两个上限都不会被突破，代价是比"允许多任务累计到总上限"更保守。
+修复前金额判断只有**一个**上限参数，装配层只能取 `min(总上限, 单任务上限)` 近似，
+于是"项目累计封顶"从未独立生效。
 
-P4.4-C 拍板：**两个上限暂取同一个值**（0.25 USD），项目级 $1.00 封顶仍然成立
-（一次冒烟远达不到）。要让**总上限**独立生效（多任务累计到 1.00 而不是卡在 0.25），
-需要"共享账本 + 任务级计数"两层机制，属**新增机制**，列为遗留项，本轮未做。
+P4.6 之后是两层，各算各的：
+
+| 层 | 配置 | 计数口径 | 参数 |
+| --- | --- | --- | --- |
+| 单任务 | `model.max_cost_per_task` | 该 `task_id` 的累计（含同任务历史） | `ModelCallLimits.max_cost` |
+| 项目累计 | `model.max_cost` | 整本账（含启动时 hydrate 读回的历史） | `ModelCallLimits.max_cost_total` |
+
+任一层超限 = 发送前 `BUDGET_EXCEEDED`（0 次调用）。历史里"未知且无任何估算"的笔数
+会让闸门直接停手（金额无法界定，**不能当 0**，D-060）。
+
+`effective_max_cost()` 保留下来表示"单任务层生效值"（仍然是两个配置的更严者），
+因为配置校验要求 `单任务 ≤ 总上限`，取 `min` 只是为了不让单任务层成为累计层的漏洞。
+
+---
+
+## 11.5.3 关系研判配置（`relationship.*`，P4.6 / D-D）
+
+| 环境变量 | 字段 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- |
+| `PERSONA_RELATIONSHIP_ANALYZER` | `relationship.analyzer` | 枚举 | `rule` | `rule` = 装配离线规则分析器（确定性、零成本、条目全部可追溯到已登记证据）；`off` = 不装配，关系阶段走兜底 |
+
+关闭的影响只在"是否装配分析器"：`perspectives` / `feeling_toward` /
+`interaction_patterns` 会留空并记 `open_questions`（**不臆造**），
+`shared_experiences` 仍由兜底路径产出。分析器运行期返回 `Err` 时按 D-E
+**降级到兜底并留 `RELATION_ANALYZER_DEGRADED` 告警**，不整体失败。
 
 ---
 

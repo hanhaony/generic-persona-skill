@@ -8,6 +8,20 @@ P1.2-B：只有状态机与检查点的数据结构。
 没有真实的研究/蒸馏/对话单元。它管的是"任务这门账"，不是"业务这份活"。
 """
 
+from .assembly import (
+    WARNING_STACK_ANALYZER_DISABLED,
+    WARNING_STACK_CHAT_PROVIDER_UNAVAILABLE,
+    WARNING_STACK_EXTRACTOR_ABSENT,
+    WARNING_STACK_LEDGER_HYDRATION_FAILED,
+    WARNING_STACK_LEDGER_NOT_HYDRATED,
+    WARNING_STACK_SEARCH_OFFLINE,
+    BusinessStack,
+    StackOptions,
+    TargetSpec,
+    build_business_stack,
+    register_targets,
+    work_id_for,
+)
 from .budget import (
     NEAR_LIMIT_RATIO,
     WARNING_BUDGET_NEAR_LIMIT,
@@ -110,6 +124,19 @@ __all__ = [
     # 业务编排器（H-10A）
     "BusinessOrchestrator",
     "BusinessDeps",
+    # 业务链装配层（P4.6 / P0-1）
+    "build_business_stack",
+    "BusinessStack",
+    "StackOptions",
+    "TargetSpec",
+    "register_targets",
+    "work_id_for",
+    "WARNING_STACK_LEDGER_NOT_HYDRATED",
+    "WARNING_STACK_LEDGER_HYDRATION_FAILED",
+    "WARNING_STACK_SEARCH_OFFLINE",
+    "WARNING_STACK_EXTRACTOR_ABSENT",
+    "WARNING_STACK_CHAT_PROVIDER_UNAVAILABLE",
+    "WARNING_STACK_ANALYZER_DISABLED",
     "BusinessRequest",
     "BusinessRunResult",
     "BusinessStepResult",

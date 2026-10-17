@@ -447,8 +447,10 @@ class TestLimitsMapping(unittest.TestCase):
         self.assertEqual(plan["max_cost_total"], 0.25)
         self.assertEqual(plan["max_cost_per_task"], 0.25)
         self.assertEqual(plan["max_cost_effective"], 0.25)
-        # 两个上限同时存在（哪怕相等）也必须把"只执行一个"说在明面上
-        self.assertTrue(any("暂取同一个值" in note for note in plan["notes"]))
+        # P4.6 / D-B：两层上限**真的**各算各的（不再是"只执行一个、取更严的近似"），
+        # 所以说明文字必须讲"两层都会被判断"，而不是旧的"暂取同一个值"。
+        self.assertEqual(plan["max_cost_total_effective"], 0.25)
+        self.assertTrue(any("两层都会被判断" in note for note in plan["notes"]))
 
 
 # ==========================================================================

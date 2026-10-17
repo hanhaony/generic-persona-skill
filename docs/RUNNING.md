@@ -92,6 +92,8 @@ python -m persona selftest     # 临时库 + Mock Provider 冒烟（退出码 0�
 | `python -m persona config show` | 打印生效的配置与来源（**永不显示密钥值**） | 0 / 1 |
 | `python -m persona config show --no-dotenv` | 同上，但忽略 `.env` 文件 | 0 / 1 |
 | `python -m persona config check` | 只做配置校验：通过 0，不通过 1 | 0 / 1 |
+| `python -m persona business plan [--analyzer rule\|off]` | **装配快照**：组件、两层上限、账本历史占用、装配告警（离线、零调用） | 0 / 1 |
+| `python -m persona business run --names A,B --work-title … --adaptation-version …` | 跑一次五阶段业务链；**未配置模型 Provider 时拒绝且零调用** | 0 / 1 / **2** |
 | `python -m persona task create --project X --stages A,B [--key K] [--budget-requests N]` | 建一个 `PENDING` 任务（不自动开跑） | 0 / 1 |
 | `python -m persona task show <task_id> --project X` | 看状态、阶段、进度、预算、检查点摘要 | 0 / 1 |
 | `python -m persona task list --project X` | 列出该项目下的任务 | 0 / 1 |
@@ -885,6 +887,21 @@ RelationshipService.create_relationship / revise
 
 **登记日期**：2026-10-17（P4.5-B C 轮，用户要求显式登记）
 
+> **状态更新（2026-10-17，P4.6 / P0-2）：本缺口已闭合。**
+>
+> - `ExternalUsageLedger.hydrate()` 从 `external_usage_records` 读回历史笔，
+>   按"实际 > 估算（与本次估算取大）> 未知占位"保守计入累计；
+> - 装配层 `persona/orchestrator/assembly.py` 在启动时执行 hydrate，并把
+>   `SqliteStorage` 同时接到 `usage_sink`（此前 e2e 从未传，C 轮 0.0032838 USD
+>   **没有落进任何库**）；
+> - 闸门现在是**两层**：单任务（`max_cost`，按 `task_id` 累计）与
+>   项目累计（`max_cost_total`，整本账，含 hydrate 读回的历史），任一层超限即停；
+> - 历史里"未知且无任何估算"的笔数 → 直接停手（金额无法界定，不能当 0）。
+>
+> 下面的"事实 / 影响"两节**保留为登记当时的真实状态**（不删史）；
+> 人工累计规则仍适用于"尚未落库的历史旧花费"：
+> `0.0012765（P4.5-A）+ 0.0032838（P4.5-B C 轮）= 0.0045603 USD`。
+
 ### 事实（代码级）
 
 `ExternalUsageLedger`（`persona/core/usage_ledger.py`）是**纯内存**对象：没有落盘、
@@ -949,3 +966,4 @@ RelationshipService.create_relationship / revise
 | 2026-10-14 | v0.15 | H-10A（业务编排型 Orchestrator，用户称 H-10A，编号差异见 DECISIONS Q-37 第九轮 / §2.24）：新增 `persona/orchestrator/business.py`（**`BusinessOrchestrator`**，实现 `UnitHandler` 接入既有 `TaskRunner`，打通 Research → Evidence → Persona → Relationship → Dialogue）；既有任务 Orchestrator 一行未改；新增 `tests/test_business_orchestrator.py`（37 项）；测试数 611 → **648**（3.13.14 / 3.14.7 实测全过）；新增 §5.12（调用链 / 调用方式 / 结果三态 / AC-1·AC-2 核对 / 遗留 G-1~G-5 / 已知限制）；`INTERFACES §12.7` 登记契约（v0.1.5） | 已实现，**待人工验收** |
 | 2026-10-14 | v0.14 | H-11A（Research 最小可运行实现，用户称 H-11A，编号差异见 DECISIONS Q-37 第八轮 / §2.23）：`persona/modules/research.py` 由 Protocol-only 推进为 **`ResearchService`**（确定性检索计划 / 经 Provider.search 检索 / 过滤排序 / 经 Evidence 登记 / run 聚合），新增独立 **`SourceRegistrarPort`（仅 `register_source`，堵死 F-10）**与 `ResearchDeps`；新增 `tests/test_research_module.py`（48 项）；测试数 563 → **611**（3.13.14 / 3.14.7 实测全过）；新增 §5.11（交付 / 调用方式与 IO / 与 Evidence 衔接 / 追溯与隔离 / 契约取舍 / 遗留 H-14~H-17 / 接真实研究服务的条件）；`INTERFACES §5.3` 回填实现状态（v0.1.4） | 已实现，**待人工验收** |
 | 2026-10-17 | v0.18 | 新增 §5.15：**G11 登记**——`ExternalUsageLedger` 纯内存、无落盘，**跨进程累计费用闸门不成立**；明确 0.25 USD 是"每次进程"上限而非累计上限；给出 C 轮之后的人工累计记账规则（不重置、新累计 = 上轮累计 + 本轮 `cost_confirmed`、基线 0.0012765 USD、未确认笔数按估算值计入并标注）；声明系统级累计闸门**另立轮次**、不混进冒烟 | 待确认 |
+| 2026-10-17 | v0.19 | **P4.6 三项落地**：① `persona/orchestrator/assembly.py`（composition root：`build_business_stack` / `register_targets`），CLI 新增 `persona business plan|run`（业务链进 CLI，D-A）；② G11 闭合——账本 `hydrate()` + `usage_sink` 接线 + **两层上限**（单任务 `max_cost` / 项目累计 `max_cost_total`，D-B/D-C）；③ 关系分析器默认装配（D-D）且失败**降级**留告警（D-E），新增配置 `PERSONA_RELATIONSHIP_ANALYZER=rule|off`。新增 `tests/test_p4_6_assembly_ledger.py`（32 项）与分析器降级用例（2 项） | 待确认 |

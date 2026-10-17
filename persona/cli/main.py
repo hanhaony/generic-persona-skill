@@ -68,6 +68,35 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-dotenv", action="store_true", help="忽略 .env 文件，只看默认值与环境变量",
     )
 
+    p_biz = sub.add_parser(
+        "business", help="业务链（研究→证据→人物→关系→对话）的装配与运行")
+    bsub = p_biz.add_subparsers(dest="business_action", metavar="{plan,run}")
+
+    b_plan = bsub.add_parser(
+        "plan", help="打印业务链装配快照（**离线**：不联网、不调模型、不花钱）")
+    b_plan.add_argument(
+        "--no-dotenv", action="store_true", help="忽略 .env 文件，只看默认值与环境变量")
+    b_plan.add_argument(
+        "--analyzer", choices=("rule", "off"), default=None,
+        help="覆盖 relationship.analyzer 配置（默认跟随配置，即 rule）")
+
+    b_run = bsub.add_parser(
+        "run", help="跑一次五阶段业务链（需要已配置模型 Provider；未配置会**拒绝**且零调用）")
+    b_run.add_argument("--names", required=True, help="人物名，逗号分隔（1 个或更多）")
+    b_run.add_argument(
+        "--type", dest="entity_type", default="FICTIONAL_CHARACTER",
+        choices=("FICTIONAL_CHARACTER", "REAL_PERSON"),
+        help="人物类型（默认 FICTIONAL_CHARACTER；虚构角色必须给作品与适用版本）")
+    b_run.add_argument("--work-title", default="", help="虚构角色所属作品名（--type 虚构时必填）")
+    b_run.add_argument("--adaptation-version", default="",
+                       help="虚构角色的适用版本（--type 虚构时必填，如『2020 动画改编版』）")
+    b_run.add_argument("--project", default="prj_local", help="项目 ID（默认 prj_local）")
+    b_run.add_argument("--task-id", default="", help="任务 ID（留空自动生成）")
+    b_run.add_argument("--max-rounds", type=int, default=1, help="对话轮数（默认 1）")
+    b_run.add_argument("--no-dotenv", action="store_true", help="忽略 .env 文件")
+    b_run.add_argument("--analyzer", choices=("rule", "off"), default=None,
+                       help="覆盖 relationship.analyzer 配置")
+
     p_task = sub.add_parser("task", help="任务生命周期（创建 / 查询 / 推进 / 暂停 / 恢复 / 取消）")
     tsub = p_task.add_subparsers(dest="task_action", metavar="{create,show,list,...}")
 
@@ -409,6 +438,166 @@ def _print_model_plan(plan: dict, key_env: str, *, compact: bool = False) -> Non
         print(f"  注意            : {note}")
 
 
+def _run_business_action(args: Any) -> int:
+    """`persona business plan|run`（P4.6 / D-A：业务链进 CLI）。
+
+    两条命令**都经同一个装配层**（`build_business_stack`），CLI 自己不构造业务服务——
+    否则 CLI 就成了第二份 composition root，正是 G4 那类"脚本代劳掩盖缺陷"。
+    """
+    action = getattr(args, "business_action", "")
+    settings = _load_settings_or_report(
+        use_dotenv=not getattr(args, "no_dotenv", False))
+    if settings is None:
+        return 1
+
+    from ..core.context import new_call_context
+    from ..core.result import error_of, is_ok, unwrap
+    from ..orchestrator import StackOptions, build_business_stack
+    from ..storage.sqlite import SqliteStorage
+
+    project = getattr(args, "project", "prj_local")
+    task_id = getattr(args, "task_id", "") or None
+    analyzer = getattr(args, "analyzer", None)
+    storage = SqliteStorage(settings.ensure_data_dir())
+    ctx = new_call_context(project_id=project, actor="cli", task_id=task_id)
+    try:
+        built = build_business_stack(
+            settings, ctx,
+            storage=storage,
+            options=StackOptions(
+                task_id=task_id,
+                # `run` 才按配置构造真实 Provider（只构造、不发请求）；
+                # `plan` 必须保持"什么都不建"，否则快照命令也可能踩到密钥/网络配置。
+                build_chat_provider=(action == "run"),
+                enable_relationship_analyzer=(None if analyzer is None
+                                              else analyzer == "rule"),
+            ),
+        )
+        if not is_ok(built):
+            print(f"装配失败：{error_of(built)}")
+            return 1
+        stack = unwrap(built)
+        if action == "plan":
+            return _print_business_plan(stack)
+        return _run_business_chain(stack, args)
+    finally:
+        storage.close()
+
+
+def _print_business_plan(stack: Any) -> int:
+    """打印装配快照。**全程离线：不联网、不调模型、不记账。**"""
+    facts = stack.describe()
+    components = facts["components"]
+    model = facts["model"]
+    ledger = facts["ledger"]
+
+    print("业务链装配快照（**离线**：不联网、不调模型、不产生费用）")
+    print(f"  数据库          : {stack.settings.database_path()}")
+    print(f"  项目 / 任务     : {stack.ctx.project_id} / {stack.ctx.task_id or '—'}")
+    print("  组件            :")
+    for key in ("evidence", "persona", "relationship", "dialogue", "research",
+                "task_service"):
+        print(f"    {key:<14}: {components.get(key)}")
+    extractor = components.get("claim_extractor")
+    print(f"  claim 抽取器    : {extractor or '未装配（未配置模型 Provider）'}")
+    print(f"  关系分析器      : {components.get('relationship_analyzer') or '未装配'}")
+
+    def money(value: Any) -> str:
+        return "不限制" if value is None else f"{value} {model['currency']}"
+
+    print(f"  单任务费用上限  : {money(model['max_cost_per_task'])}"
+          f"（按 task_id 累计，含同任务历史）")
+    print(f"  项目累计上限    : {money(model['max_cost_total'])}"
+          f"（整本账累计，含 hydrate 读回的历史）")
+    print(f"  调用次数上限    : {model['max_calls'] if model['max_calls'] is not None else '不限制'}")
+    per_call = model["est_cost_per_call"]
+    currency = model["currency"]
+    if per_call is None:
+        print("  单次调用估算    : 估不出来（缺单价或 token 估算）")
+    else:
+        print(f"  单次调用估算    : {per_call:.6f} {currency}")
+
+    history = ledger.get("history") or {}
+    if ledger.get("hydrated"):
+        print(f"  账本（历史）    : 已读 {history.get('loaded', 0)} 笔，"
+              f"占用 {ledger.get('occupied_total', 0.0):.6f} {model['currency']}"
+              f"（未知 {history.get('unknown_requests', 0)} 笔、"
+              f"无法估算 {ledger.get('unpriced_unknown', 0)} 笔）")
+    else:
+        print("  账本（历史）    : 未 hydrate（项目累计上限只统计本次进程）")
+    print(f"  账本（本次）    : 占用 {ledger.get('occupied_session', 0.0):.6f}"
+          f" {model['currency']}")
+    if ledger.get("currency_invariant") == "MIXED":
+        print("  ⚠️ 计量单位混用 : 历史记录里出现多种 currency，累计比较的前提不成立")
+    codes = facts.get("warnings") or []
+    print(f"  装配告警        : {', '.join(codes) if codes else '无'}")
+    print("说明：本命令不发起任何外部请求；真实运行（含检索与模型调用）需另行授权。")
+    return EXIT_OK
+
+
+def _run_business_chain(stack: Any, args: Any) -> int:
+    """跑一次五阶段业务链。**未配置抽取器时在发请求之前拒绝**（不白花钱）。"""
+    from ..core.result import error_of, is_ok, unwrap
+    from ..orchestrator import BusinessRequest, TargetSpec, register_targets
+
+    names = [str(n).strip() for n in str(getattr(args, "names", "")).split(",")]
+    names = [n for n in names if n]
+    if not names:
+        print("缺少 --names：至少给一个人物名（逗号分隔）")
+        return 1
+
+    entity_type = str(getattr(args, "entity_type", "FICTIONAL_CHARACTER"))
+    work_title = str(getattr(args, "work_title", "") or "").strip()
+    adaptation = str(getattr(args, "adaptation_version", "") or "").strip()
+    if entity_type == "FICTIONAL_CHARACTER" and not (work_title and adaptation):
+        print("虚构角色必须声明所属作品与适用版本（PF-V5 / D-115）：")
+        print("  请补 --work-title 与 --adaptation-version；或改用 --type REAL_PERSON")
+        return 1
+
+    if stack.claim_extractor is None:
+        print("拒绝运行：没有可用的 claim 抽取器。")
+        for note in getattr(stack, "warnings", []):
+            if note.code in ("CHAT_PROVIDER_UNAVAILABLE", "EXTRACTOR_ABSENT"):
+                print(f"  装配告警：{note.message}")
+        print("  原因：未配置模型 Provider（PERSONA_MODEL_PROVIDER）或未设置密钥。")
+        print("  影响：研究材料不会变成候选 claim，跑下去只会产生空档案（等于白跑）。")
+        print("  建议：先 `persona business plan` 看装配快照；"
+              "配置模型后用 `persona model plan` 复核单价与上限。")
+        print("  说明：本次**没有发起任何请求，也没有产生费用**（真实调用需单独授权）。")
+        return EXIT_NOT_IMPLEMENTED
+
+    specs = [
+        TargetSpec(display_name=name, entity_type=entity_type,
+                   work_title=work_title, adaptation_version=adaptation)
+        for name in dict.fromkeys(names)          # 去重且保序
+    ]
+    registered = register_targets(stack.storage, stack.ctx, specs)
+    if not is_ok(registered):
+        print(f"登记人物失败：{error_of(registered)}")
+        return 1
+    targets = unwrap(registered)
+
+    print(f"业务链开跑：{len(targets)} 名目标（{entity_type}）")
+    result = stack.orchestrator.run(
+        stack.ctx, BusinessRequest(targets=targets,
+                                   max_rounds=int(getattr(args, "max_rounds", 1) or 1)))
+    if not is_ok(result):
+        print(f"运行失败：{error_of(result)}")
+        return 1
+    run = unwrap(result)
+    print(f"  结论            : {run.status}（任务 {run.task_id} / {run.task_status}）")
+    for step in run.steps:
+        print(f"  - {step.name:<22}{step.status:<16}{step.message}")
+        for note in step.warnings:
+            print(f"      ⚠️ [{note.code}] {note.message}")
+    print(f"  来源 / 证据     : {len(run.source_ids)} / {len(run.evidence_ids)}")
+    print(f"  人物 / 关系档案 : {len(run.persona_profile_ids)} / "
+          f"{len(run.relationship_profile_ids)}")
+    if run.error is not None:
+        print(f"  错误            : [{run.error.code}] {run.error.message}")
+    return EXIT_OK if run.is_complete() else 1
+
+
 def _open_task_service(project_id: str) -> tuple[Any, Any] | None:
     """打开任务服务。**失败返回 None 并已打印原因**（不抛异常给命令层）。"""
     from ..core.result import error_of, is_ok, unwrap
@@ -592,6 +781,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             getattr(args, "action", "plan"),
             use_dotenv=not getattr(args, "no_dotenv", False),
         )
+    if args.command == "business":
+        if not getattr(args, "business_action", ""):
+            try:
+                build_parser().parse_args(["business", "--help"])
+            except SystemExit:
+                pass
+            return EXIT_OK
+        return _run_business_action(args)
     if args.command == "task":
         if not getattr(args, "task_action", ""):
             # 没有子动作时打印 task 的帮助（argparse 的 --help 会走 SystemExit）
@@ -616,7 +813,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(f"命令 `persona {args.command}` 尚未实现。")
     print(f"当前阶段：{STAGE}")
-    print("可用命令：persona info / persona selftest / persona config / persona model / persona task")
+    print("可用命令：persona info / persona selftest / persona config / persona model / "
+          "persona business / persona task")
     return EXIT_NOT_IMPLEMENTED
 
 
