@@ -57,6 +57,8 @@ from ..storage.sqlite import SqliteStorage
 
 WARNING_PROFILE_SUPERSEDED = "PROFILE_SUPERSEDED"    # 修订产生新版本，旧版已归档
 WARNING_CONFLICT_LINKED = "CONFLICT_LINKED"          # 档案关联了冲突（未裁决）
+# G7（A 级写风险）：本次修订**产出为空**，已拦下、旧版保留（不降级覆盖）
+WARNING_PROFILE_DEGRADED_SKIPPED = "PROFILE_DEGRADED_SKIPPED"
 
 # 档案的六个板块（DATA_MODEL §4.7；覆盖度统计的键）
 SECTION_BACKGROUND = "background"
@@ -515,6 +517,21 @@ class PersonaService:
                 ErrorCode.STATE_CONFLICT_NO_NEW_EVIDENCE,
                 "档案内容与最新版完全一致，不生成新版本"
                 "（如确需记录说明，请先修改内容）", trace_ref=ctx.trace_ref))
+        # —— G7（A 级写风险）：**空产出绝不覆盖有内容的旧版** ——
+        # 上面那条"内容完全一致"挡不住"旧版有 1 条、新版 0 条"：两者不相等，
+        # 于是会写出一个空的新版本，并把旧版的 `superseded_by` 指过去；而默认
+        # 读取取的是 version 最大者 ⇒ 读到空档案。旧版行虽仍在库里，实际已被
+        # 降级覆盖（P4.5-A 冒烟重跑实测：v1 `OK items=1` → v2 `INSUFFICIENT_EVIDENCE items=0`）。
+        # 处理：不写新版本、不动旧版的归档指针、返回旧版引用 + 专属告警。
+        if not self._has_any_content(draft) and self._has_any_content_row(latest):
+            result = Ok(PersonaProfileRef(
+                id=str(latest["id"]), entity_id=str(entity_id),
+                version=int(latest.get("version", 0)),
+                status=str(latest.get("status", ""))))
+            return with_warning(
+                result, WARNING_PROFILE_DEGRADED_SKIPPED,
+                f"本次修订未产出任何内容（各维度为空），不生成新版本；"
+                f"保留 v{latest.get('version')}——空产出绝不覆盖有内容的档案")
         return self._write_profile(ctx, draft,
                                    version=int(latest.get("version", 0)) + 1,
                                    superseded_by=None,
@@ -1086,6 +1103,21 @@ class PersonaService:
             if str(getattr(draft, name).text or "").strip():
                 return True
         return bool(PersonaService._all_items(draft))
+
+    @staticmethod
+    def _has_any_content_row(row: dict) -> bool:
+        """**已存储版本**是否有任何内容（G7：用于拦住"空产出覆盖有内容旧版"）。
+
+        与 `_has_any_content` 同口径，只是作用在存储行的原始 dict 上。
+        """
+        for name in TEXT_SECTIONS:
+            section = row.get(name)
+            if isinstance(section, dict) and str(section.get("text") or "").strip():
+                return True
+        for name in ITEM_SECTIONS:
+            if _normalize_items(row.get(name)):
+                return True
+        return False
 
     @staticmethod
     def _compute_coverage(draft: PersonaProfileDraft) -> dict:

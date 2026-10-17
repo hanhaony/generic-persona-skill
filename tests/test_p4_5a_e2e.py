@@ -18,6 +18,9 @@
 | **编排器真实运行接线锁** | `TestOrchestratorRealRunWiring.*` |
 | **原始响应捕获 + 幂等重跑（0 真实调用）** | `TestRawCaptureAndIdempotentRerun.*` |
 | **G6 已知缺口锁（stability 未接线）** | `TestKnownGapStabilityNotWired.*` |
+| **G7 空产出不得降级覆盖（A 级写风险）** | `TestG7DegradedRevisionSkipped.*` |
+| **G8 双人物真实运行入口（`--names`）** | `TestG8DualPersonEntry.*` |
+| **G10 `--dump` 落点不得进仓库** | `TestG10DumpPath.*` |
 
 设计纪律：
 - **不 import 被测校验逻辑**做断言：A4 的复算走 `scripts/verify_p4_5a_outputs.py`，
@@ -59,6 +62,16 @@ from persona.modules.extraction import (                                # noqa: 
     WARNING_MODEL_CALL_DUPLICATE_SKIPPED,
     ExtractionOutcome,
     RejectedClaim,
+)
+from persona.core.enums import Cardinality, ProfileStatus              # noqa: E402
+from persona.modules.persona import (                                   # noqa: E402
+    WARNING_PROFILE_DEGRADED_SKIPPED,
+)
+from persona.modules.relationship import (                              # noqa: E402
+    WARNING_RELATIONSHIP_DEGRADED_SKIPPED,
+    PerspectiveBlock,
+    RelationshipDraft,
+    SharedExperienceItem,
 )
 from persona.orchestrator import (                                      # noqa: E402
     STAGE_DIALOGUE,
@@ -940,6 +953,255 @@ class TestRawCaptureAndIdempotentRerun(unittest.TestCase):
         self.assertIn("真实模型调用次数 = 1（重跑前 1）", joined,
                       "重跑后真实调用次数不得变化")
         self.assertIn("BUDGET_EXCEEDED", joined, "预算闸门必须报 BUDGET_EXCEEDED")
+        self.assertIn("PROFILE_DEGRADED_SKIPPED", joined,
+                      "G7：重跑的空产出必须被拦下并给出专属告警码")
+
+
+# ==========================================================================
+# G7：修订"空产出"不得降级覆盖有内容的旧版（A 级写风险）
+# ==========================================================================
+class TestG7DegradedRevisionSkipped(unittest.TestCase):
+    """P4.5-B 审查实测的写风险：重跑按"本次证据"重建档案，本次没有证据 ⇒ 空产出。
+
+    `revise` 原有的"内容完全一致 → 拒绝空转"挡不住这件事：旧版有 1 条、新版 0 条，
+    两者**不相等**，于是写出空的新版本，并把旧版的 `superseded_by` 指向它；默认读取
+    取 version 最大者 ⇒ 读到空档案（旧版行还在库里，但已事实降级）。
+
+    修复口径：不写新版本、不动旧版归档指针、返回旧版引用 + 专属告警。
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.r = run_chain()          # 真实链路产出一份**有内容**的 v1 人格档案
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.r.teardown()
+
+    def test_v1_has_content_and_no_archive_pointer(self):
+        view = unwrap(self.r.stack.persona.get_persona(
+            self.r.stack.ctx, self.r.entity_id))
+        self.assertEqual(view.version, 1)
+        self.assertEqual(view.status, ProfileStatus.OK.value)
+        self.assertIsNone(view.superseded_by, "v1 不该有归档指针")
+        self.assertGreaterEqual(len(view.habits), 1, "v1 必须有内容（否则本测试无意义）")
+
+    def test_empty_revise_returns_old_version_with_warning(self):
+        ctx = self.r.stack.ctx
+        empty = BusinessOrchestrator._build_persona_draft(
+            self.r.entity_id, [], "FICTIONAL_CHARACTER")
+        empty.change_reason = "测试：本次没有可用证据（模拟重跑）"
+
+        result = self.r.stack.persona.revise(ctx, self.r.entity_id, empty)
+        self.assertFalse(is_err(result), "空产出应被**拦下并告警**，而不是报错")
+        self.assertEqual(result.value.version, 1, "版本号不得前进")
+        self.assertIn(WARNING_PROFILE_DEGRADED_SKIPPED,
+                      [w.code for w in result.warnings],
+                      "必须给出可筛选的专属告警码")
+
+        view = unwrap(self.r.stack.persona.get_persona(ctx, self.r.entity_id))
+        self.assertEqual(view.version, 1, "默认读取仍是最新有内容的版本")
+        self.assertIsNone(view.superseded_by, "旧版不得被打上归档指针")
+        self.assertGreaterEqual(len(view.habits), 1, "旧版内容必须原样保留")
+        self.assertTrue(is_err(self.r.stack.persona.get_persona(
+            ctx, self.r.entity_id, version=2)), "不得存在 v2")
+
+    def test_orchestrator_propagates_degraded_warning(self):
+        """步骤级必须看得到这件事——否则任务视图里"档案没更新"无从解释。"""
+        ctx = self.r.stack.ctx
+        empty = BusinessOrchestrator._build_persona_draft(
+            self.r.entity_id, [], "FICTIONAL_CHARACTER")
+        notes: list[WarningNote] = []
+        written = self.r.stack.orchestrator()._write_persona(
+            ctx, self.r.entity_id, empty, notes)
+        self.assertFalse(is_err(written))
+        profile_id, already = written
+        self.assertTrue(already, "没产生新版本 ⇒ already_current 必须为 True")
+        self.assertIn(WARNING_PROFILE_DEGRADED_SKIPPED,
+                      [n.code for n in notes], "模块告警必须透传到步骤告警")
+
+    def test_guard_does_not_block_when_old_version_is_empty(self):
+        """护栏必须**窄**：旧版本来就没内容时，正常修订不应被误拦。"""
+        settings = settings_for()
+        stack = runner.Stack(settings, ExternalUsageLedger(),
+                             runner.Out(SECRET_PLACEHOLDER, quiet=True))
+        try:
+            entity_id = stack.ensure_entity("阿雾")
+            first = runner.BusinessOrchestrator._build_persona_draft(
+                entity_id, [], "FICTIONAL_CHARACTER")
+            first.change_reason = "v1：没有证据"
+            created = stack.persona.create_profile(stack.ctx, first)
+            self.assertFalse(is_err(created))
+            self.assertEqual(created.value.version, 1)
+
+            second = runner.BusinessOrchestrator._build_persona_draft(
+                entity_id, [], "FICTIONAL_CHARACTER")
+            second.open_questions = ["换一条缺口说明"]
+            second.change_reason = "v2：缺口说明更新"
+            revised = stack.persona.revise(stack.ctx, entity_id, second)
+            self.assertFalse(is_err(revised), "旧版无内容时不应被 G7 护栏拦住")
+            self.assertEqual(revised.value.version, 2, "正常修订必须照常产生新版本")
+        finally:
+            stack.teardown()
+
+    def test_empty_relationship_revise_keeps_content(self):
+        """关系档案同口径：v1 `shared=1` 不得被 v2 `shared=0` 顶掉。"""
+        settings = settings_for()
+        stack = runner.Stack(settings, ExternalUsageLedger(),
+                             runner.Out(SECRET_PLACEHOLDER, quiet=True))
+        try:
+            participants = stack.ensure_targets(["阿雾", "阿灯"])
+            ids = [t.entity_id for t in participants]
+            content = RelationshipDraft(
+                participant_entity_ids=ids, cardinality=Cardinality.PAIR,
+                perspectives={p: PerspectiveBlock(entity_id=p) for p in ids},
+                shared_experiences=[SharedExperienceItem(
+                    item_id="pi_fixture", text="两人在灯会当夜共同值守堤坝",
+                    confidence=0.0, evidence_refs=["ev_fixture"],
+                    participant_entity_ids=list(ids))],
+                # PF-V5：虚构参与者必须逐个声明适用版本（就是参与者自身）
+                applicable_variant_ids=list(ids),
+                status=ProfileStatus.OK,
+                change_reason="fixture：构造一份**有内容**的 v1")
+            # 用服务自己的写入方法落一条 v1（只跳过"证据存在性"，不绕过写路径）
+            created = stack.relationship._write_relationship(
+                stack.ctx, content, version=1)
+            self.assertFalse(is_err(created))
+            self.assertEqual(created.value.version, 1)
+
+            empty = RelationshipDraft(
+                participant_entity_ids=ids, cardinality=Cardinality.PAIR,
+                perspectives={p: PerspectiveBlock(entity_id=p) for p in ids},
+                open_questions=["互动模式待补"],
+                applicable_variant_ids=list(ids),
+                status=ProfileStatus.INSUFFICIENT_EVIDENCE,
+                change_reason="测试：本次没有 RELATION 证据")
+            revised = stack.relationship.revise(stack.ctx, ids, empty)
+            self.assertFalse(is_err(revised), "空产出应被拦下并告警，而不是报错")
+            self.assertEqual(revised.value.version, 1, "版本号不得前进")
+            self.assertIn(WARNING_RELATIONSHIP_DEGRADED_SKIPPED,
+                          [w.code for w in revised.warnings])
+
+            view = unwrap(stack.relationship.get_relationship(stack.ctx, ids))
+            self.assertEqual(view.version, 1)
+            self.assertEqual(len(view.shared_experiences), 1, "有内容的旧版必须保留")
+            self.assertIsNone(view.superseded_by)
+        finally:
+            stack.teardown()
+
+
+# ==========================================================================
+# G8：双人物真实运行入口（`--names`）
+# ==========================================================================
+class TestG8DualPersonEntry(unittest.TestCase):
+    """`--run --path=orchestrator` 必须支持双人物，且**仍然只发 1 次真实请求**。"""
+
+    def test_names_default_is_single_person(self):
+        args = runner.build_parser().parse_args([])
+        self.assertEqual(args.names, runner.E2E_TARGET.display_name,
+                         "不写 --names 时行为与旧版逐字一致（阿雾）")
+
+    def test_parse_names_splits_trims_and_rejects_empty(self):
+        self.assertEqual(runner.parse_names("阿雾, 阿灯"), ["阿雾", "阿灯"])
+        self.assertEqual(runner.parse_names("阿雾"), ["阿雾"])
+        with self.assertRaises(ValueError):
+            runner.parse_names(" , ")
+
+    def test_dual_person_real_run_offline(self):
+        settings = settings_for()
+        out = runner.Out(SECRET_PLACEHOLDER, quiet=True)
+        problems: list[str] = []
+        stub = runner.StubChatProvider('{"claims": []}')
+
+        def on_targets(stack, entity_id: str) -> None:
+            # 双人物：两个实体 ID 都在登记之后才有 → 从 stack.targets 取全
+            stub.payload = runner.orchestrator_payload(
+                {t.display_name: t.entity_id for t in stack.targets})
+
+        with tempfile.TemporaryDirectory(prefix="p45a-dual-") as td:
+            dump = Path(td) / "artifact.json"
+            with network_blocked():
+                runner.run_orchestrator_real(
+                    settings, out, problems,
+                    expect=lambda cond, desc: problems.append(desc) if not cond else None,
+                    ledger=ExternalUsageLedger(),
+                    limits=runner.model_limits_from_settings(settings),
+                    dump_path=str(dump), provider=stub, on_targets=on_targets,
+                    names=["阿雾", "阿灯"])
+            artifact = json.loads(dump.read_text(encoding="utf-8"))
+
+        self.assertEqual(problems, [], f"双人物接线不得有失败项：{problems}")
+        self.assertEqual(stub.chat_calls, 1, "双人物仍只允许 1 次真实调用")
+        self.assertEqual(artifact["calls"]["real_chat_calls"], 1)
+        self.assertEqual(len(artifact["materials"]), 2, "两个目标各一份材料")
+        self.assertGreaterEqual(len(artifact["evidence_ids"]), 2)
+
+        joined = "\n".join(out.lines)
+        self.assertIn("双人物", joined)
+        self.assertIn("SUCCEEDED", joined, "双人物五阶段全执行 → SUCCEEDED")
+        self.assertIn("关系档案", joined)
+        dialogue_row = next(ln for ln in out.lines if "模拟对话" in ln)
+        self.assertIn("EXECUTED", dialogue_row, "双人物对话阶段必须真的执行")
+        self.assertIn("生成 1 轮模拟对话", dialogue_row)
+
+    def test_single_person_path_unchanged(self):
+        """不传 names 时不得改变既有行为（单人物 → PARTIAL，对话零调用）。"""
+        settings = settings_for()
+        out = runner.Out(SECRET_PLACEHOLDER, quiet=True)
+        problems: list[str] = []
+        stub = runner.StubChatProvider('{"claims": []}')
+
+        def on_targets(stack, entity_id: str) -> None:
+            stub.payload = runner.orchestrator_payload({"阿雾": entity_id})
+
+        with tempfile.TemporaryDirectory(prefix="p45a-single-"):
+            with network_blocked():
+                runner.run_orchestrator_real(
+                    settings, out, problems,
+                    expect=lambda cond, desc: problems.append(desc) if not cond else None,
+                    ledger=ExternalUsageLedger(),
+                    limits=runner.model_limits_from_settings(settings),
+                    provider=stub, on_targets=on_targets)
+
+        self.assertEqual(problems, [])
+        joined = "\n".join(out.lines)
+        self.assertIn("单人物", joined)
+        dialogue_row = next(ln for ln in out.lines if "模拟对话" in ln)
+        self.assertIn("SKIPPED", dialogue_row, "单人物对话阶段必须如实跳过")
+
+
+# ==========================================================================
+# G10：`--dump` 落点必须在系统临时目录（根因修复，不是改断言）
+# ==========================================================================
+class TestG10DumpPath(unittest.TestCase):
+    """上一轮 `--dump var/p45a_last_run.json` 在仓库里造出 `var/`，把
+    `test_all_data_in_temp_dir_not_user_data` 弄红。断言是对的，错的是落点。"""
+
+    REPO = Path(__file__).resolve().parents[1]
+
+    def test_default_dump_is_in_system_temp(self):
+        path = runner.resolve_dump_path("")
+        self.assertEqual(path.parent, Path(tempfile.gettempdir()))
+        self.assertEqual(path.name, "p45a_last_run.json")
+
+    def test_relative_dump_never_lands_in_repo(self):
+        path = runner.resolve_dump_path("var/p45a_last_run.json")
+        self.assertTrue(path.is_absolute(), "相对路径必须被解析成绝对路径")
+        self.assertEqual(path.parent.parent, Path(tempfile.gettempdir()))
+        self.assertNotIn(self.REPO, path.resolve().parents,
+                         "产物**绝不允许**落进仓库")
+
+    def test_absolute_dump_is_honored(self):
+        with tempfile.TemporaryDirectory(prefix="p45a-dump-") as td:
+            explicit = Path(td) / "x.json"
+            self.assertEqual(runner.resolve_dump_path(str(explicit)), explicit)
+
+    def test_cli_default_never_points_into_repo(self):
+        for argv in ([], ["--run"], ["--run", "--path=orchestrator"]):
+            args = runner.build_parser().parse_args(argv)
+            path = runner.resolve_dump_path(args.dump)
+            self.assertNotIn(self.REPO, path.resolve().parents,
+                             f"{argv} 的默认落点不得在仓库内")
 
 
 if __name__ == "__main__":

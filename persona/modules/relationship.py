@@ -75,6 +75,8 @@ from .persona import (
 
 WARNING_RELATIONSHIP_SUPERSEDED = "RELATIONSHIP_SUPERSEDED"  # 修订产生新版本，旧版已归档
 WARNING_CONFLICT_LINKED = "CONFLICT_LINKED"                # 档案关联了冲突（未裁决）
+# G7（A 级写风险）：本次修订**产出为空**，已拦下、旧版保留（不降级覆盖）
+WARNING_RELATIONSHIP_DEGRADED_SKIPPED = "RELATIONSHIP_DEGRADED_SKIPPED"
 
 # 关系档案的内容板块（覆盖度统计的键）
 SECTION_SHARED_EXPERIENCES = "shared_experiences"
@@ -534,6 +536,20 @@ class RelationshipService:
                 ErrorCode.STATE_CONFLICT_NO_NEW_EVIDENCE,
                 "关系内容与最新版完全一致，不生成新版本"
                 "（如确需记录说明，请先修改内容）", trace_ref=ctx.trace_ref))
+        # —— G7（A 级写风险）：**空产出绝不覆盖有内容的旧版** ——
+        # 同 persona.revise：旧版 `shared=1`、新版 `shared=0` 时内容指纹不相等，
+        # 会写出空的新版本并把旧版 `superseded_by` 指过去，默认读取即降级为空档案
+        # （P4.5-B 审查实测：关系档案 v1 → v2 `INSUFFICIENT_EVIDENCE shared=0`）。
+        if not self._has_any_content(draft) and self._has_any_content_row(latest):
+            result = Ok(RelationshipRef(
+                id=str(latest["id"]),
+                participant_entity_ids=_str_list(latest.get("participant_entity_ids")),
+                version=int(latest.get("version", 0)),
+                status=str(latest.get("status", ""))))
+            return with_warning(
+                result, WARNING_RELATIONSHIP_DEGRADED_SKIPPED,
+                f"本次修订未产出任何内容（各维度为空），不生成新版本；"
+                f"保留 v{latest.get('version')}——空产出绝不覆盖有内容的档案")
         return self._write_relationship(
             ctx, draft, version=int(latest.get("version", 0)) + 1,
             supersede_id=str(latest["id"]))
@@ -1285,6 +1301,36 @@ class RelationshipService:
     def _has_any_content(draft: RelationshipDraft) -> bool:
         """是否有任何证据支撑的内容（任一条目非空即算）。"""
         return bool(RelationshipService._all_items(draft))
+
+    @staticmethod
+    def _has_any_content_row(row: dict) -> bool:
+        """**已存储版本**是否有任何内容（G7：用于拦住"空产出覆盖有内容旧版"）。
+
+        与 `_has_any_content` 同口径（条目板块 + 视角块 + 群体互动），
+        只是作用在存储行的原始 dict 上。
+        """
+        for name in ITEM_SECTIONS:
+            if _normalize_items(row.get(name)):
+                return True
+        perspectives = row.get("perspectives") or {}
+        if isinstance(perspectives, dict):
+            for block in perspectives.values():
+                if not isinstance(block, dict):
+                    continue
+                targets = block.get("view_of_targets") or {}
+                if isinstance(targets, dict):
+                    for target_items in targets.values():
+                        if _normalize_items(target_items):
+                            return True
+                for field_name in ("feeling_toward", "expression_toward"):
+                    if _normalize_items(block.get(field_name)):
+                        return True
+        group = row.get("group_dynamics")
+        if isinstance(group, dict):
+            for section in GROUP_DYNAMICS_SECTIONS:
+                if _normalize_items(group.get(section)):
+                    return True
+        return False
 
     @staticmethod
     def _relationship_payload(draft: RelationshipDraft, version: int,

@@ -1004,11 +1004,13 @@ class BusinessOrchestrator:
                     code=WARNING_NO_EVIDENCE_FOR_ENTITY,
                     message=f"{entity_id} 没有可用证据，档案记为 INSUFFICIENT_EVIDENCE"
                             "（不补全、不臆测）"))
-            written = self._write_persona(ctx, entity_id, draft)
+            before = len(warnings)
+            written = self._write_persona(ctx, entity_id, draft, warnings)
             if isinstance(written, Err):
                 return written
             profile_ids.append(written[0])
-            if written[1]:
+            if written[1] and len(warnings) == before:
+                # 模块层已经给出更具体的说明（如 G7 的空产出拦截）时不再叠加通用提示
                 warnings.append(WarningNote(
                     code=WARNING_PROFILE_ALREADY_CURRENT,
                     message=f"{entity_id} 的档案已是最新，未生成新版本（不重复更新）"))
@@ -1144,11 +1146,14 @@ class BusinessOrchestrator:
         )
 
     def _write_persona(
-        self, ctx: CallContext, entity_id: str, draft: PersonaProfileDraft
+        self, ctx: CallContext, entity_id: str, draft: PersonaProfileDraft,
+        notes: list[WarningNote] | None = None,
     ) -> tuple[str, bool] | Err:
-        """写档案。已存在则 `revise`；内容未变 → **复用旧版，不产生新版本**。
+        """写档案。已存在则 `revise`；内容未变 / 本次产出为空 → **复用旧版，不产生新版本**。
 
-        返回 `(profile_id, already_current)`。
+        返回 `(profile_id, already_current)`。`notes` 非空时，把模块层返回的告警
+        （如 G7 的 `PROFILE_DEGRADED_SKIPPED`）原样带出去，供步骤级告警使用——
+        否则"空产出被拦下"这件事在任务视图里看不到。
         """
         draft.change_reason = "业务编排：按本次登记的证据重建档案"
         existing = self.deps.persona.get_persona(ctx, entity_id)
@@ -1158,7 +1163,12 @@ class BusinessOrchestrator:
                 if revised.error.code == ErrorCode.STATE_CONFLICT_NO_NEW_EVIDENCE:
                     return (str(existing.value.id), True)
                 return revised
-            return (str(revised.value.id), False)
+            if notes is not None:
+                notes.extend(getattr(revised, "warnings", []) or [])
+            # G7：模块层拦下"空产出覆盖"时返回的是**旧版**，版本号没有前进；
+            # 只有版本号前进才算"真的产生了新版本"。
+            return (str(revised.value.id),
+                    int(revised.value.version) <= int(existing.value.version))
         created = self.deps.persona.create_profile(ctx, draft)
         if is_err(created):
             if created.error.code == ErrorCode.STATE_CONFLICT_NO_NEW_EVIDENCE:
@@ -1230,11 +1240,12 @@ class BusinessOrchestrator:
             draft = self._relationship_draft_fallback(
                 participants, cardinality, relation_items, variants, warnings)
 
-        written = self._write_relationship(ctx, participants, draft)
+        before = len(warnings)
+        written = self._write_relationship(ctx, participants, draft, warnings)
         if isinstance(written, Err):
             return written
         profile_id, already = written
-        if already:
+        if already and len(warnings) == before:
             warnings.append(WarningNote(
                 code=WARNING_PROFILE_ALREADY_CURRENT,
                 message="关系档案已是最新，未生成新版本（不重复更新）"))
@@ -1442,7 +1453,8 @@ class BusinessOrchestrator:
         )
 
     def _write_relationship(
-        self, ctx: CallContext, participants: list[str], draft: RelationshipDraft
+        self, ctx: CallContext, participants: list[str], draft: RelationshipDraft,
+        notes: list[WarningNote] | None = None,
     ) -> tuple[str, bool] | Err:
         draft.change_reason = "业务编排：按本次登记的证据重建关系档案"
         existing = self.deps.relationship.get_relationship(ctx, list(participants))
@@ -1452,7 +1464,11 @@ class BusinessOrchestrator:
                 if revised.error.code == ErrorCode.STATE_CONFLICT_NO_NEW_EVIDENCE:
                     return (str(existing.value.id), True)
                 return revised
-            return (str(revised.value.id), False)
+            if notes is not None:
+                notes.extend(getattr(revised, "warnings", []) or [])
+            # G7：同 `_write_persona`——版本号没前进就是"没产生新版本"（空产出被拦下）
+            return (str(revised.value.id),
+                    int(revised.value.version) <= int(existing.value.version))
         created = self.deps.relationship.create_relationship(ctx, draft)
         if is_err(created):
             if created.error.code == ErrorCode.STATE_CONFLICT_NO_NEW_EVIDENCE:

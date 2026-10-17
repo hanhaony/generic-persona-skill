@@ -79,6 +79,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -642,6 +643,8 @@ class Stack:
         self._extractor = None
         self.entity_id: str = ""
         self.target: PersonQueryTarget | None = None
+        #: 已登记的**全部**目标（`self.target` 只是最后一个）。双人物用它。
+        self.targets: list[PersonQueryTarget] = []
 
     # -------------------------------------------------------------- 目标实体
     def ensure_entity(self, name: str) -> str:
@@ -664,6 +667,7 @@ class Stack:
                  "official_canon_level": "CANON"}},
             project_id=PROJECT, namespace=ProvenanceNamespace.PUBLIC_SOURCE).value)
         self.target = PersonQueryTarget(entity_id=self.entity_id, display_name=name)
+        self.targets.append(self.target)
         return self.entity_id
 
     def ensure_targets(self, names: list[str]) -> list[PersonQueryTarget]:
@@ -925,8 +929,8 @@ def print_stage_table(out: Out, run) -> None:
         STAGE_RESEARCH: "① 研究（检索→抓取→门禁→材料）",
         STAGE_EVIDENCE: "② ③ 抽取 + 证据登记",
         STAGE_PERSONA: "④ ⑤ 门禁 + 人格档案",
-        STAGE_RELATIONSHIP: "关系档案（单人物 → 跳过）",
-        STAGE_DIALOGUE: "模拟对话（单人物 → 跳过）",
+        STAGE_RELATIONSHIP: "关系档案",
+        STAGE_DIALOGUE: "模拟对话",
     }
     out("  阶段               状态            说明")
     for step in run.steps:
@@ -991,7 +995,8 @@ def dump_ledger(out: Out, ledger: ExternalUsageLedger, cap: float | None,
 # ==========================================================================
 def run_orchestrator_real(settings, out: Out, problems: list[str], *,
                           expect, ledger, limits, dump_path: str = "",
-                          provider=None, on_targets=None) -> None:
+                          provider=None, on_targets=None,
+                          names: list[str] | None = None) -> None:
     """真实执行**编排器路径**：`BusinessOrchestrator.run` 全链 + 1 次真实模型调用。
 
     与 `--path=script` 的差别：材料交接、证据登记、门禁、人格档案**全部**由
@@ -1010,9 +1015,17 @@ def run_orchestrator_real(settings, out: Out, problems: list[str], *,
       - `provider`：替掉真实 Provider，好让离线测试用桩模型把**同一条产品代码
         链路**零成本复跑一遍（否则"接线本身"就没有任何测试锁住）；
       - `on_targets`：目标实体登记完成后回调 `(stack, entity_id)`，让桩模型能拿到
-        存储生成的实体 ID 去构造载荷。
+        存储生成的实体 ID 去构造载荷（双人物时可从 `stack.targets` 取全部）。
+
+    G8（双人物入口）：`names` 为 `None` 时退化成单人物（阿雾），与既有行为逐字一致。
+    传 2 个名字时：桩数据源换成 `StubTwoTargetSourceProvider`（按检索词里的目标名
+    返回各自的合成正文）、研究上限换成 `E2E_RESEARCH_LIMITS_TWO`、请求带 2 个目标，
+    真实模型调用仍是 **1 次**（抽取器一次处理全部材料与目标）。
     """
-    out.hr("[7] 真实执行（编排器路径：产品代码全链，1 次调用，失败不重试）")
+    names = list(names) if names else [E2E_TARGET.display_name]
+    two_person = len(names) > 1
+    label = "双人物" if two_person else "单人物"
+    out.hr(f"[7] 真实执行（编排器路径：产品代码全链，{label}，1 次调用，失败不重试）")
 
     if provider is not None:
         real_provider = provider
@@ -1036,13 +1049,25 @@ def run_orchestrator_real(settings, out: Out, problems: list[str], *,
     recorder = CountingChatProvider(real_provider)
     dialogue_stub = StubDialogueProvider()
 
+    # G8：双人物必须换数据源与上限——单目标桩只会返回阿雾那份正文，
+    # 第二个人物拿不到材料（关系阶段就成了"没证据"，而不是"链路没通"）。
+    source_provider = (StubTwoTargetSourceProvider() if two_person
+                       else StubSearchExtractProvider())
+    research_limits = (E2E_RESEARCH_LIMITS_TWO if two_person
+                       else E2E_RESEARCH_LIMITS)
+
     stack = Stack(settings, ledger, out,
                   chat_provider=dialogue_stub,
-                  source_provider=StubSearchExtractProvider(),
-                  research_limits=E2E_RESEARCH_LIMITS)
+                  source_provider=source_provider,
+                  research_limits=research_limits)
     try:
-        entity_id = stack.ensure_entity("阿雾")
-        out(f"  目标实体        : {entity_id}（{E2E_TARGET.display_name}，单人物）")
+        targets = stack.ensure_targets(names)
+        entity_id = targets[0].entity_id
+        shown = "、".join(f"{t.display_name}={t.entity_id}" for t in targets)
+        out(f"  目标实体        : {shown}（{label}）")
+        out(f"  数据源          : {type(stack.search_provider).__name__}")
+        out(f"  研究上限        : max_queries={research_limits.max_queries} "
+            f"max_extracts={research_limits.max_extracts}")
         out(f"  临时库          : {stack.tmp}\\p45a.db（隔离，退出即删）")
         out("  路径            : BusinessOrchestrator.run（产品代码，无脚本代劳）")
         out(f"  原始响应捕获    : {'已挂载（Provider 唯一网络出口 _urlopen）' if raw_capture else '未挂载（注入的桩 Provider 无网络出口）'}")
@@ -1055,14 +1080,14 @@ def run_orchestrator_real(settings, out: Out, problems: list[str], *,
             on_targets(stack, entity_id)
 
         # --- 发送前：把真实请求体构造出来核验（只构造，不发送）---
-        preview = stack.research.run(stack.ctx, [stack.target])
+        preview = stack.research.run(stack.ctx, targets)
         if is_err(preview):
             out(f"  [FAIL] 研究链路失败：{preview.error.code} {preview.error.message}")
             problems.append("研究链路失败（编排器路径预检）")
             return
         preview_materials, _rejected = materials_from_research(stack, preview.value)
         req_built = inner_extractor.build_request(
-            preview_materials, [stack.target], model_hint=settings.model.model_id)
+            preview_materials, targets, model_hint=settings.model.model_id)
         body_builder = getattr(real_provider, "_build_body", None)
         if body_builder is None:
             out("  （注入的 Provider 无 _build_body：跳过线上请求体核验——离线测试用）")
@@ -1088,7 +1113,7 @@ def run_orchestrator_real(settings, out: Out, problems: list[str], *,
         result = None
         raised: BaseException | None = None
         try:
-            result = orch.run(stack.ctx, stack.request())
+            result = orch.run(stack.ctx, stack.request(targets=targets))
         except BaseException as exc:                       # noqa: BLE001 —— 如实上报
             raised = exc
         elapsed = time.monotonic() - started
@@ -1108,13 +1133,19 @@ def run_orchestrator_real(settings, out: Out, problems: list[str], *,
 
         out(f"  整体状态        : {run.status}"
             + ("（五阶段全执行）" if run.status == "SUCCEEDED"
-               else "（单人物：关系/对话按语义跳过）"
-               if run.status == "PARTIAL" else ""))
+               else (f"（{label}：{'关系/对话' if not two_person else '部分阶段'}按语义跳过）"
+                     if run.status == "PARTIAL" else "")))
         out(f"  任务终态        : {run.task_status}")
         out("")
         print_stage_table(out, run)
-        expect(dialogue_stub.chat_calls == 0,
-               "编排器路径：对话阶段被语义跳过，桩对话 Provider **零调用**")
+        if two_person:
+            # 双人物：关系阶段 EXECUTED → 对话阶段会真的跑，用的是**桩**对话 Provider
+            # （零成本；桩产物只进 Conversation* / SIMULATED 记忆，绝不回流证据）
+            expect(dialogue_stub.chat_calls >= 1,
+                   "编排器路径：双人物下对话阶段真的执行（桩对话 Provider 被调用）")
+        else:
+            expect(dialogue_stub.chat_calls == 0,
+                   "编排器路径：对话阶段被语义跳过，桩对话 Provider **零调用**")
 
         materials = list(orch._materials.get(run.task_id, []) or [])
         gate_valid = sum(1 for m in materials if str(getattr(m, "quality_status", "")))
@@ -1133,6 +1164,23 @@ def run_orchestrator_real(settings, out: Out, problems: list[str], *,
         out(f"  证据数          : {len(run.evidence_ids)}")
         expect(len(run.evidence_ids) >= 1, "编排器路径：证据**非空**")
 
+        # --- ④ 关系档案：直接回读（G7：版本号不得被空产出顶到 v2）---
+        if run.relationship_profile_ids:
+            out(f"  ④ 关系档案      : {run.relationship_profile_ids}")
+            for rid in run.relationship_profile_ids:
+                view = stack.relationship.get_relationship(stack.ctx, rid)
+                if is_ok(view):
+                    out(f"      · {rid} v{view.value.version} "
+                        f"status={view.value.status} "
+                        f"共享经历={len(view.value.shared_experiences)} "
+                        f"互动模式={len(view.value.interaction_patterns)}")
+                    expect(view.value.version == 1,
+                           "关系档案版本停在 v1（重跑不得产生降级覆盖的新版本）")
+        else:
+            out("  ④ 关系档案      : （无）")
+            if two_person:
+                problems.append("双人物未产出关系档案")
+
         outcome = recorded.last_outcome
         if outcome is None:
             out("  [FAIL] 抽取器没有产出 outcome（编排器可能没走到证据阶段）")
@@ -1142,31 +1190,35 @@ def run_orchestrator_real(settings, out: Out, problems: list[str], *,
         dump_outcome(out, outcome)
 
         # --- ⑤ 人格档案：直接从产品代码产出的档案回读（不重建、不改写）---
-        etypes = orch._entity_types(stack.ctx, [entity_id])
+        etypes = orch._entity_types(stack.ctx, [t.entity_id for t in targets])
         if is_err(etypes):
             problems.append("读取实体类型失败")
             return
-        request_obj = stack.request()
+        request_obj = stack.request(targets=targets)
         loaded = orch._load_evidence(stack.ctx, request_obj, list(run.evidence_ids))
         if is_err(loaded):
             problems.append("加载证据失败")
             return
-        items = loaded.get(entity_id, [])
-        draft = BusinessOrchestrator._build_persona_draft(
-            entity_id, items, etypes.get(entity_id, ""))
         out("")
         out(f"  ⑤ 人格档案      : {run.persona_profile_ids}")
-        out(f"      条目统计     : background_refs={len(draft.background.evidence_refs)} "
-            f"traits={len(draft.traits)} habits={len(draft.habits)} "
-            f"single_events={len(draft.single_events)} "
-            f"experiences={len(draft.experiences)} "
-            f"open_questions={len(draft.open_questions)}")
-        for it in draft.traits:
-            out(f"      * trait   : {it.text}  (stability={it.stability}, "
-                f"refs={it.evidence_refs})")
-        for it in draft.single_events:
-            out(f"      * single  : {it.text}  (stability={it.stability}, "
-                f"refs={it.evidence_refs})")
+        drafts: dict[str, Any] = {}
+        for t in targets:
+            draft_t = BusinessOrchestrator._build_persona_draft(
+                t.entity_id, loaded.get(t.entity_id, []), etypes.get(t.entity_id, ""))
+            drafts[t.entity_id] = draft_t
+            out(f"      · {t.display_name}（{t.entity_id}）"
+                f"background_refs={len(draft_t.background.evidence_refs)} "
+                f"traits={len(draft_t.traits)} habits={len(draft_t.habits)} "
+                f"single_events={len(draft_t.single_events)} "
+                f"experiences={len(draft_t.experiences)} "
+                f"open_questions={len(draft_t.open_questions)}")
+            for it in draft_t.traits:
+                out(f"        * trait   : {it.text}  (stability={it.stability}, "
+                    f"refs={it.evidence_refs})")
+            for it in draft_t.single_events:
+                out(f"        * single  : {it.text}  (stability={it.stability}, "
+                    f"refs={it.evidence_refs})")
+        draft = drafts[entity_id]
 
         # ---------------- [7b] 幂等重跑（**必须** 0 次真实调用） ----------------
         out.hr("[7b] 幂等重跑（同一条链再跑一次；**必须 0 次真实调用**）")
@@ -1179,7 +1231,7 @@ def run_orchestrator_real(settings, out: Out, problems: list[str], *,
         rerun = None
         rerun_raised: BaseException | None = None
         try:
-            rerun = orch.run(stack.ctx, stack.request())
+            rerun = orch.run(stack.ctx, stack.request(targets=targets))
         except BaseException as exc:                        # noqa: BLE001 —— 如实上报
             rerun_raised = exc
         out(f"  ① 原样重跑 orch.run  → 真实模型调用次数 = {recorder.calls}"
@@ -1202,6 +1254,24 @@ def run_orchestrator_real(settings, out: Out, problems: list[str], *,
             else:
                 out("     → 未出现 DUPLICATE_SKIPPED 告警：需人工复核拦点。")
 
+        # —— G7 回归锁：重跑的"空产出"不得把有内容的档案顶成空的新版本 ——
+        # 重跑时证据登记被幂等拦下 ⇒ 本次没有可用证据 ⇒ 人物/关系草稿为空。
+        # 修复前：会写出 v2（空）并把 v1 的 superseded_by 指过去 = 降级覆盖。
+        for t in targets:
+            pv = stack.persona.get_persona(stack.ctx, t.entity_id)
+            if is_ok(pv):
+                expect(pv.value.version == 1,
+                       f"G7：重跑后 {t.display_name} 的人物档案仍为 v1（空产出未覆盖）")
+                out(f"     · {t.display_name} 人物档案版本 = v{pv.value.version}"
+                    f"（status={pv.value.status}，旧版内容未降级）")
+        for rid in (run.relationship_profile_ids or []):
+            rv = stack.relationship.get_relationship(stack.ctx, rid)
+            if is_ok(rv):
+                expect(rv.value.version == 1,
+                       "G7：重跑后关系档案仍为 v1（空产出未覆盖）")
+                out(f"     · {rid} 关系档案版本 = v{rv.value.version}"
+                    f"（status={rv.value.status}，旧版内容未降级）")
+
         # —— 闸门 ②：换一份材料让幂等键变化，逼**预算闸门**自己出手 ——
         out("")
         out("  ② 预算探针：改掉材料的 canonical_key（幂等键随之变化）→ "
@@ -1215,7 +1285,7 @@ def run_orchestrator_real(settings, out: Out, problems: list[str], *,
             out("     材料流为空：跳过预算探针（前面已断言材料非空，此处仅为防御）")
         else:
             probe_result = inner_extractor.extract(
-                stack.ctx, probe_materials, targets=[stack.target])
+                stack.ctx, probe_materials, targets=targets)
             out(f"     探针后真实模型调用次数 = {recorder.calls}")
             expect(recorder.calls == calls_before,
                    "预算探针：真实调用次数**仍未增加**")
@@ -1262,7 +1332,7 @@ def run_orchestrator_real(settings, out: Out, problems: list[str], *,
                 evidence_ids=list(run.evidence_ids),
                 source_ids=list(run.source_ids), draft=draft, entity_id=entity_id,
                 ledger=ledger, limits=limits, recorder=recorder,
-                elapsed=elapsed, target=stack.target,
+                elapsed=elapsed, target=targets[0],
                 mode="orchestrator-path",
                 profile_id=(run.persona_profile_ids[0]
                             if run.persona_profile_ids else None),
@@ -1283,6 +1353,38 @@ def run_orchestrator_real(settings, out: Out, problems: list[str], *,
 # ==========================================================================
 # 主流程
 # ==========================================================================
+def parse_names(raw: str) -> list[str]:
+    """`--names 阿雾,阿灯` → `["阿雾", "阿灯"]`（G8）。
+
+    只做语法层面的拆分与去空；**是否与桩数据源目录对得上**由调用方如实报告，
+    不在这里假装校验过（名称对不上时桩会返回默认样张，脚本会把这件事说出来）。
+    """
+    names = [part.strip() for part in str(raw or "").split(",") if part.strip()]
+    if not names:
+        raise ValueError("--names 不能为空")
+    return names
+
+
+def resolve_dump_path(given: str) -> Path:
+    """`--dump` 的路径解析（G10：**绝不把产物写进仓库**）。
+
+    根因：上一轮冒烟按文档用了 `--dump var/p45a_last_run.json`，于是在仓库里
+    创建了 `var/`，把 `test_all_data_in_temp_dir_not_user_data`（断言仓库内不得
+    出现用户数据目录）弄红。断言本身是对的，错的是脚本把默认落点放进了仓库。
+
+    规则：
+      - 未给 `--dump`（空串）→ `<系统临时目录>/p45a_last_run.json`；
+      - 相对路径 → 一律解析到系统临时目录下（`var/x.json` → `<temp>/var/x.json`）；
+      - 绝对路径 → 原样尊重（用户明确指定了落点）。
+    """
+    if not str(given or "").strip():
+        return Path(tempfile.gettempdir()) / "p45a_last_run.json"
+    path = Path(given)
+    if not path.is_absolute():
+        path = Path(tempfile.gettempdir()) / path
+    return path
+
+
 def build_parser() -> argparse.ArgumentParser:
     """命令行参数（独立出来是为了让离线测试能直接断言默认值）。"""
     parser = argparse.ArgumentParser(description="P4.5-A 端到端验证（--run 会真实计费）")
@@ -1294,13 +1396,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--path", choices=("script", "orchestrator"),
                         default="orchestrator",
                         help="真实运行走哪条链路（默认 orchestrator = 产品代码全链）")
+    parser.add_argument("--names", default=E2E_TARGET.display_name,
+                        metavar="NAME[,NAME]",
+                        help="目标人物名，逗号分隔：1 个 = 单人物，2 个 = 双人物全链"
+                             f"（默认 {E2E_TARGET.display_name}；只能是合成虚构名，AC-16）")
     parser.add_argument("--dump", default="", metavar="PATH",
-                        help="把本次运行产物写成 JSON（供 verify_p4_5a_outputs.py 离线复算）")
+                        help="把本次运行产物写成 JSON（供 verify_p4_5a_outputs.py 离线复算）；"
+                             "相对路径一律落到系统临时目录，绝不写进仓库")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    try:
+        names = parse_names(args.names)
+    except ValueError as exc:
+        print(f"参数错误：{exc}")
+        return 2
+    # G10：产物落点由脚本统一解析——相对路径一律进系统临时目录，绝不写进仓库
+    dump_path = resolve_dump_path(args.dump)
 
     loaded = load_settings(overrides=E2E_CONFIG)
     if is_err(loaded):
@@ -1326,6 +1441,8 @@ def main(argv: list[str] | None = None) -> int:
             else "真实执行（**会产生费用**，1 次调用）" if args.run
             else "DRY-RUN（绝不发请求）")
     out(f"模式   ：{mode}   路径：{args.path}")
+    out(f"目标   ：{'、'.join(names)}（{len(names)} 人）")
+    out(f"产物落点：{dump_path}（系统临时目录；仓库内不落任何文件）")
     out(f"时间   ：{time.strftime('%Y-%m-%d %H:%M:%S')}")
     out(f"密钥   ：{'已设置（内容不显示）' if secret else '未设置'}  长度={len(secret)}")
 
@@ -1524,7 +1641,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.path == "orchestrator":
             run_orchestrator_real(settings, out, problems, expect=expect,
                                   ledger=service_ledger, limits=limits,
-                                  dump_path=args.dump)
+                                  dump_path=str(dump_path), names=names)
             return _finish(out, problems, mode="real", ledger=service_ledger,
                            limits=limits)
 
@@ -1606,7 +1723,7 @@ def main(argv: list[str] | None = None) -> int:
         dump_ledger(out, service_ledger, limits.max_cost, limits.currency)
 
         # ---------------- 产物落盘（供独立复算器） ----------------
-        if args.dump:
+        if dump_path:
             artifact = build_artifact(
                 materials=materials, outcome=outcome, evidence_ids=evidence_ids,
                 source_ids=list(ro.source_ids), draft=draft, entity_id=entity_id,
@@ -1614,7 +1731,7 @@ def main(argv: list[str] | None = None) -> int:
                 elapsed=elapsed, target=stack.target,
                 mode="script-side-assembly",
                 profile_id=profile_id, already_current=already)
-            path = Path(args.dump)
+            path = Path(dump_path)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(artifact, ensure_ascii=False, indent=2),
                             encoding="utf-8")
