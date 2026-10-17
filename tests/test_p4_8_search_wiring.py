@@ -246,13 +246,18 @@ class CallPlanTest(_StackCase):
         self.assertEqual(plan.dialogues, 0, "单目标按语义跳过对话，不得虚报调用")
 
     def test_multi_target_dialogue_calls_are_bounded(self):
+        """D-4：对话次数 = **轮数**（每轮 1 个 turn），不是"目标数 × 轮数"。
+
+        此前按后者报，2 目标 × 2 轮被报成 4 次，实际只发 2 次——
+        清单偏大会让人以为"还早"，等真的超预算才发现口径错了。
+        """
         stack, _targets = self._build(_online_model_settings(), allow_real=True,
                                       build_chat=True)
         targets = unwrap(register_targets(stack.storage, stack.ctx, [
             TargetSpec("阿灯", "FICTIONAL_CHARACTER", "雾港灯会", "2020 动画改编版"),
             TargetSpec("阿雾", "FICTIONAL_CHARACTER", "雾港灯会", "2020 动画改编版")]))
         plan = plan_calls(stack, targets, max_rounds=2)
-        self.assertEqual(plan.dialogues, 4, "上限 = 目标数 × 轮数")
+        self.assertEqual(plan.dialogues, 2, "对话 = 轮数（每轮 1 个 turn）")
         self.assertEqual(plan.extractions, 1, "抽取仍是一次批量")
 
     def test_model_cost_estimate_uses_configured_unit_price(self):
@@ -281,6 +286,48 @@ class CallPlanTest(_StackCase):
 # ==========================================================================
 # 四、CLI 是否真的把"建不建检索出口"传下去
 # ==========================================================================
+
+
+class RegisteredTargetQueryTextTest(_StackCase):
+    """登记的目标必须把作品名带进检索词（P4.8 R4 真实运行前 dry-run 抓到的缺陷）。
+
+    症状：`register_targets` 把作品名写进了实体载荷，却只给
+    `PersonQueryTarget` 填了 `display_name`，于是 `plan_queries` 拿不到
+    `work_titles`，真实检索退化成查「阿灯」「阿雾」这种两字人名
+    （实测查回来全是同名噪声）。CLI 又强制要求 `--work-title` ——
+    声明了却不用，等于让用户白填。
+    """
+
+    def test_registered_target_carries_work_title_and_version(self):
+        stack, targets = self._build(test_settings())
+        target = targets[0]
+        self.assertEqual(target.work_titles, ["雾港灯会"])
+        self.assertEqual(target.adaptation_version, "2020 动画改编版")
+        self.assertEqual(target.entity_type, "FICTIONAL_CHARACTER")
+
+    def test_query_text_contains_the_work_title(self):
+        stack, targets = self._build(test_settings())
+        planned = unwrap(stack.research.plan_queries(stack.ctx, targets))
+        self.assertEqual(len(planned), 1, "无话题 ⇒ 每目标 1 条身份查询")
+        self.assertEqual(planned[0].query_text, "阿灯 雾港灯会",
+                         "基础辨识词 = 名字 + 作品名（INTERFACES §5.2）")
+
+    def test_real_person_without_work_title_stays_bare(self):
+        """真人没有作品名：检索词只留名字，**不拼空串、不补占位**。"""
+        stack = self._build(test_settings())[0]
+        targets = unwrap(register_targets(stack.storage, stack.ctx, [
+            TargetSpec("某公众人物", "REAL_PERSON")]))
+        self.assertEqual(targets[0].work_titles, [])
+        planned = unwrap(stack.research.plan_queries(stack.ctx, targets))
+        self.assertEqual(planned[0].query_text, "某公众人物")
+
+    def test_query_target_passes_work_titles_through(self):
+        """`_query_target` 不能把已有 `work_titles` 清空（这正是缺陷的成因）。"""
+        from persona.orchestrator.assembly import _query_target
+        stack, targets = self._build(test_settings())
+        converted = _query_target(targets[0])
+        self.assertEqual(converted.work_titles, ["雾港灯会"])
+        self.assertEqual(converted.adaptation_version, "2020 动画改编版")
 
 
 class CliBuildSearchFlagTest(unittest.TestCase):

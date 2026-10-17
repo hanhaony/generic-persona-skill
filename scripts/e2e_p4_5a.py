@@ -355,7 +355,12 @@ class StubChatProvider:
     两个用途：
       1. A11 负样例与离线测试里扮演"模型"，证明门禁会**拦在调用之前**；
       2. `--dry` 的编排器路径诊断里扮演"模型"，确保诊断本身不可能花钱。
+
+    `offline = True`：请求不离开进程 → 记账层不产生外部用量记录，
+    也不占用 `max_calls`（与 `FakeProvider` 同一口径，见 D-3）。
     """
+
+    offline = True
 
     def __init__(self, payload: str = '{"claims": []}', *, fail: bool = False,
                  request_id: str = "stub-request-0001") -> None:
@@ -604,7 +609,11 @@ class StubDialogueProvider:
 
     为什么单独一个：抽取与对话共用一个 Provider 时，桩若只返回 claim JSON，
     对话轮次会把 JSON 当台词记下来，产物看起来"像通了"其实是脏数据。
+
+    `offline = True`：同 `StubChatProvider`——桩不联网，不产生外部用量。
     """
+
+    offline = True
 
     def __init__(self) -> None:
         self.chat_calls = 0

@@ -77,7 +77,14 @@ class FakeProvider:
     """确定性假实现：同样的输入永远返回同样的输出。
 
     token 用量一律返回 `None`——**未知就不填，绝不猜**（D-060）。
+
+    `offline = True`：声明"请求不会离开进程"。记账层据此**不做外部用量记账**
+    （`modules/model_budget.is_offline_provider`）——把本地替身记成"未知费用"
+    会让账本凭空多出一笔未知占位，真实调用反而被闸门拦下。脚本/测试里的自定义
+    桩同样应加上这一行。
     """
+
+    offline = True
 
     def __init__(
         self,

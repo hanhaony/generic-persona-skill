@@ -67,7 +67,9 @@ MATERIAL_A = SearchResult(
     title="雾港设定资料集",
     url="https://example.invalid/mist-harbor",
     canonical_key="key_mist_harbor",
-    snippet="雾港的地理与机构说明。",
+    # P4.8 / D-2 之后，检索结果必须**提到目标**才会被登记为来源：
+    # 这份夹具是"关于阿雾的设定资料"，摘要里自然应当出现她的名字。
+    snippet="雾港的地理与机构说明；阿雾是灯塔的常年值守者。",
     published_at="2021-05-04",
     source_kind_guess="OFFICIAL_MATERIAL",
 )
@@ -75,7 +77,7 @@ MATERIAL_B = SearchResult(
     title="星灯访谈录",
     url="https://example.invalid/starlamp-interview",
     canonical_key="key_starlamp_interview",
-    snippet="主创访谈，谈及角色设定过程。",
+    snippet="主创访谈，谈及阿雾的角色设定过程。",
     published_at="2022-01",
     source_kind_guess="INTERVIEW",
 )

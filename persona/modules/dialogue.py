@@ -50,13 +50,27 @@ from ..core.enums import (
     SessionStatus,
 )
 from ..core.errors import ErrorCode, new_error
-from ..core.ids import new_id, prefix_of
+from ..core.ids import new_id, new_token, prefix_of
 from ..core.result import Err, Ok, Result, UsageDelta, is_err, unwrap
 from ..core.types import MAX_QUERY_LIMIT, Page, Query
+from ..core.usage_ledger import (
+    OP_CHAT,
+    OUTCOME_FAILED,
+    OUTCOME_SUCCEEDED,
+    ExternalUsageLedger,
+    ModelCallLimits,
+    make_idempotency_key,
+)
 from ..providers.base import ChatRequest, Message, Provider
 from ..storage.sqlite import SqliteStorage
 from .evidence import EvidenceReader
 from .memory import MemoryQuery, MemoryView
+from .model_budget import (
+    check_model_budget,
+    count_chat_calls,
+    is_offline_provider,
+    settle_model_call,
+)
 from .persona import PersonaReader
 from .relationship import RelationshipReader
 
@@ -77,6 +91,9 @@ MEMORY_WRITE_POLICIES = (POLICY_MEMORY_WRITE_NONE, POLICY_MEMORY_WRITE_EXPLICIT)
 
 # 注入上下文的模拟记忆条数上限（防止无关记忆淹没 prompt）。
 MEMORY_CONTEXT_LIMIT = 5
+
+#: 对话提示词的版本号（进幂等键：改了提示词 = 不同请求意图）
+DIALOGUE_PROMPT_VERSION = "g2-dialogue-2026-10-16"
 
 # 隔离声明：注入给模型的 prompt 必须显式声明"以下为模拟情节，非真实事件"。
 SIMULATION_NOTICE = (
@@ -125,6 +142,18 @@ class DialogueDeps:
     只读端口保证模拟不得污染现实资料；`memory_reader` 只有 `search`；
     `memory` 只有 `write_simulated`；`storage` 理论上只写 Conversation* 两张表
     （此处直接复用 `SqliteStorage`，由模块自身约束只写会话/轮次）。
+
+    # 记账依赖（P4.8 / D-3）
+
+    `ledger` / `limits` / `usage_sink` / `task_id` / `model_hint` 让**对话的
+    模型调用也进同一本账**。此前这五个字段一个都没有，于是：
+
+    - `ConversationSession.budget_used` 有 token，`external_usage_records` 里没有行；
+    - 累计费用闸门看不到对话花掉的钱；
+    - 账单上的一笔扣费在库里查不到对应记录。
+
+    四个字段全部可选（默认 `None`）：直接构造 `DialogueService` 的单元测试不必
+    准备账本；但**装配层必须传**，否则就是"产品路径漏账"（见 `assembly.py`）。
     """
 
     profiles: PersonaReader
@@ -134,6 +163,11 @@ class DialogueDeps:
     storage: SqliteStorage
     provider: Provider
     memory_reader: MemoryReaderPort | None = None
+    ledger: ExternalUsageLedger | None = None
+    limits: ModelCallLimits | None = None
+    usage_sink: Any = None
+    task_id: str | None = None
+    model_hint: str | None = None
 
 
 @dataclass
@@ -272,6 +306,11 @@ def _str_list(value: Any) -> list[str]:
     return [str(v) for v in value]
 
 
+def _text(value: Any) -> str:
+    """去首尾空白的字符串（`None` → `""`）。"""
+    return "" if value is None else str(value).strip()
+
+
 # --------------------------------------------------------------------------
 # 服务实现
 # --------------------------------------------------------------------------
@@ -282,6 +321,8 @@ class DialogueService:
 
     def __init__(self, deps: DialogueDeps) -> None:
         self.deps = deps
+        #: 没有账本时的次数兜底（有账本时以账本为准，见 `count_chat_calls`）
+        self._calls = 0
 
     # ------------------------------------------------------------ 会话
 
@@ -456,9 +497,43 @@ class DialogueService:
                       "speaker_entity_id": speaker_entity_id,
                       "fixture_key": f"dialogue_turn:{speaker_entity_id}"},
         )
-        resp = self.deps.provider.chat(ctx, req)
+
+        # —— 发送前：预算闸门；发送后：立刻结算（P4.8 / D-3）——
+        #
+        # 记账位置必须在"判断结果是否可用"之前：返回空内容的请求同样花过钱。
+        # 离线替身（`FakeProvider` / 声明 `offline = True` 的桩）不产生外部用量，
+        # 既不预留也不落账——把它们记成 UNKNOWN 会让账本凭空多出 1 credit 的
+        # 未知占位，下一笔真实调用会被闸门误判为"有未知费用"而停手。
+        key = self._call_key(ctx, session_id, speaker_entity_id, next_index)
+        billable = not is_offline_provider(self.deps.provider)
+        ledger = self.deps.ledger if billable else None
+        if billable:
+            blocked = check_model_budget(
+                ctx, ledger=ledger, limits=self.deps.limits,
+                task_id=self.deps.task_id,
+                calls_made=count_chat_calls(ledger, self._calls), key=key)
+            if blocked is not None:
+                return blocked
+        self._calls += 1
+        try:
+            resp = self.deps.provider.chat(ctx, req)
+        except Exception:
+            # 异常同样是"请求可能已经发出去了"：先按失败结算（失败 ≠ 免费），
+            # 再原样抛出。不吞异常，也不把异常当成"没花钱"。
+            if billable:
+                self._settle(ctx, key, OUTCOME_FAILED, None)
+            raise
         if is_err(resp):
+            # 失败 ≠ 免费：预留不释放，转未知占位继续占额度
+            if billable:
+                self._settle(ctx, key, OUTCOME_FAILED, None)
             return resp  # Provider 失败 → 直接传播，不伪造成功
+        # 用量优先取 `ChatResponse.usage`，其次结果信封上的 `Ok.usage`；
+        # 两者都缺 → 未知（不填 0），与抽取器的口径一致。
+        usage = (getattr(resp.value, "usage", None)
+                 or getattr(resp, "usage", None) or None)
+        if billable:
+            self._settle(ctx, key, OUTCOME_SUCCEEDED, usage)
         text = str(resp.value.text or "").strip()
         if not text:
             return Err(new_error(
@@ -477,6 +552,40 @@ class DialogueService:
             safety_flags=context["safety_flags"],
             usage=resp.value.usage,
         ))
+
+    # ------------------------------------------------------------ 记账
+
+    def _call_key(self, ctx: CallContext, session_id: str, speaker: str,
+                  index: int) -> str:
+        """对话调用的幂等键（**事件级**，不是批量意图级）。
+
+        与抽取器的差别是刻意的：抽取是"拿这批材料抽一次"的**可重放意图**，
+        同一个键重发就是浪费钱，所以发送前要查重；对话是**每一轮都是新事件**，
+        用户点一次"重说"就是真的再花一次钱。因此键里带一个一次性 token：
+
+        - 每次真实调用都有独立键 → 账本不会把两次真实花费折叠成一笔（不漏账）；
+        - `settle()` 的幂等只防"同一次结算写两遍"，仍成立。
+
+        代价写在这里：跨进程无法保证"同一轮只花一次"。这符合对话的语义，
+        但意味着**调用方不能靠重跑来免费重试对话**。
+        """
+        provider_name = (_text(getattr(self.deps.provider, "provider_name", ""))
+                         or type(self.deps.provider).__name__)
+        return make_idempotency_key(
+            provider_name, OP_CHAT, "dialogue",
+            _text(self.deps.model_hint or ""),
+            str(session_id), str(speaker), int(index),
+            DIALOGUE_PROMPT_VERSION, new_token("dlg_"))
+
+    def _settle(self, ctx: CallContext, key: str, outcome_kind: str,
+                usage: UsageDelta | None) -> None:
+        """把这次**已经发生的**对话调用写进账本与持久层。"""
+        settle_model_call(
+            ctx, ledger=self.deps.ledger, usage_sink=self.deps.usage_sink,
+            provider_name=(_text(getattr(self.deps.provider, "provider_name", ""))
+                           or type(self.deps.provider).__name__),
+            key=key, outcome_kind=outcome_kind, usage=usage,
+            limits=self.deps.limits, task_id=self.deps.task_id)
 
     # ------------------------------------------------------------ 落盘轮次
 

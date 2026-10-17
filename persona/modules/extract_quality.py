@@ -176,14 +176,19 @@ def detect_page_type(url: str) -> str:
     return PAGE_TYPE_GENERIC
 
 
-def _mentions_any(content: str, names: list[str]) -> bool:
-    """目标人物的任一词是否出现在正文里。
+def text_mentions_any(content: str, names: list[str] | tuple[str, ...]) -> bool:
+    """目标人物的任一词是否出现在这段文本里。
+
+    **唯一实现**：正文质量门禁（`assess_content_quality`）与检索结果过滤
+    （`research.filter_and_rank`）都调这个函数。两处各写一份"怎么算提到了目标"
+    是典型的漂移来源——门禁判"提到了"、过滤判"没提到"，同一份材料在两道
+    门口得到相反结论。
 
     最小长度取 **2** 而不是 3：中文人名常是两字（如"阿雾"），
     用 3 会把两字名整个挡掉，导致明明提到了目标却被判"无关"。
 
-    误判方向是安全的：这个信号只用于"目标**没被提到**才降质"，
-    多匹配一个短词只会让我们**不**降质，不会误杀正常内容。
+    误判方向是安全的：这个信号只用于"目标**没被提到**才降质/才拒收"，
+    多匹配一个短词只会让我们**不**降质、不误杀正常内容。
     """
     lowered = (content or "").lower()
     for name in names or []:
@@ -192,6 +197,10 @@ def _mentions_any(content: str, names: list[str]) -> bool:
             if len(token) >= 2 and token in lowered:
                 return True
     return False
+
+
+# 兼容旧名（模块内既有调用点保持不变）
+_mentions_any = text_mentions_any
 
 
 # --------------------------------------------------------------------------

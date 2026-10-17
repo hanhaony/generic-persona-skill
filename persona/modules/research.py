@@ -51,6 +51,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, runtime_checkable
+from urllib.parse import unquote, urlsplit
 
 from ..core.context import CallContext
 from ..core.enums import FetchStatus, SourceKind
@@ -88,6 +89,7 @@ from .extract_quality import (
     assess_content_quality,
     has_extraction_defect,
     plan_remediation,
+    text_mentions_any,
 )
 from .compliance import (
     COMPLIANCE_STAGE_EXTRACT,
@@ -113,6 +115,11 @@ WARNING_CANDIDATE_REJECTED = "CANDIDATE_REJECTED"    # 有候选被拒（原因�
 WARNING_BATCH_DEDUP = "BATCH_DEDUP"                  # 同一批内的重复候选被折叠
 WARNING_REGISTER_DEDUP = "SOURCE_DEDUP_HIT"          # 与 Evidence 同名：命中去重，返回原记录
 WARNING_NO_EVENTS = "NO_EVENTS"                      # 本模块不产出 SourceEvent（交 Evidence）
+WARNING_IRRELEVANT_REJECTED = "CANDIDATES_IRRELEVANT"  # 与目标无关的候选被拒（P4.8 / D-2）
+WARNING_RELEVANCE_NOT_CHECKED = "RELEVANCE_NOT_CHECKED"  # 没有目标名可判 → 未做相关性过滤
+
+#: 候选与目标无关时的拒收原因前缀（`IRRELEVANT_TO_TARGET: …`）
+REASON_IRRELEVANT = "IRRELEVANT_TO_TARGET"
 # —— P4.5 补救接线（官方 query+chunks_per_source / format=text 自动重抓）——
 WARNING_EXTRACT_REMEDIATED = "EXTRACT_REMEDIATED"    # 低质量正文经官方参数补救后通过门禁
 WARNING_EXTRACT_REMEDIATION_BUDGET_STOPPED = "EXTRACT_REMEDIATION_BUDGET_STOPPED"
@@ -190,8 +197,9 @@ class ResearchPort(Protocol):
         results: list[SearchResult],
         *,
         target_entity_ids: list[str] | None = None,
+        targets: list["PersonQueryTarget"] | None = None,
     ) -> Result["RankedCandidates"]:
-        """去重 / 去无效 / 确定性排序。合规钩子（白黑名单、robots/ToS）留在这里（Q-02）。"""
+        """去重 / 去无效 / 去无关 / 确定性排序。合规钩子（白黑名单、robots/ToS）留在这里（Q-02）。"""
         ...
 
     def register(
@@ -853,6 +861,48 @@ def _batch_key(result: SearchResult) -> str:
     return _text(result.canonical_key) or _text(result.url)
 
 
+def _relevance_terms(targets: list["PersonQueryTarget"]) -> list[str]:
+    """相关性判据词表：目标本名 + 别名 + 作品名（去重保序）。
+
+    **作品名必须进词表**：一篇《X》的角色介绍页，标题里可能只有作品名，
+    只有角色名会让它被误判成"无关"。
+    """
+    terms: list[str] = []
+    for target in targets or []:
+        values = [getattr(target, "display_name", "")]
+        values.extend(list(getattr(target, "aliases", ()) or ()))
+        values.extend(list(getattr(target, "work_titles", ()) or ()))
+        for value in values:
+            text = _text(value)
+            if text and text not in terms:
+                terms.append(text)
+    return terms
+
+
+def _terms_hint(terms: list[str], limit: int = 3) -> str:
+    """词表的人类可读摘要（拒收原因里带具体词，便于人工复核）。"""
+    shown = "、".join(terms[:limit])
+    return shown + ("…" if len(terms) > limit else "")
+
+
+def _relevance_text(result: SearchResult) -> str:
+    """用于相关性判定的文本：**标题 + 摘要 + 链接路径**。
+
+    链接路径也算，是因为英文维基这类页面的标题可能只有条目名的一部分，
+    而路径 `/wiki/Sherlock_Holmes` 本身就是很强的相关性信号。
+    **域名部分不算**：`sherlock.example.com` 这种命中只说明站点名带这个词，
+    不能说明这一页在讲谁；短名字（两字）在域名里误命中的概率也不低。
+    """
+    parts = [_text(getattr(result, "title", "")),
+             _text(getattr(result, "snippet", ""))]
+    url = _text(getattr(result, "url", ""))
+    if url:
+        path = unquote(urlsplit(url).path or "")
+        parts.append(path.replace("-", " ").replace("_", " ")
+                     .replace("/", " ").replace(".", " "))
+    return " ".join(p for p in parts if p)
+
+
 # --------------------------------------------------------------------------
 # 实现
 # --------------------------------------------------------------------------
@@ -1002,8 +1052,9 @@ class ResearchService:
         results: list[SearchResult],
         *,
         target_entity_ids: list[str] | None = None,
+        targets: list["PersonQueryTarget"] | None = None,
     ) -> Result[RankedCandidates]:
-        """去重 / 去无效 / 确定性排序。
+        """去重 / 去无效 / **去无关** / 确定性排序。
 
         - 空输入**不算失败**：返回空 `accepted` + 一条 `EMPTY_INPUT` 提示。
         - 被拒项**必须记录原因**，不静默丢弃。
@@ -1011,15 +1062,43 @@ class ResearchService:
           过程可复现，不引入随机性。
         - 合规钩子（来源白/黑名单、robots/ToS）留在这里（Q-02 待定），
           当前未启用任何名单，只保留位置。
+
+        # 相关性过滤（P4.8 / D-2，用户拍板"登记 ≠ 可用"）
+
+        P4.8 R4 的真实运行里，检索词「阿灯 《雾港灯会》」返回 5 条**汽车防雾灯**
+        页面，全部被登记成"来源"——`filter_and_rank` 当时只查"字段齐不齐"，
+        完全不看"这条跟目标有没有关系"。报表上的"来源数"因此是假的。
+        现在补上最小可判据：
+
+        - 判据 = **标题 / 摘要 / 链接路径**里是否出现目标的名字、别名或作品名；
+        - 实现复用门禁同一个 `text_mentions_any()`（一处口径，两处使用）；
+        - **没有目标名可判时不做过滤**，而是显式告警 `RELEVANCE_NOT_CHECKED`——
+          宁可说"这次没判"，也不假装"都相关"。
+
+        ⚠️ 这是**字面包含**判定，不是语义相关性：措辞不同但确实相关的页面会被拒。
+        所以拒收原因里带具体词表，便于人工复核后改写检索词——**不假装它更聪明**。
         """
-        targets = _str_list(target_entity_ids)
+        entity_ids = _str_list(target_entity_ids)
         ranked = RankedCandidates()
         if not results:
             ranked.warnings.append(WarningNote(
                 code=WARNING_EMPTY_INPUT, message="没有候选可供过滤（不是失败）"))
             return Ok(ranked)
 
+        # 判据词表：目标本名 + 别名 + 作品名（作品名很重要——"《X》角色介绍"
+        # 这类页面标题里未必有角色名，但那确实是相关来源）。
+        # 调用方没传 `targets` 时退回本轮 `run()` 记下的目标（`_current_targets`）。
+        terms = _relevance_terms(
+            list(targets) if targets is not None
+            else list(getattr(self, "_current_targets", []) or []))
+        if not terms:
+            ranked.warnings.append(WarningNote(
+                code=WARNING_RELEVANCE_NOT_CHECKED,
+                message="没有可用的目标名字/作品名：**本次没有做相关性过滤**"
+                        "（结果可能包含同名噪声，登记数不代表可用数）"))
+
         seen: dict[str, RejectedCandidate] = {}
+        irrelevant = 0
         for raw in results:
             if not isinstance(raw, SearchResult):
                 ranked.rejected.append(RejectedCandidate(
@@ -1035,11 +1114,18 @@ class ResearchService:
                 ranked.rejected.append(RejectedCandidate(
                     result=raw, reason="MISSING_LOCATOR: canonical_key 与 url 均为空"))
                 continue
+            if terms and not text_mentions_any(_relevance_text(raw), terms):
+                irrelevant += 1
+                ranked.rejected.append(RejectedCandidate(
+                    result=raw,
+                    reason=f"{REASON_IRRELEVANT}: 标题、摘要与链接路径均未出现"
+                           f"{_terms_hint(terms)}——与目标无关的页面不得登记为来源"))
+                continue
             if key in seen:
                 ranked.rejected.append(RejectedCandidate(
                     result=raw, reason=f"DUPLICATE_IN_BATCH: 与已接受候选同键（{key}）"))
                 continue
-            candidate = RankedCandidate(result=raw, target_entity_ids=list(targets),
+            candidate = RankedCandidate(result=raw, target_entity_ids=list(entity_ids),
                                         rank_weight=_rank_weight_of(raw))
             seen[key] = RejectedCandidate(result=raw, reason="")  # 占位，仅用于去重
             ranked.accepted.append(candidate)
@@ -1051,6 +1137,11 @@ class ResearchService:
             ranked.warnings.append(WarningNote(
                 code=WARNING_CANDIDATE_REJECTED,
                 message=f"{len(ranked.rejected)} 条候选被拒绝（原因见 rejected）"))
+        if irrelevant:
+            ranked.warnings.append(WarningNote(
+                code=WARNING_IRRELEVANT_REJECTED,
+                message=f"{irrelevant} 条候选与目标无关，已拒收（未登记为来源）："
+                        f"相关性判据={_terms_hint(terms)}"))
         if any(r.reason.startswith("DUPLICATE_IN_BATCH") for r in ranked.rejected):
             ranked.warnings.append(WarningNote(
                 code=WARNING_BATCH_DEDUP, message="同批内存在重复候选，已折叠"))
@@ -1252,7 +1343,11 @@ class ResearchService:
                 continue
 
             ranked = self.filter_and_rank(
-                ctx, outcome.results, target_entity_ids=planned_query.target_entity_ids)
+                ctx, outcome.results,
+                target_entity_ids=planned_query.target_entity_ids,
+                # P4.8 / D-2：把目标（名字/别名/作品名）带进过滤阶段，
+                # 无关页面直接拒收——否则"N 条来源"里可能全是同名噪声。
+                targets=targets)
             if is_err(ranked):
                 return ranked
             output.warnings.extend(ranked.value.warnings)

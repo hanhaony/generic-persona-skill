@@ -495,6 +495,30 @@ D-020）、`status=AMBIGUOUS/INSUFFICIENT_EVIDENCE/CONFLICTED`（D-008）、
 
 ---
 
+### 2.29 P4.8 R4：首次真实检索运行的结论与整改项（2026-10-17）
+
+| 编号 | 决定 | 依据 | 状态 |
+| --- | --- | --- | --- |
+| D-254 | **检索词必须带上作品名**：`register_targets` 要把 `work_titles` / `adaptation_version` / `entity_type` 一起传给 `PersonQueryTarget`；`_query_target` 不得清空已有的 `work_titles`。此前 CLI 强制要求 `--work-title`，装进实体后却被丢掉，真实检索退化成查两字人名（实测查「阿灯」）。**"声明了就必须用"**，否则等于让用户白填 | R4 dry-run 实测；`plan_queries` 本就支持"名字 + 作品名" | 已修（+4 项测试） |
+| D-255 | **`filter_and_rank` 不做相关性判定是有意还是遗忘，必须明确**：现状只去重/查完整性，5 条"防雾灯"页面全部登记成来源。**登记 ≠ 可用**。下一轮要加"目标名/作品名整体命中标题或摘要"的硬判定，无关项进 `rejected` 并带原因；在此之前，任何报表**不得**把来源数当收获数 | R4 实测：5 条来源、0 条可用 | 已修（见 §2.30 / D-260） |
+| D-256 | **对话的模型调用必须走逐笔账本**：`DialogueDeps` 加 `ledger` + `usage_sink`（或在编排层结算），使每一次 `chat` 都产生一条 `ExternalUsageRecord`。现状 token 只落在 `ConversationSession.budget_used`，`external_usage_records` 里**没有这笔**——累计闸门与逐笔对账双重漏账，违反"所有真实调用必须落库"的既有拍板 | R4 实测：3 条 tavily、0 条 deepseek | 已修（见 §2.30 / D-259） |
+| D-257 | **调用清单的对话次数改为按"每轮 1 turn"标定**（或明确标注为上界）。现状 `目标数 × 轮数` 报 2 次，实际 1 次——上界没错，但会让人按 2 次的钱做预算判断。**清单的意义是"能对上账"，不是"给个安全的数字"** | R4 实测：清单 3 次模型、实际 1 次 | 已修（见 §2.30 / D-261） |
+| D-258 | **真实检索 e2e 的复现纪律**：`--dry` 必须**物理断网**（把 `_urlopen` 换成必然失败的替身，而不是"相信没人调用"）；原始响应要**增量落盘**且**读 body 失败也要记**；真实运行只发生一次，报告写错就修报告器 + `--report-only` 重放产物，**绝不为打全数字再花一次钱** | R4 工具本身出过两个错（漏记超时、档案字段形状假设错） | 已实现 |
+
+---
+
+### 2.30 P4.8 R4 整改（D-3 / D-2 / D-4）与 R4.1 换角复跑（2026-10-17）
+
+| 编号 | 决定 | 依据 | 状态 |
+| --- | --- | --- | --- |
+| D-259 | **对话与抽取共用同一套预算闸门与结算**：把抽取器里已验收的闸门逻辑提到 `persona/modules/model_budget.py`，`dialogue.draft_turn` 与 `extraction` 调**同一个** `check_model_budget()` / `settle_model_call()`。**不允许两条通道两套账**——账本最不能容忍的就是两套口径。`DialogueDeps` 增补 `ledger` / `usage_sink` / `limits` / `task_id`，装配层注入 | D-256；R4 实测账单有扣费、库里无记录 | 已修（`model_budget.py` 新建；+专项测试） |
+| D-260 | **离线替身明确声明 `offline = True` 且不记账**：请求没离开进程 ⇒ 不产生外部用量 ⇒ 既不预留也不落账。若不声明就按真实出口记账。**宁可多记一笔本地调用（几厘），也不要漏记一笔真实扣费**；反之把桩记成 UNKNOWN 会凭空产生 1 credit 未知占位，下一笔真实调用会被闸门误判停手 | D-259 落地时 e2e 桩被当在线，撞 `max_calls=1` | 已修（`FakeProvider.offline`、`e2e_p4_5a` 两个桩同步声明） |
+| D-261 | **`filter_and_rank` 加硬相关性判定**：用 `display_name` / `work_titles` / `adaptation_version` 构词表（最小长度 2），候选的标题 + 摘要 + 链接路径均未命中即进 `rejected`（原因 `IRRELEVANT_TO_TARGET: …`），**不再登记成来源**。无词表可判时**不做过滤而显式告警 `RELEVANCE_NOT_CHECKED`**（不能假装查过） | D-255；"登记 ≠ 可用" | 已修（+专项测试） |
+| D-262 | **`plan_calls` 的对话次数按实际轮次计**：`dialogues = max_rounds`（每轮 1 个 turn），不再是 `目标数 × 轮数`。e2e 脚本的硬断言同步改为 `1 抽取 + max_rounds` | D-257 | 已修 |
+| D-263 | **R4.1 换角复跑须用"真实存在"的目标**：R4 用虚构的《雾港灯会》导致 0 条可用来源，无法验证"有来源 → 有证据 → 有 traits"主路径。改用公有领域角色**福尔摩斯 / 华生**（《福尔摩斯探案集》）。**先给清单、零成本 dry-run 通过后，等用户书面授权才发真实请求** | R4 §7"没证明"第 1 条 | 已定；授权待批 |
+
+---
+
 ## 3. 尚未确定的开放问题
 
 > ⚠️ 以下问题是**真的没定**。任何人不得以"我猜是这样"为由自行实现。
@@ -602,3 +626,5 @@ D-020）、`status=AMBIGUOUS/INSUFFICIENT_EVIDENCE/CONFLICTED`（D-008）、
 | 2026-10-14 | v0.15 | 新增 §2.23（D-191 ~ D-205）：P2 的 `Research` 部分最小可运行实现（用户称 H-11A）的实现口径——编号映射 Q-37 第八轮、保留 `ResearchPort` 并按 INTERFACES §5.2 更正签名（D-110 同口径）、只注入 `SourceRegistrarPort`（仅 `register_source`，结构性堵死 F-10）、**不注入 Storage 不落自己的表**、确定性模板检索计划（Q-29）、0 结果为业务结果而非错误、过滤排序确定性且被拒项必带原因、登记只经 Evidence 且失败整体传播、run 的失败纪律（单查询失败继续 / 全失败上报 / `BUDGET_EXCEEDED` 立即传播 / `budget` 参数不记账）、隔离（只产 `Source` 恒 `PUBLIC_SOURCE`、不产 `EvidenceItem`）、`NO_RESULT` 用模块常量不改已审 `FetchStatus`、`VALIDATION.empty_targets` 未登记故复用 `required_field`（零新增错误码）、`RankedCandidate.score` → `rank_weight`（配合 INV-4 而不放宽不变式）、Mock Research Provider 放测试侧；Q-37 扩展覆盖第八轮"H-11A → 仓库 P2 Research" | 已实现，**待人工验收** |
 | 2026-10-17 | v0.18 | 新增 §2.27（D-245 ~ D-249）：P4.7 验收与整改——① **装配层默认禁止真实外呼**（`allow_real=False`，未授权记 `REAL_PROVIDER_BLOCKED`；CLI `--allow-real` 才授权；配置层与装配层是两个开关，D-245）；② `--material` 不替代模型（D-246）；③ **G12 登记**：跨源同句 ⇒ `traits` 两条同文本条目，单独立轮（D-247，详见 `RUNNING.md` §5.16）；④ P1a **S3 并入阶段三**（D-248）；⑤ `usage list` 暂缓、先定口径（D-249）。事件背景：P4.7 期间 1 次未授权真实调用 0.0019161 USD，累计 **0.0097980 USD**，人工账本不重置 | 已实现 / 已登记 |
 | 2026-10-17 | v0.19 | 新增 §2.28（D-250 ~ D-253）：P4.8 R1 + R3——① **G12 修复采用方案 A**（条目身份 = 维度+归一化说法+主体的 sha256 摘要，跨源同句合并、引用全收，旧档案不迁移，只合并归一化完全相同者）；② **检索出口接线**（`search_provider_from_settings`，`max_retries` 强制 0，与模型共用 `allow_real` 闸门，`--material` 时不建检索出口）；③ **调用清单**（`plan_calls`：检索/抓取/模型次数 + 金额 + 计量单位，清单外调用即缺陷）；④ 顺手修 `research.*` 配置在产品路径被忽略的缺口（D-253）。全量 1301 项通过；**未跑真实检索** | 已实现 |
+| 2026-10-17 | v0.20 | 新增 §2.29（D-254 ~ D-258）：P4.8 R4 首次真实检索——① **检索词必须带作品名**（D-254，已修）；② **过滤阶段无相关性判定**须补齐，登记 ≠ 可用（D-255，未修）；③ **对话模型调用必须进逐笔账本**（D-256，未修，下一轮第一项）；④ **清单对话次数按"每轮 1 turn"标定**（D-257，未修）；⑤ 真实检索 e2e 复现纪律（dry 物理断网 / 增量落盘 / 只读重放，D-258）。R4 实际：1 检索成功 + 1 超时 + 1 抓取 + 1 模型，清单外调用 0；0 证据 / 0 traits / `INSUFFICIENT_EVIDENCE`（门禁有效） | 已实现 / 已登记 |
+| 2026-10-17 | v0.21 | 新增 §2.30（D-259 ~ D-263）：P4.8 R4 整改三项——① **对话与抽取共用同一套预算闸门与结算**（新建 `persona/modules/model_budget.py`，`DialogueDeps` 补 `ledger`/`usage_sink`/`limits`/`task_id`，D-259）；② **离线替身须显式声明 `offline=True` 且不记账**（未声明一律按真实出口记，D-260）；③ **`filter_and_rank` 加硬相关性判定**，未命中目标名/作品名即进 `rejected`，无词表可判时告警 `RELEVANCE_NOT_CHECKED`（D-261）；④ **`plan_calls` 对话次数改为 `max_rounds`**（D-262）。全量 **1326 项通过**（上一基线 1305，+21）。R4.1 换角复跑定为福尔摩斯/华生，**清单已出、授权待批**（D-263） | 已实现 |

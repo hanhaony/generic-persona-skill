@@ -101,7 +101,9 @@ MATERIAL_FOG = SearchResult(
     title="雾港设定资料集",
     url="https://example.invalid/mist-harbor",
     canonical_key="key_mist_harbor",
-    snippet="雾港灯塔与看守制度的官方设定。",
+    # P4.8 / D-2：检索结果必须**提到目标**（名字/别名/作品名）才算相关。
+    # 这份材料讲的是阿雾值守的灯塔，摘要里出现她的名字才符合真实检索结果。
+    snippet="雾港灯塔与看守制度的官方设定，阿雾是常年值守者。",
     published_at="2021-05-04",
     source_kind_guess="OFFICIAL_MATERIAL",
 )
@@ -117,7 +119,7 @@ MATERIAL_TIDE = SearchResult(
     title="潮汐手记",
     url="https://example.invalid/tide-notes",
     canonical_key="key_tide_notes",
-    snippet="渔村手记，记录阿海的日常工作。",
+    snippet="渔村手记，记录阿海与阿灯的日常工作。",
     published_at="2022-03-01",
     source_kind_guess="BIOGRAPHY",
 )

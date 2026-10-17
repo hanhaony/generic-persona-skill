@@ -45,7 +45,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from ..config import AppSettings
+from ..config import DEFAULT_MODEL_ID, AppSettings
 from ..config.spec import (
     NETWORK_MODEL_PROVIDER_NAMES,
     NETWORK_PROVIDER_NAMES,
@@ -320,7 +320,9 @@ def plan_calls(
     - 检索 Provider 是离线的 `FakeProvider` → 0 次（不联网）；
     - 抓取次数只能给**上限**：要等检索结果才知道有几条可用正文；
     - 模型抽取是**一次批量**（全部材料与目标一个请求）；
-    - 对话只在**多目标**时生成（单目标按语义跳过），上限 `目标数 × 轮数`。
+    - 对话只在**多目标**时生成（单目标按语义跳过）；**每一轮只生成 1 个 turn**
+      （`DialogueService.run(max_rounds)` 每轮调一次模型），所以上限是 `轮数`，
+      不是 `目标数 × 轮数`（P4.8 / D-4 修正：此前后者把清单报大了一倍）。
     """
     materials = list(materials or [])
     search_provider = getattr(getattr(stack.research, "deps", None), "provider", None)
@@ -347,7 +349,9 @@ def plan_calls(
                        "（配置 research.*）")
 
     extractions = 1 if model_online and (materials or searches) else 0
-    dialogues = (len(targets) * max(0, int(max_rounds))
+    # 对话：每轮 1 个 turn（`DialogueService.run` 的循环体只调一次模型），
+    # 与 `BusinessOrchestrator.plan()` 的 `STAGE_DIALOGUE: max(1, rounds)` 同口径。
+    dialogues = (max(0, int(max_rounds))
                  if model_online and len(targets) >= 2 else 0)
     if model_online and len(targets) < 2:
         reasons.append("单目标：关系与对话按语义跳过，只做 1 次批量抽取")
@@ -377,15 +381,32 @@ def plan_calls(
 
 
 def _query_target(target: Any) -> PersonQueryTarget:
-    """把已登记的目标转成检索目标（只填检索真正用到的字段）。"""
+    """把已登记的目标转成检索目标（只填检索真正用到的字段）。
+
+    两种形状都要认：`PersonQueryTarget`（`register_targets` 的返回值，字段是
+    `work_titles` 复数）和别的带 `work_title`（单数）的轻对象。此前只认后者，
+    于是"已经是检索目标"的对象反而把作品名清空成 `[]` —— 清单与实际请求
+    各按各的口径算，看起来一致，其实都在查光秃秃的人名。
+    """
+    titles = [str(t) for t in (getattr(target, "work_titles", ()) or []) if str(t)]
+    if not titles:
+        single = str(getattr(target, "work_title", "") or "")
+        titles = [single] if single else []
     return PersonQueryTarget(
         entity_id=str(getattr(target, "entity_id", "")),
         display_name=str(getattr(target, "display_name", "") or ""),
         entity_type=str(getattr(target, "entity_type", "") or ""),
-        work_titles=[str(getattr(target, "work_title", "")) or ""]
-        if getattr(target, "work_title", "") else [],
+        work_titles=titles,
         adaptation_version=getattr(target, "adaptation_version", None),
     )
+
+
+def _works_of(payload: dict) -> list[str]:
+    """从已登记的实体载荷里取作品名（只取有名字的，不臆造）。"""
+    meta = payload.get("fictional_character_meta") or {}
+    return [str(work.get("title") or "")
+            for work in (meta.get("works") or [])
+            if isinstance(work, dict) and str(work.get("title") or "")]
 
 
 # --------------------------------------------------------------------------
@@ -463,8 +484,19 @@ def register_targets(
                               project_id=pid, namespace=namespace)
         if is_err(created):
             return Err(created.error)
-        targets.append(PersonQueryTarget(entity_id=str(created.value),
-                                         display_name=name))
+        # 作品名/改编版本必须**跟着目标一起走下去**：`plan_queries` 用
+        # `work_titles` 拼"基础辨识词"（名字 + 作品名）。此前这里只塞了
+        # `display_name`，于是真实检索退化成查两字人名（P4.8 R4 实测抓到：
+        # 查询词是「阿灯」「阿雾」），而 CLI 明明强制要求 `--work-title`——
+        # 声明了却不用，等于让用户白填。
+        targets.append(PersonQueryTarget(
+            entity_id=str(created.value),
+            display_name=name,
+            entity_type=entity_type,
+            work_titles=list(_works_of(payload)),
+            adaptation_version=(str(payload.get("fictional_character_meta", {})
+                                    .get("adaptation_version") or "") or None),
+        ))
     return Ok(targets)
 
 
@@ -602,7 +634,17 @@ def build_business_stack(
         profiles=persona, relations=relationship, evidence=evidence,
         memory=memory, storage=storage,
         provider=dialogue_provider or FakeProvider(),
-        memory_reader=memory))
+        memory_reader=memory,
+        # P4.8 / D-3：对话的模型调用也要进**同一本账**。此前这四项一个都没传，
+        # 于是对话花的钱只在 `ConversationSession.budget_used` 里有 token，
+        # `external_usage_records` 里一行都没有（累计闸门与逐笔对账同时漏账）。
+        # 次数上限与抽取器**共用**：`max_calls` 约束的是"本次运行几次模型调用"，
+        # 不是"抽取几次"。
+        ledger=ledger,
+        limits=model_limits_from_settings(settings),
+        usage_sink=storage,
+        task_id=options.task_id,
+        model_hint=settings.model.model_id or DEFAULT_MODEL_ID))
     task_service = TaskService(storage)
 
     # ---------------- 4. 研究（检索 + 正文抓取） ----------------

@@ -200,12 +200,12 @@ class TestUsageRecordedPerOperation(P45TestCase):
         """抓取用量必须进入 `ResearchOutput.budget_used`（P4.3 缺陷的直接回归）。"""
         stub = StubUrlopen(
             search_data={"results": [
-                {"title": "A", "url": "https://good.invalid/a", "content": "摘要"}],
+                {"title": "阿雾的资料", "url": "https://good.invalid/a", "content": "摘要"}],
                 "usage": {"credits": 1}},
             # 提到目标人物的正文：否则门禁会按"与目标无关"判低质量，
             # 触发一次补救抓取，把本例要断言的"1 次 search + 1 次 extract"搅乱。
             # （本例测的是用量入账，不是质量，夹具必须干净。）
-            extract_data={"results": [{"url": "https://good.invalid/a", "title": "A",
+            extract_data={"results": [{"url": "https://good.invalid/a", "title": "阿雾的资料",
                                        "raw_content": _prose_target(10)}],
                           "failed_results": [], "usage": {"credits": 0}})
         p = self.provider(stub)
@@ -447,7 +447,7 @@ class TestSequentialCannotBypassCeiling(P45TestCase):
 
     def test_second_call_blocked_by_reservation(self):
         stub = StubUrlopen(search_data={
-            "results": [{"title": "A", "url": "https://good.invalid/a",
+            "results": [{"title": "阿雾的资料", "url": "https://good.invalid/a",
                          "content": "摘要"}],
             "usage": {"credits": 1}})
         p = self.provider(stub)
@@ -474,7 +474,7 @@ class TestSequentialCannotBypassCeiling(P45TestCase):
                 return super().__call__(req, timeout=timeout)
 
         stub = SpyStub(search_data={
-            "results": [{"title": "A", "url": "https://good.invalid/a",
+            "results": [{"title": "阿雾的资料", "url": "https://good.invalid/a",
                          "content": "摘要"}],
             "usage": {"credits": 1}})
         p = self.provider(stub)
@@ -824,9 +824,9 @@ class TestLowQualityBlockedFromClaimExtractor(P45TestCase):
         """端到端：抓到的是导航骨架 → 出口清空 + 无材料。"""
         stub = StubUrlopen(
             search_data={"results": [
-                {"title": "A", "url": "https://good.invalid/a", "content": "摘要"}],
+                {"title": "阿雾的资料", "url": "https://good.invalid/a", "content": "摘要"}],
                 "usage": {"credits": 1}},
-            extract_data={"results": [{"url": "https://good.invalid/a", "title": "A",
+            extract_data={"results": [{"url": "https://good.invalid/a", "title": "阿雾的资料",
                                        "raw_content": _nav(40)}],
                           "failed_results": [], "usage": {"credits": 0}})
         p = self.provider(stub)
@@ -908,7 +908,7 @@ class TestExcerptWindowSelection(P45TestCase):
         """Provider 交出来的摘录就是正文窗口，不是页头。"""
         raw = _long_page()
         stub = StubUrlopen(extract_data={
-            "results": [{"url": "https://good.invalid/a", "title": "A",
+            "results": [{"url": "https://good.invalid/a", "title": "阿雾的资料",
                          "raw_content": raw}],
             "failed_results": [], "usage": {"credits": 0}})
         p = self.provider(stub)
@@ -924,7 +924,7 @@ class TestExcerptWindowSelection(P45TestCase):
         """纯导航页：Provider 交回页头（不是编造的正文），门禁随后判废。"""
         raw = _long_nav(50)
         stub = StubUrlopen(extract_data={
-            "results": [{"url": "https://good.invalid/a", "title": "A",
+            "results": [{"url": "https://good.invalid/a", "title": "阿雾的资料",
                          "raw_content": raw}],
             "failed_results": [], "usage": {"credits": 0}})
         p = self.provider(stub)
@@ -960,9 +960,9 @@ class TestQualityGateJudgesExcerpt(P45TestCase):
         raw = _long_page()
         stub = StubUrlopen(
             search_data={"results": [
-                {"title": "A", "url": "https://good.invalid/a", "content": "摘要"}],
+                {"title": "阿雾的资料", "url": "https://good.invalid/a", "content": "摘要"}],
                 "usage": {"credits": 1}},
-            extract_data={"results": [{"url": "https://good.invalid/a", "title": "A",
+            extract_data={"results": [{"url": "https://good.invalid/a", "title": "阿雾的资料",
                                        "raw_content": raw}],
                           "failed_results": [], "usage": {"credits": 0}})
         p = self.provider(stub)
@@ -1001,9 +1001,9 @@ class TestQualityGateJudgesExcerpt(P45TestCase):
         raw = _long_page()
         stub = StubUrlopen(
             search_data={"results": [
-                {"title": "A", "url": "https://good.invalid/a", "content": "摘要"}],
+                {"title": "阿雾的资料", "url": "https://good.invalid/a", "content": "摘要"}],
                 "usage": {"credits": 1}},
-            extract_data={"results": [{"url": "https://good.invalid/a", "title": "A",
+            extract_data={"results": [{"url": "https://good.invalid/a", "title": "阿雾的资料",
                                        "raw_content": raw}],
                           "failed_results": [], "usage": {"credits": 0}})
         p = self.provider(stub)
@@ -1028,9 +1028,9 @@ class TestExtractQualityInResearchFlow(P45TestCase):
     def test_quality_status_attached_to_extracted(self):
         stub = StubUrlopen(
             search_data={"results": [
-                {"title": "A", "url": "https://good.invalid/a", "content": "摘要"}],
+                {"title": "阿雾的资料", "url": "https://good.invalid/a", "content": "摘要"}],
                 "usage": {"credits": 1}},
-            extract_data={"results": [{"url": "https://good.invalid/a", "title": "A",
+            extract_data={"results": [{"url": "https://good.invalid/a", "title": "阿雾的资料",
                                        "raw_content": "阿雾" + _prose(20)}],
                           "failed_results": [], "usage": {"credits": 0}})
         p = self.provider(stub)
@@ -1045,9 +1045,9 @@ class TestExtractQualityInResearchFlow(P45TestCase):
         """门禁只标记、不丢弃：条目仍在 extracted 里，供诊断。"""
         stub = StubUrlopen(
             search_data={"results": [
-                {"title": "A", "url": "https://good.invalid/a", "content": "摘要"}],
+                {"title": "阿雾的资料", "url": "https://good.invalid/a", "content": "摘要"}],
                 "usage": {"credits": 1}},
-            extract_data={"results": [{"url": "https://good.invalid/a", "title": "A",
+            extract_data={"results": [{"url": "https://good.invalid/a", "title": "阿雾的资料",
                                        "raw_content": "太短"}],
                           "failed_results": [], "usage": {"credits": 0}})
         p = self.provider(stub)
@@ -1062,7 +1062,7 @@ class TestExtractQualityInResearchFlow(P45TestCase):
     def test_extract_failure_recorded_as_empty(self):
         stub = StubUrlopen(
             search_data={"results": [
-                {"title": "A", "url": "https://gone.invalid/a", "content": "摘要"}],
+                {"title": "阿雾的资料", "url": "https://gone.invalid/a", "content": "摘要"}],
                 "usage": {"credits": 1}},
             extract_data={"results": [], "failed_results": [
                 {"url": "https://gone.invalid/a", "error": "Failed to retrieve"}],
@@ -1168,9 +1168,9 @@ class TestRemediationIdempotencyKeys(P45TestCase):
         """
         stub = StubUrlopen(
             search_data={"results": [
-                {"title": "A", "url": "https://good.invalid/a", "content": "摘要"}],
+                {"title": "阿雾的资料", "url": "https://good.invalid/a", "content": "摘要"}],
                 "usage": {"credits": 1}},
-            extract_data={"results": [{"url": "https://good.invalid/a", "title": "A",
+            extract_data={"results": [{"url": "https://good.invalid/a", "title": "阿雾的资料",
                                        "raw_content": _prose_target(10)}],
                           "failed_results": [], "usage": {"credits": 0}})
         p = self.provider(stub)
@@ -1228,9 +1228,9 @@ class TestRemediationIdempotencyKeys(P45TestCase):
         （extract 调用次数不增长），并有显式 warning。
         """
         search_data = {"results": [
-            {"title": "A", "url": "https://good.invalid/a", "content": "摘要"}],
+            {"title": "阿雾的资料", "url": "https://good.invalid/a", "content": "摘要"}],
             "usage": {"credits": 1}}
-        extract_data = {"results": [{"url": "https://good.invalid/a", "title": "A",
+        extract_data = {"results": [{"url": "https://good.invalid/a", "title": "阿雾的资料",
                                      "raw_content": _prose_target(10)}],
                         "failed_results": [], "usage": {"credits": 0}}
         stub = StubUrlopen(search_data=search_data, extract_data=extract_data)
@@ -1253,9 +1253,9 @@ class TestRemediationIdempotencyKeys(P45TestCase):
         这个请求会真的再花一次钱，而 settle 只会静默返回 False。
         """
         search_data = {"results": [
-            {"title": "A", "url": "https://good.invalid/a", "content": "摘要"}],
+            {"title": "阿雾的资料", "url": "https://good.invalid/a", "content": "摘要"}],
             "usage": {"credits": 1}}
-        extract_data = {"results": [{"url": "https://good.invalid/a", "title": "A",
+        extract_data = {"results": [{"url": "https://good.invalid/a", "title": "阿雾的资料",
                                      "raw_content": _prose_target(10)}],
                         "failed_results": [], "usage": {"credits": 0}}
         p1 = self.provider(StubUrlopen(search_data=search_data,
@@ -1330,9 +1330,9 @@ class TestRemediationBudgetAndCounts(P45TestCase):
     def _nav_stub(self, *, error_for=None):
         return _ParamAwareExtractStub(
             search_data={"results": [
-                {"title": "A", "url": "https://good.invalid/a", "content": "摘要"}],
+                {"title": "阿雾的资料", "url": "https://good.invalid/a", "content": "摘要"}],
                 "usage": {"credits": 1}},
-            extract_data={"results": [{"url": "https://good.invalid/a", "title": "A",
+            extract_data={"results": [{"url": "https://good.invalid/a", "title": "阿雾的资料",
                                        "raw_content": _nav(40)}],
                           "failed_results": [], "usage": {"credits": 0}},
             error_for=error_for,
@@ -1465,9 +1465,9 @@ class TestRemediationRescuesContent(P45TestCase):
         """端到端：初始抓到导航骨架 → format=text 补救 → 过门禁 → 材料交出。"""
         stub = _ParamAwareExtractStub(
             search_data={"results": [
-                {"title": "A", "url": "https://good.invalid/a", "content": "摘要"}],
+                {"title": "阿雾的资料", "url": "https://good.invalid/a", "content": "摘要"}],
                 "usage": {"credits": 1}},
-            extract_data={"results": [{"url": "https://good.invalid/a", "title": "A",
+            extract_data={"results": [{"url": "https://good.invalid/a", "title": "阿雾的资料",
                                        "raw_content": _nav(40)}],
                           "failed_results": [], "usage": {"credits": 0}},
             text_content=_prose_target(10))
@@ -1507,9 +1507,9 @@ class TestRemediationRescuesContent(P45TestCase):
         """补救回来还是低质量 → 留在 rejected、诊断记下补救历史、出口清空。"""
         stub = _ParamAwareExtractStub(
             search_data={"results": [
-                {"title": "A", "url": "https://good.invalid/a", "content": "摘要"}],
+                {"title": "阿雾的资料", "url": "https://good.invalid/a", "content": "摘要"}],
                 "usage": {"credits": 1}},
-            extract_data={"results": [{"url": "https://good.invalid/a", "title": "A",
+            extract_data={"results": [{"url": "https://good.invalid/a", "title": "阿雾的资料",
                                        "raw_content": _nav(40)}],
                           "failed_results": [], "usage": {"credits": 0}},
             text_content=_nav(40))          # 补救拿回来的还是导航
@@ -1610,9 +1610,9 @@ class TestInitialExtractCarriesOfficialChunks(P45TestCase):
     def test_initial_request_carries_query_and_chunks(self):
         stub = StubUrlopen(
             search_data={"results": [
-                {"title": "A", "url": "https://good.invalid/a", "content": "摘要"}],
+                {"title": "阿雾的资料", "url": "https://good.invalid/a", "content": "摘要"}],
                 "usage": {"credits": 1}},
-            extract_data={"results": [{"url": "https://good.invalid/a", "title": "A",
+            extract_data={"results": [{"url": "https://good.invalid/a", "title": "阿雾的资料",
                                        "raw_content": _prose_target(10)}],
                           "failed_results": [], "usage": {"credits": 0}})
         p = self.provider(stub)
@@ -1634,9 +1634,9 @@ class TestInitialExtractCarriesOfficialChunks(P45TestCase):
 
         stub = StubUrlopen(
             search_data={"results": [
-                {"title": "A", "url": "https://good.invalid/a", "content": "摘要"}],
+                {"title": "阿雾的资料", "url": "https://good.invalid/a", "content": "摘要"}],
                 "usage": {"credits": 1}},
-            extract_data={"results": [{"url": "https://good.invalid/a", "title": "A",
+            extract_data={"results": [{"url": "https://good.invalid/a", "title": "阿雾的资料",
                                        "raw_content": _prose(10)}],
                           "failed_results": [], "usage": {"credits": 0}})
         p = self.provider(stub)
