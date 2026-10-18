@@ -189,6 +189,12 @@ COMPOUND_CLAIM_MIN_CLAUSES = 3
 #: 主体归属等于靠猜。R4.5 的 25/26 错绑就是这个后果。这条告警存在的意义是：
 #: 缺名字的时候**运行视图能看见**，而不是等档案张冠李戴了再回头查。
 WARNING_TARGET_NAME_MISSING = "TARGET_NAME_MISSING"
+#: **运行参数没写进审计**（D-294）：`ChatRequest.metadata` 只活在进程内，
+#: DeepSeek 侧刻意不外发；如果本地也写不进去，"这轮用的是 0 还是 0.7、
+#: 装的是哪层词表"事后就只能靠 HTTP body 反推，`trait_tag_enabled` 这种
+#: 没有对应 body 字段的**彻底查不到**。审计是旁路，写失败**不阻断抽取**，
+#: 但必须让人看见——否则又是一次"以为留痕了、其实没有"。
+WARNING_AUDIT_WRITE_FAILED = "AUDIT_WRITE_FAILED"
 
 # --------------------------------------------------------------------------
 # D-272：输出上限（**不再写死一个值**）
@@ -1017,6 +1023,9 @@ class ProviderClaimExtractor:
             max_claims_per_material=self.max_claims_per_material,
             vocabulary=self.vocabulary,
             temperature=self.temperature)
+        #: D-294：把本次调用的**运行参数**落一条本地审计。放在发送**之前**，
+        #: 是为了让失败/异常的那次调用也留下参数（"失败了"不等于"没发生"）。
+        self._audit_model_request(ctx, request, outcome)
         #: D-276：需求有上界了，但**材料数本身还是变量**。N=4 在
         #: `TOKENS_PER_CLAIM=180`（D-287）下到 **10 份**仍装得下
         #: （256+10×4×180=7456 ≤ 8192），12 份才超（8896）。
@@ -1200,6 +1209,62 @@ class ProviderClaimExtractor:
             ctx, ledger=self.ledger, limits=self.limits,
             task_id=self.task_id,
             calls_made=self._chat_calls(), key=key)
+
+    def _audit_model_request(self, ctx: CallContext, request: ChatRequest,
+                             outcome: "ExtractionOutcome") -> None:
+        """D-294：把本次模型调用的**运行参数**写一条 `model.request` 审计。
+
+        # 为什么需要它
+
+        `ChatRequest.metadata` 只活在进程内：`DeepSeekProvider._build_body()`
+        明确**不发送**它（这是对的——不该把 `prompt_version` 这类内部信息
+        交给第三方）。但此前它也**没有任何本地落盘路径**，于是
+
+        - "这轮抽取用的是 0 还是 0.7" 只能从 HTTP body 的 `temperature` 反推；
+        - `trait_tag_enabled` / `trait_tags`（装的是哪层词表）**没有对应的
+          body 字段**，事后彻底查不到（P2 遗留的同一条缺口）。
+
+        # 两条硬约束
+
+        - **旁路**：审计写失败**不阻断抽取**，只记 `AUDIT_WRITE_FAILED`
+          告警——"以为留痕了、其实没有"比没有更糟，所以必须让人看见；
+        - **不改协议**：`detail` 只进 `audit_records`，绝不进请求体
+          （外发行为零变化）。
+
+        调用时机是"请求已构造、尚未发送"：失败/异常的那次调用也要留下参数，
+        "失败了"不等于"没发生"。
+        """
+        audit = getattr(self.usage_sink, "append_audit", None)
+        if audit is None:
+            # 老实现（只有 record_external_usage / has_external_usage）不因此失效。
+            return
+        metadata = dict(getattr(request, "metadata", None) or {})
+        detail = {
+            "kind": "model_request",
+            "purpose": "claim_extraction",
+            "model": _text(getattr(request, "model_hint", None)) or _text(self.model_hint),
+            "temperature": getattr(request, "temperature", None),
+            "prompt_version": metadata.get("prompt_version"),
+            "trait_tag_enabled": metadata.get("trait_tag_enabled"),
+            "trait_tags": metadata.get("trait_tags"),
+            "max_output_tokens": metadata.get("max_output_tokens"),
+            "material_count": metadata.get("material_count"),
+            "max_claims_per_material": metadata.get("max_claims_per_material"),
+            "output_ceiling_sufficient": metadata.get("output_ceiling_sufficient"),
+        }
+        try:
+            written = audit(ctx, "INFO", "model.request", detail=detail)
+        except Exception as exc:  # noqa: BLE001 —— 旁路失败不许影响主流程
+            outcome.warnings.append(WarningNote(
+                code=WARNING_AUDIT_WRITE_FAILED,
+                message=f"运行参数审计未写入（{type(exc).__name__}: {exc}）："
+                        "模型调用照常进行，但事后无法从库里对账本次参数"))
+            return
+        if is_err(written):
+            outcome.warnings.append(WarningNote(
+                code=WARNING_AUDIT_WRITE_FAILED,
+                message=f"运行参数审计未写入（{written.error.code.value}）："
+                        "模型调用照常进行，但事后无法从库里对账本次参数"))
 
     def _settle(self, ctx: CallContext, key: str, *, outcome_kind: str,
                 usage: UsageDelta | None) -> None:

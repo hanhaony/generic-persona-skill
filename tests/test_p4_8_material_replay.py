@@ -306,16 +306,27 @@ class TestInstallReplay(CacheFileTestCase):
 class TestProbeVerdict(unittest.TestCase):
     """探针判定必须是三态可解释的结论，不能"大概正确"。
 
-    OK   = 黛玉侧材料里的宝玉说法挂给了宝玉；
-    FAIL = 挂错（D-288 复现）；
-    WARN = 探针句没被抽成 claim（本轮没测到，不是通过）。
+    OK   = 探针句在库里，主体挂对**且** `material_key` 指向注入的那份材料；
+    FAIL = 主体错（D-288 复现）**或** `material_key` 错（D-291 复现）；
+    WARN = 全库都找不到探针句（本轮没测到，不是通过）。
+
+    ⚠️ **D-295 改写了本类的判定口径**：旧实现先按 `source_id == 探针材料` 过滤，
+    再在过滤后的列表里找探针句——于是"被改归属/被拒收"的探针句永远看不见，
+    一律报 WARN（"模型没选中这句话"）。现在改为**在全库定位 + 主体/material_key
+    两行分别判**，对应的旧断言按新规则重写（不是删掉，是改判据：
+
+    - `test_evidence_from_other_sources_is_ignored` 断言 WARN → 改为断言 FAIL，
+      因为"别的源里出现探针句"恰恰就是 `material_key` 填错，不是"忽略"；
+    - 各用例的 `PROBE.text` 从占位符 `"探针"` 换成与证据同文的句子，
+      因为定位改用文本相似度（占位符与任何 claim 的相似度都是 0）。
     """
 
     TARGETS = [SimpleNamespace(display_name="林黛玉", entity_id="pe_dai"),
                SimpleNamespace(display_name="贾宝玉", entity_id="pe_bao")]
     SOURCES = [{"id": "src_dai_side", "url": "https://example.invalid/dai"}]
     PROBE = {"target": "林黛玉", "about": "贾宝玉",
-             "url": "https://example.invalid/dai", "text": "探针", "index": -1,
+             "url": "https://example.invalid/dai",
+             "text": "贾宝玉厌恶科举与禄蠹。", "index": -1,
              "placement": "extract_fulltext"}
 
     def _judge(self, evidence, sources=None):
@@ -329,6 +340,7 @@ class TestProbeVerdict(unittest.TestCase):
         verdict, lines = self._judge(evidence)
         self.assertEqual(verdict, "OK")
         self.assertTrue(any("挂给了 贾宝玉" in line for line in lines))
+        self.assertTrue(any("material_key" in line for line in lines))
 
     def test_fail_when_statement_is_bound_to_the_retrieval_target(self):
         """这正是 R4.5 的错法：材料是黛玉侧 → 整份算给黛玉。"""
@@ -340,7 +352,7 @@ class TestProbeVerdict(unittest.TestCase):
 
     def test_double_subject_still_counts_as_bound(self):
         """双主体（黛玉+宝玉）也算挂对：只要 about 在主体里。"""
-        evidence = [{"source_id": "src_dai_side", "claim": "贾宝玉厌恶科举。",
+        evidence = [{"source_id": "src_dai_side", "claim": "贾宝玉厌恶科举与禄蠹。",
                      "subject_entity_ids": ["pe_dai", "pe_bao"]}]
         self.assertEqual(self._judge(evidence)[0], "OK")
 
@@ -360,12 +372,19 @@ class TestProbeVerdict(unittest.TestCase):
                      "subject_entity_ids": ["pe_dai"]}]
         verdict, lines = self._judge(evidence)
         self.assertEqual(verdict, "WARN")
-        self.assertTrue(any("没有被抽成 claim" in line for line in lines))
+        self.assertTrue(any("没测到" in line for line in lines))
 
-    def test_evidence_from_other_sources_is_ignored(self):
-        evidence = [{"source_id": "src_bao_side", "claim": "贾宝玉厌恶科举。",
+    def test_evidence_from_another_source_fails_material_key(self):
+        """D-295 改写：别的源里出现探针句 ⇒ `material_key` 填错，必须 FAIL。
+
+        旧断言这里期望 WARN（"忽略其他源"）——**那正是盲区本身**：过滤掉以后
+        就再也发现不了"探针句被归到了别的材料"。详见 `test_p4_8_probe_judge.py`。
+        """
+        evidence = [{"source_id": "src_bao_side", "claim": "贾宝玉厌恶科举与禄蠹。",
                      "subject_entity_ids": ["pe_bao"]}]
-        self.assertEqual(self._judge(evidence)[0], "WARN")
+        verdict, lines = self._judge(evidence)
+        self.assertEqual(verdict, "FAIL")
+        self.assertTrue(any("[FAIL] material_key" in line for line in lines))
 
 
 class TestReplayDoesNotPersistUsage(CacheFileTestCase):

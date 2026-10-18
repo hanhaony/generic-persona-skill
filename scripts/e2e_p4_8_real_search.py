@@ -293,24 +293,51 @@ def _forbidden(*_args, **_kwargs):
     raise AssertionError("--dry 模式禁止任何网络调用（本应无人调用 _urlopen）")
 
 
+def _bigrams(text: str) -> set[str]:
+    """字符二元组（去空白）。用于"哪条证据才是探针句"的**定位**，不做语义判断。"""
+    compact = "".join(str(text or "").split())
+    if len(compact) < 2:
+        return {compact} if compact else set()
+    return {compact[i:i + 2] for i in range(len(compact) - 1)}
+
+
+def _similarity(a: str, b: str) -> float:
+    left, right = _bigrams(a), _bigrams(b)
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
 def _judge_probe(*, evidence: list[dict], sources: list[dict],
-                 probe_info: dict, targets: list) -> tuple[str, list[str]]:
+                 probe_info: dict, targets: list,
+                 match_threshold: float = 0.5) -> tuple[str, list[str]]:
     """判定强判别探针：`(verdict, lines)`，verdict ∈ `OK / FAIL / WARN`。
 
     R4.6 的主体 28/28 有个致命弱点：24 条所在材料满足"检索目标 = 内容主体"，
     **一个仍然按材料目标整份填的坏模型也能满分**。探针把"宝玉的说法"放进
     "黛玉侧材料"，此时两种填法第一次分叉。
 
-    三分支各自的含义（都必须是可解释的结论，不是"大概"）：
-    - `OK`  ：该源里提到宝玉的证据**挂给了宝玉** ⇒ 主体按内容走；
-    - `FAIL`：提到了但没挂给宝玉 ⇒ 错绑复现，D-288 不成立；
-    - `WARN`：探针句**没被抽成 claim** ⇒ 本轮没测到（不是通过，也不是失败）。
+    # D-295：必须**两行分别判**（主体 + `material_key`）
+
+    R4.7 的判定只在该源**已登记**的证据里找探针句，于是看不到"被改归属/被拒收"
+    的候选，把 `material_key` 填错误报成"模型没选中这句话"（WARN）。
+    现在改为：① 在**全部证据**里按文本相似度定位探针句；② 主体与 `material_key`
+    各判一行，**任一错即 FAIL**。
+
+    三分支：
+    - `OK`  ：探针句在库里，主体挂对、`material_key` 也指向注入的那份材料；
+    - `FAIL`：探针句在库里但**主体错**或 **`material_key` 错**（D-288 / D-291 复发）；
+    - `WARN`：**全库都找不到**探针句 ⇒ 本轮没测到（不是通过，也不是失败）。
+      注意：这可能是"模型没选中"，也可能是"抽到了但核验拒收"——两者在
+      证据层都表现为"不存在"，脚本无法区分，文案里必须说清。
     """
     by_name = {t.display_name: t.entity_id for t in targets}
     display_of = {t.entity_id: t.display_name for t in targets}
+    url_of = {s.get("id") or s.get("source_id"): (s.get("url") or "") for s in sources}
     lines: list[str] = []
     about_name = str(probe_info.get("about") or "")
     about_id = by_name.get(about_name)
+    probe_text = str(probe_info.get("text") or "")
     probe_sources = [s for s in sources if (s.get("url") or "") == probe_info.get("url")]
     if not probe_sources:
         lines.append(f"  [WARN] 注入的那份材料没进来源表（{probe_info.get('url')}）："
@@ -322,31 +349,51 @@ def _judge_probe(*, evidence: list[dict], sources: list[dict],
 
     source_id = probe_sources[0].get("id") or probe_sources[0].get("source_id")
     lines.append(f"  探针材料：{source_id}（属于「{probe_info.get('target')}」的检索结果）")
-    from_source = [e for e in evidence if e.get("source_id") == source_id]
-    mentioning = [e for e in from_source
-                  if about_name and about_name in str(e.get("claim") or "")]
-    lines.append(f"  该源证据 {len(from_source)} 条，其中提到「{about_name}」的 "
-                 f"{len(mentioning)} 条")
-    right = [e for e in mentioning if about_id in (e.get("subject_entity_ids") or [])]
-    wrong = [e for e in mentioning if about_id not in (e.get("subject_entity_ids") or [])]
-    for item in mentioning:
-        subject_names = [display_of.get(s, s)
-                         for s in item.get("subject_entity_ids") or []]
-        lines.append(f"    · {str(item.get('claim'))[:60]}")
-        lines.append(f"      主体={subject_names}")
-    if right and not wrong:
+    lines.append(f"  该源已登记证据 {sum(1 for e in evidence if e.get('source_id') == source_id)} 条")
+
+    #: **关键**：不按 source_id 过滤。探针句如果被改归属/挂错源，恰恰在这个
+    #: 过滤之外——R4.7 的 WARN 误报就是这么来的。
+    scored = [(_similarity(probe_text, str(e.get("claim") or "")), e) for e in evidence]
+    scored = [(score, item) for score, item in scored if score >= match_threshold]
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+
+    if not scored:
+        lines.append(f"  [WARN] 全库找不到与探针句足够相似的证据（相似度阈值 "
+                     f"{match_threshold:.2f}）：可能模型没选中这句，"
+                     "也可能抽到了但被核验拒收——证据层看不出区别，本轮记为「没测到」")
+        return "WARN", lines
+
+    score, hit = scored[0]
+    subject_ids = list(hit.get("subject_entity_ids") or [])
+    subject_names = [display_of.get(s, s) for s in subject_ids]
+    actual_source = hit.get("source_id")
+    lines.append(f"  定位到探针句（相似度 {score:.2f}）：{str(hit.get('claim'))[:60]}")
+
+    subject_ok = about_id in subject_ids
+    lines.append(f"  [{'OK ' if subject_ok else 'FAIL'}] 主体：{'挂给了 ' + about_name if subject_ok else '没有挂给 ' + about_name}"
+                 f"（subject={subject_names}）")
+
+    material_ok = actual_source == source_id
+    if material_ok:
+        lines.append(f"  [OK ] material_key：指向注入的那份材料（{source_id}）")
+    else:
+        lines.append(f"  [FAIL] material_key：指向 {actual_source}"
+                     f"（{url_of.get(actual_source, '?')}），"
+                     f"应指向 {source_id}（{probe_info.get('url')}）"
+                     "——D-291 的两段式核验没把它改回来")
+
+    if subject_ok and material_ok:
         lines.append(f"  [OK ] 结论：来自「{probe_info.get('target')}」侧材料的"
-                     f"「{about_name}」说法**挂给了 {about_name}**"
-                     "（按检索目标整份填的模型会挂错）")
+                     f"「{about_name}」说法**主体与归属都对**"
+                     "（按检索目标整份填的模型会挂错，填错材料的会指向别的源）")
         return "OK", lines
-    if wrong:
-        lines.append(f"  [FAIL] 结论：来自「{probe_info.get('target')}」侧材料的"
-                     f"「{about_name}」说法**没有挂给 {about_name}**"
-                     "——主体错绑复现，D-288 的修复不成立")
-        return "FAIL", lines
-    lines.append("  [WARN] 结论：探针句没有被抽成 claim（模型没选中这句话），"
-                 "本轮无法判定主体映射——可换探针句/调 --probe-text 再试")
-    return "WARN", lines
+    if not subject_ok and material_ok:
+        lines.append("  [FAIL] 结论：主体错绑复现，D-288 的修复不成立")
+    elif subject_ok and not material_ok:
+        lines.append("  [FAIL] 结论：主体对但归属材料错——D-291 的两段式核验失效")
+    else:
+        lines.append("  [FAIL] 结论：主体与材料归属**同时错**，D-288 与 D-291 都要复查")
+    return "FAIL", lines
 
 
 # --------------------------------------------------------------------------
@@ -648,6 +695,17 @@ def main(argv: list[str] | None = None) -> int:
     out(f"    · 夹取区间 [{OUTPUT_TOKEN_FLOOR}, {OUTPUT_TOKEN_CEILING}]；"
         f"{OUTPUT_TOKEN_CEILING} 是 DeepSeek 官方 max_tokens 上限")
 
+    #: D-294：运行参数必须**事后可查**。`ChatRequest.metadata` 不外发（正确），
+    #: 所以这里先把"将要落盘审计的那几个字段"打出来——dry 阶段不执行抽取，
+    #: 真正的落盘由离线真链路测试证明（`tests/test_p4_8_metadata_audit.py`）。
+    out("")
+    out("  本次模型调用将落盘的审计字段（`model.request`，只进本地库、不进请求体）：")
+    out(f"    · temperature        = {args.extract_temperature if args.extract_temperature is not None else DEFAULT_EXTRACT_TEMPERATURE}")
+    out(f"    · prompt_version     = {PROMPT_VERSION}")
+    out(f"    · trait_tag_enabled  = {'true' if vocabulary else 'false'}")
+    out(f"    · trait_tags         = {len(vocabulary.all_tags()) if vocabulary else 0}")
+    out(f"    · max_claims_per_material = {DEFAULT_MAX_CLAIMS_PER_MATERIAL}")
+
     planned_queries = stack.research.plan_queries(ctx, targets)
     out("")
     if is_ok(planned_queries):
@@ -874,11 +932,13 @@ def main(argv: list[str] | None = None) -> int:
     expect(run.status in (RUN_SUCCEEDED, RUN_PARTIAL),
            f"任务未失败（状态 {run.status}）")
     if probe_verdict == "FAIL":
-        expect(False, "强判别探针：材料主体≠检索目标时主体挂错")
+        #: D-295：FAIL 不再只是"主体挂错"，也可能是"`material_key` 归错"——
+        #: 两者都由 `[8.1]` 的两行分判指出，这里不再替它下结论。
+        expect(False, "强判别探针：主体或 material_key 判错（见 [8.1] 的两行分判）")
     elif probe_verdict == "WARN":
         out("  [WARN] 强判别探针未得出结论（见 [8.1]，本轮不能据此判主体映射）")
     elif probe_verdict == "OK":
-        out("  [OK ] 强判别探针：材料主体≠检索目标时，主体仍按内容挂对")
+        out("  [OK ] 强判别探针：材料主体≠检索目标时，主体与 material_key 都对")
     if replay_session is not None:
         expect(replay_session.miss_count() == 0,
                f"回放未缺项（命中 {replay_session.unique_hits} 个不同请求，"
