@@ -62,6 +62,7 @@ from persona.modules.extraction import (
     REJECT_MATERIAL_UNDECLARED,
     WARNING_CLAIM_PENDING_REVIEW,
     WARNING_MATERIAL_NOT_GATE_PASSED,
+    WARNING_MATERIAL_SUMMARY_ONLY,
     WARNING_NO_MATERIALS,
     ProviderClaimExtractor,
     target_ids_of,
@@ -661,13 +662,20 @@ class TestPendingBlocksDownstream(BusinessTestCase):
                       [w.code for w in result.warnings])
         self.assertEqual(self.fx.count("EvidenceItem"), 0, "pending 不得变成证据")
 
-    def test_strict_gate_makes_a_snippet_only_chain_produce_nothing(self):
-        """如实记录启用严格 gate 后的真实后果：只抓摘要的链路会被整体挡下。
+    def test_snippet_only_chain_produces_evidence_under_strict_gate(self):
+        """**P4.8 / D-6 改写**：只抓摘要的链路在严格 gate 下**应当产出证据**。
 
-        这不是缺陷，是 `require_gate_verdict=True` 的定义（材料必须亮出正文质量
-        门禁结论）；但它意味着**启用真实模型抽取必须先开启正文抓取**，
-        否则模型一次都不会被调用——所以配置层对
-        `require_gate_verdict=true` + `max_extracts=0` 直接拒绝加载。
+        这个用例以前断言的是反面（`chat_calls == 0`、0 条证据），并把那解释为
+        "`require_gate_verdict=True` 的定义"。R4.1 实测证明那个解释是错的：
+        7 条来源**全部真实相关**、正文抓取失败退回摘要 ⇒ 全部按"未声明"拒收
+        ⇒ 0 证据。**这不是门禁有效，是门禁把"我们没抓到正文"当成了"内容不可用"**
+        ——误杀，而且与目标是否真实存在无关。
+
+        修法（用户拍板方案 ①）：摘要带 `SUMMARY_ONLY` 一等状态进入材料流；
+        门禁只负责"亮结论"，不负责"判死刑"；最终可用性由证据层的 `tier` 决定。
+
+        ⚠️ 判废的正文（`LOW_QUALITY` / `EMPTY`）**仍然**被挡在抽取器外——
+        放行摘要不等于放松门禁，见 `tests/test_p4_8_summary_gate.py`。
         """
         a, _b, targets = self._targets()
         provider = StubChatProvider(_payload([_item(material_key=KEY_FOG,
@@ -677,9 +685,12 @@ class TestPendingBlocksDownstream(BusinessTestCase):
         with network_blocked():
             result = unwrap(self.fx.orch.run(
                 self.fx.ctx, BusinessRequest(targets=targets, max_rounds=2)))
-        self.assertEqual(provider.chat_calls, 0)
-        self.assertEqual(result.evidence_ids, [])
-        self.assertEqual(self.fx.count("EvidenceItem"), 0)
+        self.assertEqual(provider.chat_calls, 1, "摘要不再被判死刑：模型会被调用")
+        self.assertEqual(len(result.evidence_ids), 1)
+        self.assertEqual(self.fx.count("EvidenceItem"), 1)
+        self.assertIn(WARNING_MATERIAL_SUMMARY_ONLY,
+                      [w.code for w in result.warnings],
+                      "放行摘要必须留痕，不能静默通过")
 
 
 class TestConfiguredChainRegistersEvidence(BusinessTestCase):
@@ -726,7 +737,7 @@ class TestDryRun(unittest.TestCase):
         system = request.messages[0].content
         self.assertIn("忽略", system)                 # 注入边界声明
         self.assertIn("WEB_CONTENT_BEGIN", system)
-        self.assertIn("本次允许使用的主体 ID", system)
+        self.assertIn("本次允许使用的主体", system)
         self.assertIn("pe_dryrun_awu", system)        # 白名单主体
         self.assertIn("不得自造 ID", system)
         self.assertIn("verbatim_quote", system)       # 输出 schema 嵌在规则里
@@ -793,7 +804,7 @@ class TestDryRun(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("没有发送任何请求", text)
         self.assertIn("<<WEB_CONTENT_BEGIN>>", text)
-        self.assertIn("本次允许使用的主体 ID", text)
+        self.assertIn("本次允许使用的主体", text)
         self.assertIn("deepseek-flash", text)
 
 

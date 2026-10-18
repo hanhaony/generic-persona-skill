@@ -117,25 +117,28 @@ def payload_for(entity_id: str, material_key: str) -> str:
     """
     import json
 
-    def claim(key, claim_text, quote, dimension, stability):
+    #: D-280：TRAIT/HABIT 维度必须给 `trait_tag`（合法值或显式 null）；
+    #: BACKGROUND 不给字段。与真实模型在新提示词下的输出形状一致。
+    def claim(key, claim_text, quote, dimension, stability, trait_tag=None):
         return {
             "key": key, "claim": claim_text, "tier": "VERBATIM",
             "dimension": dimension, "subject_entity_ids": [entity_id],
             "material_key": material_key, "verbatim_quote": quote,
             "stability": stability, "canon_level": "CANON", "confidence": 0.9,
+            "trait_tag": trait_tag,
         }
 
     return json.dumps({"claims": [
         claim("c1", "阿雾是雾港灯塔的常年值守者",
               "阿雾是雾港灯塔的常年值守者", "BACKGROUND", "REPEATED"),
         claim("c2", "阿雾偏爱在傍晚独自巡视堤坝",
-              "阿雾偏爱在傍晚独自巡视堤坝", "HABIT", "REPEATED"),
+              "阿雾偏爱在傍晚独自巡视堤坝", "HABIT", "REPEATED", "exercise"),
         claim("c3", "阿雾向来沉默寡言",
-              "阿雾向来沉默寡言", "TRAIT", "PATTERN"),
+              "阿雾向来沉默寡言", "TRAIT", "PATTERN", "aloof"),
         claim("c4", "阿雾习惯在整点敲响灯塔的铜钟",
-              "阿雾习惯在整点敲响灯塔的铜钟", "HABIT", "PATTERN"),
+              "阿雾习惯在整点敲响灯塔的铜钟", "HABIT", "PATTERN", None),
         claim("c5", "阿雾曾在一次夜雾中连续值守七十二小时",
-              "阿雾曾在一次夜雾中连续值守七十二小时", "TRAIT", "SINGLE"),
+              "阿雾曾在一次夜雾中连续值守七十二小时", "TRAIT", "SINGLE", "persistent"),
     ]}, ensure_ascii=False)
 
 

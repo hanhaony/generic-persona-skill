@@ -316,11 +316,28 @@ def _text(value: Any) -> str:
 # --------------------------------------------------------------------------
 
 
+#: 对话的采样温度——**与抽取温度是两个独立旋钮**（`DEFAULT_EXTRACT_TEMPERATURE`
+#: 在 `extraction.py`）。
+#:
+#: 为什么保持 0.7：角色扮演要的就是措辞的自然变化，把温度压到 0 会让同一个角色
+#: 每轮都像复读；而且对话**不参与**"材料固定、两轮对照"这类实验，压低它只有坏处。
+#:
+#: 为什么独立：D-293 的结论是"抽取要可对照 ⇒ 温度要能调"。那是抽取侧的实验需求，
+#: 不是产品对对话的偏好。两者共用一个值会造成"为了跑一次实验，顺手把角色说话
+#: 改得像机器人"——所以这里必须能各调各的，谁也别去"统一一下"。
+DIALOGUE_TEMPERATURE = 0.7
+
+
 class DialogueService:
     """多人多轮对话基础服务。只依赖注入的只读端口、存储与 Provider。"""
 
-    def __init__(self, deps: DialogueDeps) -> None:
+    def __init__(self, deps: DialogueDeps, *,
+                 temperature: float | None = None) -> None:
         self.deps = deps
+        #: 对话温度。`None` ⇒ `DIALOGUE_TEMPERATURE`（0.7）。
+        #: 装配层不传 = 生产行为，与 P4.4 之后一直用的值一致。
+        self.temperature = float(DIALOGUE_TEMPERATURE if temperature is None
+                                 else temperature)
         #: 没有账本时的次数兜底（有账本时以账本为准，见 `count_chat_calls`）
         self._calls = 0
 
@@ -492,7 +509,9 @@ class DialogueService:
         # 稳定键，真实服务不受影响。
         req = ChatRequest(
             messages=messages,
-            temperature=0.7,
+            #: 对话温度：独立的旋钮（`DIALOGUE_TEMPERATURE`，默认 0.7）。
+            #: **不要**在这里改成"跟抽取保持一致"——见常量区注释。
+            temperature=self.temperature,
             metadata={"session_id": session_id,
                       "speaker_entity_id": speaker_entity_id,
                       "fixture_key": f"dialogue_turn:{speaker_entity_id}"},

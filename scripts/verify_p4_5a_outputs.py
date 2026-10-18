@@ -52,8 +52,13 @@ class Report:
 
 
 def _norm_ws(text: str) -> str:
-    """折空白（独立实现，只用标准库）。"""
-    return re.sub(r"\s+", " ", str(text or "")).strip()
+    """折空白（独立实现，只用标准库）。
+
+    D-289：口径是**丢弃**空白，不是压成一个空格——压成空格会让"材料换行/PDF 断行"
+    与"引文连写"失配，把真实存在的引文判成不在材料里（三轮 4/4 次误拒）。
+    这里刻意保留独立实现（不复用产品代码），但语义必须与产品一致。
+    """
+    return re.sub(r"\s+", "", str(text or ""))
 
 
 def verify(artifact: dict) -> Report:

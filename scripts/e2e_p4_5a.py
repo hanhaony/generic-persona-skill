@@ -991,31 +991,35 @@ def orchestrator_payload(name_to_id: dict[str, str], *,
 
     `material_key` 用材料的 `canonical_key`（= url）——抽取器就是这么定位的。
     """
+    #: D-280：第 5 列是 `trait_tag`。TRAIT/HABIT 维度**必须**从一个合法值或
+    #: `None`（显式 null："我想过但贴不上"）里选；BACKGROUND 不给字段。
+    #: 词表没有对应类目时填 null 而不是硬凑——桩也要示范"贴错比 null 更糟"。
     catalog = {
         "阿雾": (E2E_URL, [
-            ("a1", "阿雾是雾港灯塔的常年值守者", "BACKGROUND", "REPEATED"),
-            ("a2", "阿雾偏爱在傍晚独自巡视堤坝", "HABIT", "REPEATED"),
-            ("a3", "阿雾向来沉默寡言", "TRAIT", "PATTERN"),
-            ("a4", "阿雾习惯在整点敲响灯塔的铜钟", "HABIT", "PATTERN"),
-            ("a5", "阿雾曾在一次夜雾中连续值守七十二小时", "TRAIT", "SINGLE"),
+            ("a1", "阿雾是雾港灯塔的常年值守者", "BACKGROUND", "REPEATED", None),
+            ("a2", "阿雾偏爱在傍晚独自巡视堤坝", "HABIT", "REPEATED", "exercise"),
+            ("a3", "阿雾向来沉默寡言", "TRAIT", "PATTERN", "aloof"),
+            ("a4", "阿雾习惯在整点敲响灯塔的铜钟", "HABIT", "PATTERN", None),
+            ("a5", "阿雾曾在一次夜雾中连续值守七十二小时", "TRAIT", "SINGLE", "persistent"),
         ]),
         "阿灯": (E2E_URL_2, [
-            ("b1", "阿灯是雾港星灯会的常任司仪", "BACKGROUND", "REPEATED"),
-            ("b2", "阿灯喜欢在灯会开场前独自登上堤坝看海", "HABIT", "REPEATED"),
-            ("b3", "阿灯生性热烈健谈", "TRAIT", "PATTERN"),
-            ("b4", "阿灯习惯在每次灯会结束时点燃最后一盏灯", "HABIT", "PATTERN"),
-            ("b5", "阿灯曾在一次风暴夜独自护住整排灯架", "TRAIT", "SINGLE"),
+            ("b1", "阿灯是雾港星灯会的常任司仪", "BACKGROUND", "REPEATED", None),
+            ("b2", "阿灯喜欢在灯会开场前独自登上堤坝看海", "HABIT", "REPEATED", "exercise"),
+            ("b3", "阿灯生性热烈健谈", "TRAIT", "PATTERN", "optimistic"),
+            ("b4", "阿灯习惯在每次灯会结束时点燃最后一盏灯", "HABIT", "PATTERN", None),
+            ("b5", "阿灯曾在一次风暴夜独自护住整排灯架", "TRAIT", "SINGLE", "courageous"),
         ]),
     }
     claims: list[dict] = []
     for name, entity_id in name_to_id.items():
         material_key, rows = catalog[name]
-        for key, text, dimension, stability in rows:
+        for key, text, dimension, stability, trait_tag in rows:
             claims.append({
                 "key": f"{key}_{name}", "claim": text, "tier": "VERBATIM",
                 "dimension": dimension, "subject_entity_ids": [entity_id],
                 "material_key": material_key, "verbatim_quote": text,
                 "stability": stability, "canon_level": "CANON", "confidence": 0.9,
+                "trait_tag": trait_tag,
             })
 
     if with_pair and "阿雾" in name_to_id and "阿灯" in name_to_id:
@@ -1046,6 +1050,9 @@ def orchestrator_payload(name_to_id: dict[str, str], *,
                 "material_key": material_key,
                 "verbatim_quote": E2E_SHARED_SENTENCE,
                 "stability": "UNKNOWN", "canon_level": "CANON", "confidence": 0.9,
+                # D-280：两条共享句必须同标签才归并到一起（与 e2e_p4_8 真实
+                # 链路上"模型自己归纳出同一个标签"是同一件事）
+                "trait_tag": "disciplined",
             })
     return json.dumps({"claims": claims}, ensure_ascii=False)
 

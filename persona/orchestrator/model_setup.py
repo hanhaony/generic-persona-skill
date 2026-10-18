@@ -55,6 +55,7 @@ from ..core.usage_ledger import (
 from ..modules.extract_quality import QUALITY_VALID
 from ..modules.extraction import ProviderClaimExtractor, admit_materials
 from ..modules.research import PersonQueryTarget
+from ..modules.trait_vocabulary import TraitVocabulary, default_vocabulary
 from ..providers.base import ChatRequest, Provider, ProviderConfig
 from ..providers.deepseek import DEFAULT_BASE_URL, DeepSeekProvider
 from ..providers.tavily import TavilyProvider
@@ -159,6 +160,8 @@ def claim_extractor_from_settings(
     ledger: ExternalUsageLedger | None = None,
     usage_sink: Any = None,
     task_id: str | None = None,
+    vocabulary: "TraitVocabulary | None" = None,
+    temperature: float | None = None,
 ) -> ProviderClaimExtractor:
     """按配置装配一个模型驱动抽取器（**只装配，不发请求**）。
 
@@ -170,6 +173,14 @@ def claim_extractor_from_settings(
     - `usage_sink`：跨轮幂等与逐笔用量的持久化出口（建议传 `SqliteStorage`；
       不传就只有内存账本，换个进程就不知道上一轮花过什么）。
     - `task_id`：写进用量记录，便于对账，也用于**单任务上限**的归属判断。
+    - `vocabulary`：D-280 受控特征标签词表。**不传 = 默认启用 L1**（31 个
+      TRAIT/HABIT 标签）；显式传**空词表** = 关掉标签解析（schema 里不出现
+      `trait_tag`，与 trait_tag 上线前完全一致）。`None` 与空词表是两件事，
+      与 `BusinessOrchestrator(trait_vocabulary=...)` 同一条纪律——
+      空词表是 falsy，谁在这里写 `or` 谁就把"我想关掉"静默改成"用默认的"。
+    - `temperature`：抽取温度（D-293）。`None` ⇒ `DEFAULT_EXTRACT_TEMPERATURE`
+      （**生产值 0.7**）。只有对照实验才会显式传别的值（R4.8 传 0）；
+      **这不是产品默认值的开关**，别把它当成"调优点"。
     """
     return ProviderClaimExtractor(
         provider,
@@ -180,6 +191,9 @@ def claim_extractor_from_settings(
         task_id=task_id,
         # gate 开关由配置决定（P4.4-B 决策：True → 材料必须亮出门禁结论）
         require_gate_verdict=bool(settings.model.require_gate_verdict),
+        vocabulary=(vocabulary if vocabulary is not None
+                    else default_vocabulary()),
+        temperature=temperature,
     )
 
 

@@ -63,6 +63,11 @@ from ..core.result import Err, Ok, Result, UsageDelta, WarningNote, error_of, is
 from ..core.types import MAX_QUERY_LIMIT, BudgetUsage, Query, SourceMaterial
 from ..modules.dialogue import DialogueService, SessionDraft
 from ..modules.evidence import EvidenceDraft, EvidenceService, InferenceDraft
+from ..modules.extract_quality import (
+    QUALITY_SUMMARY_ONLY,
+    QUALITY_VALID,
+)
+from ..modules.trait_vocabulary import TraitVocabulary, default_vocabulary
 from ..modules.extraction import (
     CandidateClaim,
     ClaimExtractorPort,
@@ -156,6 +161,9 @@ WARNING_INFERENCE_NO_ROOT = "INFERENCE_NO_ROOT"        # 无根推断，丢弃
 WARNING_MATERIAL_GATE_REJECTED = "MATERIAL_GATE_REJECTED"  # 抓取正文未过质量门禁，未进材料流
 WARNING_MATERIAL_UNBOUND = "MATERIAL_SOURCE_UNBOUND"       # 抓取正文找不到对应已登记来源
 WARNING_MATERIAL_SUPERSEDED = "MATERIAL_SUPERSEDED"        # 同来源的检索摘要被抓取正文取代
+#: D-273：同一阶段被重试时，新结果会**覆盖**上一次的失败记录，而
+#: "SKIPPED / 0 候选"极易被读成"没有东西可抽"。把上次的失败原因带进本次告警。
+WARNING_PRIOR_ATTEMPT_SUPERSEDED = "PRIOR_ATTEMPT_SUPERSEDED"
 WARNING_MATERIAL_NOT_USABLE = "NO_MATERIAL_FROM_EXTRACTS"  # 有抓取正文但没有一份可用，退回摘要
 
 # G9：RELATION 证据未被档案消费时的**分类**告警
@@ -385,6 +393,8 @@ def _profile_item_id(dimension: EvidenceDimension, claim_key: str,
 
     `dimension` 进摘要：同一句话若被抽成 TRAIT 与 HABIT 两个维度，
     它们会落在两个不同板块里，ID 必须不同（否则 diff 口径会打架）。
+    D-283 之后这仍然成立——只是“维度”改由 `trait_tag` 的归属族决定，
+    而不是模型给的 `dimension`（见 `_effective_dimension`）。
     """
     payload = "\x00".join((dimension.value, claim_key, ",".join(subjects)))
     return "pi_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
@@ -406,6 +416,104 @@ def _dimension_of(value: Any) -> EvidenceDimension:
         return EvidenceDimension.BACKGROUND
 
 
+#: D-280 / D-283：本编排器解析"标签归属族"用的词表。默认只用 L1
+#: （`trait_vocabulary.default_vocabulary()`）；L2/L3 由 `BusinessOrchestrator(
+#: trait_vocabulary=...)` 注入。**空词表 ⇒ 所有标签都解析不出族**，
+#: 于是全部回退"没有标签"，与 trait_tag 上线前一致。
+TRAIT_VOCABULARY = default_vocabulary()
+
+
+def _trait_tag_of(item: Any) -> str:
+    """证据上的受控特征标签。缺失字段（旧证据）返回 `""`。"""
+    return _text(getattr(item, "trait_tag", ""))
+
+
+def _merge_note(bucket: dict) -> str:
+    """归并条目的 `uncertainty_note`（D-283 / D-284）。
+
+    **只在组内确实出现多种措辞时写**（一种措辞 = 没什么可说明的，不添噪声）。
+
+    这里是 `TRAIT_TAG_DIVERSITY` 的替代品。那个告警想用字符重合度识别
+    “可能误并”，实测失败：`analytical` 组（逻辑缜密 / 聪明如超人 / 智慧超群）
+    组内重合度 0.000，而“吸烟斗 vs 注射可卡因”这种真该警惕的对照对也是
+    0.000——**同义必然异形**，两头的取值完全重叠，任何阈值都在同时漏报和误报。
+
+    所以改成不做判断、只报事实：告诉读者“这一条是 N 个来源的 M 种措辞合出来的，
+    原文都在证据引用里”。**不静默，也不猜**。
+    """
+    texts = bucket.get("distinct_texts") or []
+    if len(texts) < 2:
+        return ""
+    sources = bucket.get("source_ids") or []
+    return (f"本条由 {len(sources)} 个来源的 {len(texts)} 条措辞各异的说法归并；"
+            f"原文见证据引用")
+
+
+def _effective_dimension(item: Any,
+                         vocabulary: "TraitVocabulary | None" = None) -> EvidenceDimension:
+    """这条证据该归到哪个维度 —— **标签说了算**。
+
+    D-283：`dimension` **不进归并键、也不决定板块**。R4.3 实测同一个事实
+    在不同来源会被抽成不同维度：小提琴在 baike 是 `HABIT`、在大英图书馆和
+    #3 里是 `TRAIT`；可卡因在 baike 是 `HABIT`、在大英图书馆是 `TRAIT`；
+    烟斗在 baike 是 `HABIT`、在起点是 `TRAIT`、在百科“标志性形象”里是
+    `CANON_FACT`。维度留在键里，这些永远合不到一起。
+
+    裁决顺序：
+        1. 有标签且标签族可解析 ⇒ **用标签族**（更具体、跨来源稳定）；
+        2. 有标签但解析不出族（词表被换掉了）⇒ **退回 `dimension`**，
+           但只在它是三个可标签维度之一时；否则退回 `BACKGROUND`。
+        3. 没有标签 ⇒ 用 `dimension`（**与 trait_tag 上线前完全一致**）。
+
+        第 2 条是防御：`_build_persona_draft` 可能收到手工构造的证据对象。
+
+    注意 `None` 与**空词表**是两件事：`None` = 调用方没指定，用模块默认
+    （`TRAIT_VOCABULARY`，与编排器默认值同一个源）；空词表 = 调用方明确
+    要求关掉标签解析。早先这里写 `vocabulary or TRAIT_VOCABULARY`，空词表
+    是 falsy 会被静默换成默认值，"我想关掉"的意图直接丢了（`TraitVocabulary`
+    有 `__bool__`，按标签数判真假）。
+    """
+    tag = _trait_tag_of(item)
+    if tag:
+        effective = vocabulary if vocabulary is not None else TRAIT_VOCABULARY
+        family = effective.family_of(tag)
+        if family:
+            return _dimension_of(family)
+    dimension = _dimension_of(getattr(item, "dimension", ""))
+    if tag and dimension not in (EvidenceDimension.TRAIT, EvidenceDimension.HABIT,
+                                EvidenceDimension.SPEECH_STYLE):
+        # 标签族解析不出，而 dimension 又落在不该有标签的维度上：
+        # 这个组合不该出现（校验层会拒收）。宁可按 BACKGROUND 收，
+        # 也不让一句背景描述顺着标签挤进 traits 绕过闸门（D-012 / PF-V2）。
+        return EvidenceDimension.BACKGROUND
+    return dimension
+
+
+def _merge_key(item: Any) -> tuple:
+    """**归并键（唯一实现，G6-D3 + D-283）**。
+
+    | 情形 | 键 |
+    |---|---|
+    | 有 `trait_tag` | `(主体集合, "tag:<标签>")` |
+    | 没有标签 | `(主体集合, "text:<逐字归一化后的说法>")` |
+
+    **不含 `dimension`**。`_stability_groups` 从建立起就不含它，注释写着理由：
+    “同一句话被抽成两个维度仍是同一个说法的同一次出现，按维度切开会人为压低
+    `occurrences`”。D-283 把这个口径定为唯一，并同样用于 `_build_persona_draft`
+    ——此前两处各写一遍、口径还不一样（后者含 dimension），会出现
+    “稳定性判了 2 条、条目却生成 1 条”这种对不上的账（D-3 同类问题）。
+
+    为什么"有标签就不看措辞"：标签是**受控词表**里的一个枚举值，
+    它比自然语言措辞更稳定——这正是把归一化前移到抽取时的意义。
+    `text:` 前缀让两种键不可能碰撞（一个说法不可能长成 `tag:xxx`）。
+    """
+    subjects = frozenset(_str_list(getattr(item, "subject_entity_ids", None)))
+    tag = _trait_tag_of(item)
+    if tag:
+        return (subjects, "tag:" + tag)
+    return (subjects, "text:" + _fold_whitespace(_text(getattr(item, "claim", ""))))
+
+
 # --------------------------------------------------------------------------
 # 实现
 # --------------------------------------------------------------------------
@@ -422,8 +530,17 @@ class BusinessOrchestrator:
     **业务代码不要直接调它们**。
     """
 
-    def __init__(self, deps: BusinessDeps) -> None:
+    def __init__(self, deps: BusinessDeps,
+                 trait_vocabulary: TraitVocabulary | None = None) -> None:
         self.deps = deps
+        #: D-283：解析 `trait_tag` 归属族用的词表。默认只用 L1；
+        #: L2/L3 由调用方注入（与 `ProviderClaimExtractor(vocabulary=...)` 同一个
+        #: 词表时，抽取侧与归并侧的口径才一致）。
+        #: 显式传**空词表**表示"关掉标签解析"，不是"用默认的"——空词表是
+        #: falsy，`or` 会把这两种意图混成一件事。
+        self.trait_vocabulary = (trait_vocabulary
+                                 if trait_vocabulary is not None
+                                 else TRAIT_VOCABULARY)
         self._request: BusinessRequest | None = None
         self._task_id: str = ""
         self._steps: dict[str, BusinessStepResult] = {}
@@ -527,12 +644,21 @@ class BusinessOrchestrator:
         task_id = self._task_id or _task_id_from_key(idempotency_key)
         prior = self._load_artifacts(ctx, task_id)
 
+        previous = self._steps.get(unit.name)
         step = self._dispatch(ctx, request, unit.name, prior)
         if isinstance(step, Err):
             failed = BusinessStepResult(name=unit.name, status=STEP_FAILED,
                                         message=str(step.error))
             self._steps[unit.name] = failed
             return step
+        #: D-273：重试的结果会盖掉上一次的失败，而"SKIPPED / 0 候选"会被读成
+        #: "没有东西可抽"——真相常常是"上一次已经做过并且失败了"。
+        #: 失败原因不跟着结果一起消失：把它并进本次告警。
+        if previous is not None and previous.status == STEP_FAILED:
+            step.warnings.append(WarningNote(
+                code=WARNING_PRIOR_ATTEMPT_SUPERSEDED,
+                message=f"本阶段上一次尝试是 FAILED：{previous.message}"
+                        "——本次结果已覆盖上次，这条是上次失败的唯一留痕"))
         self._steps[unit.name] = step
         return Ok(UnitOutcome(artifact_ids=dict(step.artifact_ids), usage=step.usage))
 
@@ -586,7 +712,13 @@ class BusinessOrchestrator:
         materials, flow_warnings = flow
         warnings.extend(flow_warnings)
 
-        gate_valid = sum(1 for m in materials if _text(m.quality_status))
+        #: D-6 之后"`quality_status` 非空"有了两种截然不同的含义，必须分开报：
+        #: `VALID` = 正文通过门禁，**`SUMMARY_ONLY` = 明确声明自己是摘要**（没过
+        #: 正文门禁）。混在一个"带门禁结论"里数，会让人以为摘要也过了门禁。
+        gate_valid = sum(1 for m in materials
+                         if _text(m.quality_status) == QUALITY_VALID)
+        gate_summary = sum(1 for m in materials
+                           if _text(m.quality_status) == QUALITY_SUMMARY_ONLY)
         message = (f"登记 {len(research.source_ids)} 条来源"
                    f"（计划 {research.planned_count} 条检索，"
                    f"执行 {research.executed_count} 条，"
@@ -594,7 +726,7 @@ class BusinessOrchestrator:
                    f"带回 {len(research.materials)} 份检索摘要、"
                    f"{len(research.extracted)} 份抓取正文，"
                    f"进入材料流 {len(materials)} 份"
-                   f"（其中带门禁结论 {gate_valid} 份））")
+                   f"（正文过门禁 {gate_valid} 份、摘要 {gate_summary} 份））")
         self._remember(materials)
         return BusinessStepResult(
             name=STAGE_RESEARCH, status=STEP_EXECUTED,
@@ -893,6 +1025,7 @@ class BusinessOrchestrator:
             stability=candidate.stability,
             canon_level=candidate.canon_level,
             tags=_str_list(candidate.tags) + [f"extract:{_text(method) or 'UNKNOWN'}"],
+            trait_tag=_text(getattr(candidate, "trait_tag", "")),
         )
 
     def _find_derived(
@@ -1083,17 +1216,26 @@ class BusinessOrchestrator:
     def _find_evidence(
         self, ctx: CallContext, source_id: str, draft: EvidenceDraft
     ) -> str | None | Err:
-        """幂等守卫：同来源 + 同 claim + 同主体 的证据不重复登记。"""
+        """幂等守卫：同来源 + 同 claim + 同主体 + 同 trait_tag 的证据不重复登记。
+
+        `trait_tag` 必须进这个守卫（D-283）：同一条文本带上不同标签是
+        **另一次抽取意图**的产物，不该被当成重复而静默跳过。反过来说，
+        同一文本 + 同一标签 ⇒ 同一条证据，重复登记只会让"几个来源支持"
+        这个可读事实变虚。
+        """
         page = self.deps.evidence.query_evidence(
             ctx, Query(filters={"source_id": source_id}, limit=MAX_QUERY_LIMIT))
         if is_err(page):
             return page
         wanted_claim = _text(draft.claim)
         wanted_subjects = set(_str_list(draft.subject_entity_ids))
+        wanted_tag = _text(getattr(draft, "trait_tag", ""))
         for item in page.value.items:
             if _text(item.claim) != wanted_claim:
                 continue
             if set(_str_list(item.subject_entity_ids)) != wanted_subjects:
+                continue
+            if _text(getattr(item, "trait_tag", "")) != wanted_tag:
                 continue
             return str(item.id)
         return None
@@ -1130,7 +1272,8 @@ class BusinessOrchestrator:
             entity_id = _text(target.entity_id)
             items = by_entity.get(entity_id, [])
             draft = self._build_persona_draft(
-                entity_id, items, types.get(entity_id, ""), stabilities)
+                entity_id, items, types.get(entity_id, ""), stabilities,
+                self.trait_vocabulary)
             if not items:
                 warnings.append(WarningNote(
                     code=WARNING_NO_EVIDENCE_FOR_ENTITY,
@@ -1199,19 +1342,25 @@ class BusinessOrchestrator:
 
     @staticmethod
     def _stability_groups(items: list[Any]) -> dict[tuple, list[Any]]:
-        """按「归一化说法 + 主体集合」把证据归组（G6-D3）。
+        """按**归并键**把证据归组（G6-D3 + D-283）。
+
+        键 = `_merge_key(item)`，**唯一实现**，`_build_persona_draft` 用的是
+        同一个函数——此前两处各写一遍且口径不同（条目侧含 `dimension`、
+        判定侧不含），会出现"稳定性判了 2 条、条目却生成 1 条"的账
+        （D-3「两条通道两套账」的同一类教训）。
 
         **不含 `dimension`**：同一句话被抽成两个维度（如同时是 HABIT 与 TRAIT）
         仍是**同一个说法的同一次出现**，按维度切开会人为压低 `occurrences`。
 
-        归一化只折空白（与 `evidence._normalize_claim`、D-104 同口径）：
-        这是"确定性可判定"的上限，语义级聚类需要模型，本实现不含。
+        有 `trait_tag` 时**不看措辞**（D-280）：标签是受控词表里的枚举值，
+        比自然语言措辞稳定，这正是把归一化前移到抽取时的意义。
+        没有标签时退回逐字归一化（只折空白，与 `evidence._normalize_claim`
+        D-104 同口径）——这是"确定性可判定"的上限，语义级聚类需要模型，
+        本实现不含。
         """
         groups: dict[tuple, list[Any]] = {}
         for item in items:
-            key = (_fold_whitespace(_text(item.claim)),
-                   frozenset(_str_list(item.subject_entity_ids)))
-            groups.setdefault(key, []).append(item)
+            groups.setdefault(_merge_key(item), []).append(item)
         return groups
 
     def _assess_stabilities(
@@ -1240,7 +1389,7 @@ class BusinessOrchestrator:
         if not items:
             return judged
         unassessed: list[str] = []
-        for (claim_key, _subjects), members in self._stability_groups(items).items():
+        for (_subjects, claim_key), members in self._stability_groups(items).items():
             pending = [i for i in members
                        if _stability_of(getattr(i, "stability", None)) == Stability.UNKNOWN]
             if not pending:
@@ -1276,6 +1425,7 @@ class BusinessOrchestrator:
     def _build_persona_draft(
         entity_id: str, items: list[Any], entity_type: str,
         stabilities: dict[str, Stability] | None = None,
+        vocabulary: "TraitVocabulary | None" = None,
     ) -> PersonaProfileDraft:
         """证据 → 档案条目（**按维度搬运，不做语义理解**）。
 
@@ -1298,6 +1448,15 @@ class BusinessOrchestrator:
         "归一化（折空白）完全相同"的说法——措辞不同的同义句仍各自成条，
         那是语义聚类（P1b），不在本方法的能力范围内。
         **旧档案不做 id 迁移**：档案是版本化的，新口径只影响新生成的版本。
+
+        D-280 / D-282 / D-283（本轮）：**归并键改成 `trait_tag` 优先**。
+        有标签 ⇒ `(主体集合, tag:标签)`，不看措辞（受控词表比自然语言稳定，
+        归一化由此前移到抽取时）；没有标签 ⇒ 退回逐字归一化（与今天一致）。
+        键的**唯一实现**是模块级 `_merge_key()`，`_stability_groups` 用的是
+        同一个函数——此前两处各写一遍且口径不同（后者含 `dimension`），
+        会出现"稳定性判了 2 条、条目却生成 1 条"的账（D-3 同类）。
+        板块由**标签归属族**决定（`_effective_dimension`），`dimension` 进 ID 摘要
+        但不进归并键、不决定板块。
         """
         background: list[str] = []
         background_refs: list[str] = []
@@ -1325,7 +1484,8 @@ class BusinessOrchestrator:
                 stability = _stability_of(
                     getattr(item, "effective_stability", None) or item.stability)
             variants.extend(_str_list(item.applicable_variant_ids))
-            dimension = _dimension_of(item.dimension)
+            # D-283：板块由**标签族**决定，不由模型给的 `dimension` 决定。
+            dimension = _effective_dimension(item, vocabulary)
 
             if dimension == EvidenceDimension.BACKGROUND:
                 # 文本板块没有 item_id：重复文本只留一次，但**证据引用一条不丢**
@@ -1349,40 +1509,57 @@ class BusinessOrchestrator:
                     non_canon_refs.append(str(item.source_id))
                 continue
 
-            subjects = tuple(sorted(_str_list(item.subject_entity_ids)))
-            bucket = groups.get((dimension, _fold_whitespace(claim), subjects))
+            #: D-283：**用唯一的归并键**，与 `_stability_groups` 同一个函数。
+            #: 此前这里是 `(dimension, 说法, 主体)` —— 与判定侧的
+            #: `(说法, 主体)` 口径不同，会出现"稳定性判了 2 条、
+            #: 条目却生成 1 条"这种对不上的账。
+            key = _merge_key(item)
+            bucket = groups.get(key)
             if bucket is None:
-                bucket = {"text": claim, "refs": [], "stabilities": []}
-                groups[(dimension, _fold_whitespace(claim), subjects)] = bucket
+                bucket = {"text": claim, "refs": [], "stabilities": [],
+                          "dimension": dimension,
+                          "distinct_texts": [], "source_ids": []}
+                groups[key] = bucket
             bucket["refs"].append(evidence_id)
             bucket["stabilities"].append(stability)
+            #: D-283：组内保留**全部原始措辞**。归并后的条目只显示第一条，
+            #: 但“这条其实是 N 个来源的 M 种说法合出来的”必须可查——
+            #: 这是替代 `TRAIT_TAG_DIVERSITY` 字符重合度告警的办法：
+            #: 那个指标对“真同义”和“真误并”给同样的 0.000（D-284），
+            #: 靠它告警等于同时漏报和误报；如实列出措辞差异才可靠。
+            if claim and claim not in bucket["distinct_texts"]:
+                bucket["distinct_texts"].append(claim)
+            sid = _text(getattr(item, "source_id", ""))
+            if sid and sid not in bucket["source_ids"]:
+                bucket["source_ids"].append(sid)
 
         traits: list[ProfileItem] = []
         single_events: list[ProfileItem] = []
         habits: list[ProfileItem] = []
         experiences: list[TimelineItem] = []
 
-        for (dimension, claim_key, subjects), bucket in groups.items():
+        for key, bucket in groups.items():
+            dimension = bucket["dimension"]
+            claim_key = key[1]           # "tag:<标签>" 或 "text:<归一化说法>"
+            subjects = tuple(sorted(key[0]))
             item_id = _profile_item_id(dimension, claim_key, subjects)
             refs = list(dict.fromkeys(bucket["refs"]))   # 去重且保序
             stability = _strongest_stability(bucket["stabilities"])
             text = bucket["text"]
+            entry = ProfileItem(item_id=item_id, text=text,
+                                confidence=0.0, evidence_refs=refs,
+                                stability=stability,
+                                uncertainty_note=_merge_note(bucket))
             if dimension == EvidenceDimension.TRAIT:
-                entry = ProfileItem(item_id=item_id, text=text,
-                                    confidence=0.0, evidence_refs=refs,
-                                    stability=stability)
                 if stability in _NON_TRAIT_STABILITIES:
                     single_events.append(entry)
                 else:
                     traits.append(entry)
             elif dimension == EvidenceDimension.HABIT:
-                habits.append(ProfileItem(item_id=item_id, text=text,
-                                          confidence=0.0, evidence_refs=refs,
-                                          stability=stability))
+                habits.append(entry)
             elif dimension == EvidenceDimension.EXPERIENCE:
-                experiences.append(TimelineItem(item_id=item_id, text=text,
-                                                confidence=0.0, evidence_refs=refs,
-                                                stability=stability))
+                experiences.append(TimelineItem(**{**vars(entry),
+                                                   "occurred_at": None}))
 
         fictional = entity_type != EntityType.REAL_PERSON
         canon = None
@@ -1408,6 +1585,44 @@ class BusinessOrchestrator:
             open_questions.append(
                 "本次证据中没有可用于人物档案的维度"
                 "（例如 RELATION 维度归关系档案），人物档案各维度待补")
+
+        #: 只读证据锚点（D-278 保守版）：**不进 `traits`**，只回答
+        #: "这个特征有几条来源提到"。
+        #:
+        #: 分组键与条目口径**完全一致**（D-283：`_merge_key()`，有标签时
+        #: 按标签、没有时按逐字说法），所以"跨源同义但措辞不同"在这里
+        #: **可能并成一行**（那是 trait_tag 的功劳，不是本字段的能力）。
+        #: 本字段**仍然不解决**"没有标签的同义说法怎么并"，只是让
+        #: "证据到底说了什么"在档案里可见，别让档案读起来像全空。
+        anchors: dict[tuple, dict] = {}
+        for item in items:
+            dimension = _effective_dimension(item, vocabulary)
+            key = _merge_key(item)
+            bucket = anchors.get(key)
+            if bucket is None:
+                bucket = {"feature": _text(item.claim),
+                          "dimension": str(dimension),
+                          "subjects": list(sorted(key[0])),
+                          "evidence_ids": [], "source_ids": []}
+                anchors[key] = bucket
+            evidence_id = str(item.id)
+            if evidence_id not in bucket["evidence_ids"]:
+                bucket["evidence_ids"].append(evidence_id)
+            sid = _text(getattr(item, "source_id", "")) or ""
+            if sid and sid not in bucket["source_ids"]:
+                bucket["source_ids"].append(sid)
+        evidence_anchors = sorted(
+            anchors.values(),
+            key=lambda a: (-len(a["source_ids"]), -len(a["evidence_ids"]),
+                           str(a["dimension"]), str(a["feature"])))
+        for anchor in evidence_anchors:
+            #: 计数在这里先算一遍，让**草稿形状 == 落盘形状**；落盘时
+            #: `_anchor_view` 还会再算一次（那次才是防编造的闸门）
+            anchor["evidence_count"] = len(anchor["evidence_ids"])
+            anchor["source_count"] = len(anchor["source_ids"])
+            #: 恒 False：锚点是"看得见"，不是"固化成特质"
+            anchor["in_traits"] = False
+
         return PersonaProfileDraft(
             entity_id=entity_id,
             background=ProfileSection(text=" ".join(background), confidence=0.0,
@@ -1423,6 +1638,7 @@ class BusinessOrchestrator:
             open_questions=open_questions,
             status=ProfileStatus.OK if items else ProfileStatus.INSUFFICIENT_EVIDENCE,
             change_reason="",
+            evidence_anchors=evidence_anchors,
         )
 
     def _write_persona(

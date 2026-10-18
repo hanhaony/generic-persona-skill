@@ -150,6 +150,17 @@ class StackOptions:
     extraction_strategy: Any = None
     search_metadata: dict[str, Any] = field(default_factory=dict)
     quality_min_effective_chars: int | None = None
+    #: D-280 trait_tag 词表。`None` = 用默认 L1（**抽取侧与编排侧同一份**：
+    #: 装配时同时喂给 `claim_extractor_from_settings` 和 `BusinessOrchestrator`，
+    #: 两侧口径必须一致，否则抽取器放行的 L2 标签在归并侧解析不出族）。
+    #: 传**空词表** = 显式关掉标签解析（与 trait_tag 上线前一致）。
+    trait_vocabulary: Any = None
+    #: D-293 抽取温度。`None` = 生产默认 0.7（`DEFAULT_EXTRACT_TEMPERATURE`）。
+    #: **只给对照实验用**：R4.8 传 0 验"同材料同输入是否同输出"。
+    #: 不要把它接进产品配置去"调优"——0 会压掉选材与措辞的自然变化。
+    #: 对话温度不在这里：那是 `DialogueService` 自己的旋钮（`DIALOGUE_TEMPERATURE`），
+    #: 两者刻意不共用。
+    extract_temperature: float | None = None
 
 
 # --------------------------------------------------------------------------
@@ -266,6 +277,10 @@ class CallPlan:
     est_model_cost: float | None
     currency: str
     reasons: list[str]
+    #: 低质量正文的**补救**抓取上限（D-288 另记）：它与 `max_extracts` 是
+    #: **两份额度**（补救不占初始名额）。不计入 `est_search_credits`——
+    #: 补救通常因同一 URL 仍不合格而 0 计费，按最坏情况翻倍会把预估报高。
+    remediations: int = 0
 
     def as_lines(self) -> list[str]:
         """给 CLI 直接打印的行（**不含**任何密钥与单价明细）。"""
@@ -278,8 +293,11 @@ class CallPlan:
         if self.extracts_upper_bound == 0:
             lines.append("  抓取正文        : 0 次")
         else:
-            lines.append(f"  抓取正文        : ≤{self.extracts_upper_bound} 次"
-                         f"（`max_extracts` 上限；单条失败官方不计费）")
+            total = self.extracts_upper_bound + self.remediations
+            detail = (f"{self.extracts_upper_bound} 初始 + {self.remediations} 补救"
+                      if self.remediations else "`max_extracts` 上限")
+            lines.append(f"  抓取正文        : ≤{total} 次（{detail}；"
+                         f"补救不占初始名额，单条失败官方不计费）")
         calls = self.extractions + self.dialogues
         if calls == 0:
             lines.append("  模型调用        : 0 次")
@@ -345,7 +363,9 @@ def plan_calls(
             stack.ctx, [_query_target(t) for t in targets])
         searches = len(planned.value) if is_ok(planned) else len(targets)
         extracts = int(limits.max_extracts)
-        reasons.append(f"检索上限 {limits.max_queries} 次 / 抓取上限 {limits.max_extracts} 次"
+        reasons.append(f"检索上限 {limits.max_queries} 次 / 抓取上限 "
+                       f"{limits.max_extracts} 次 + 补救 "
+                       f"{int(getattr(limits, 'max_remediations', 0) or 0)} 次"
                        "（配置 research.*）")
 
     extractions = 1 if model_online and (materials or searches) else 0
@@ -377,6 +397,7 @@ def plan_calls(
         est_model_cost=est_model,
         currency=model_limits_from_settings(stack.settings).currency,
         reasons=reasons,
+        remediations=int(getattr(limits, "max_remediations", 0) or 0),
     )
 
 
@@ -716,7 +737,9 @@ def build_business_stack(
     if extractor is None and chat_provider is not None:
         extractor = claim_extractor_from_settings(
             settings, chat_provider,
-            ledger=ledger, usage_sink=storage, task_id=options.task_id)
+            ledger=ledger, usage_sink=storage, task_id=options.task_id,
+            vocabulary=options.trait_vocabulary,
+            temperature=options.extract_temperature)
     if extractor is None:
         warnings.append(WarningNote(
             code=WARNING_STACK_EXTRACTOR_ABSENT,
@@ -738,11 +761,17 @@ def build_business_stack(
                         "perspectives / feeling_toward 留空（不臆造）"))
 
     # ---------------- 7. 编排器 ----------------
-    orchestrator = BusinessOrchestrator(BusinessDeps(
-        research=research, evidence=evidence, persona=persona,
-        relationship=relationship, dialogue=dialogue,
-        task_service=task_service, storage=storage,
-        claim_extractor=extractor, relationship_analyzer=analyzer))
+    #: D-280/D-283：词表**两侧同一份**。`StackOptions.trait_vocabulary=None`
+    #: 时 `BusinessOrchestrator` 用它自己的默认（L1），与
+    #: `claim_extractor_from_settings` 的默认一致；调用方显式注入时，
+    #: 两侧都收到同一个对象，抽取侧放行的标签在归并侧才解析得出族。
+    orchestrator = BusinessOrchestrator(
+        BusinessDeps(
+            research=research, evidence=evidence, persona=persona,
+            relationship=relationship, dialogue=dialogue,
+            task_service=task_service, storage=storage,
+            claim_extractor=extractor, relationship_analyzer=analyzer),
+        trait_vocabulary=options.trait_vocabulary)
 
     return Ok(BusinessStack(
         settings=settings,

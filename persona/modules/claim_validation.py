@@ -59,10 +59,13 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 from .compliance import detect_prompt_injection
 from .extract_quality import QUALITY_VALID
+
+if TYPE_CHECKING:                        # 只为类型标注；运行期不引入循环依赖
+    from .trait_vocabulary import TraitVocabulary
 
 # --------------------------------------------------------------------------
 # 常量：结论 / 拒收原因 / 待审核原因
@@ -102,6 +105,17 @@ REJECT_INFERENCE_WITH_QUOTE = "INFERENCE_WITH_QUOTE"
 REJECT_INFERENCE_NO_DERIVATION = "INFERENCE_NO_DERIVATION"
 REJECT_TOO_LONG = "TOO_LONG"
 REJECT_TOO_MANY_CLAIMS = "TOO_MANY_CLAIMS"
+# —— trait_tag（D-280 / D-283）——
+#: 标签不在受控词表里。**不自造标签，也不把造出来的标签改写成词表里的某一个**：
+#: 改写等于替模型做决定，而且会静默改变归并结果（D-280 §5）。
+REJECT_TRAIT_TAG_NOT_IN_VOCABULARY = "TRAIT_TAG_NOT_IN_VOCABULARY"
+#: 该维度已启用 trait_tag（词表里存在这个族的标签），但候选没给。
+#: 方案 §3 要求"两边都硬"：可填可不填会让模型随机发挥，归并就废了。
+REJECT_TRAIT_TAG_MISSING = "TRAIT_TAG_MISSING"
+#: 未启用 trait_tag 的维度（BACKGROUND / EXPERIENCE / RELATION / CANON_FACT）
+#: 填了标签。**必须拒收而不是"以标签为准"**：否则一句背景描述可以被贴个
+#: `analytical` 直接送进 `traits`，那是绕过稳定性闸门（D-012 / PF-V2）。
+REJECT_TRAIT_TAG_UNEXPECTED_DIMENSION = "TRAIT_TAG_UNEXPECTED_DIMENSION"
 
 # —— 待审核原因（结构合法但核验不了）——
 PENDING_EMPTY_QUOTE = "EMPTY_QUOTE"                    # 声称原话却没给摘录
@@ -115,6 +129,17 @@ ISSUE_CONFIDENCE_UNSPECIFIED = "CONFIDENCE_UNSPECIFIED"
 ISSUE_SUBJECT_ALLOWLIST_EMPTY = "SUBJECT_ALLOWLIST_EMPTY"
 ISSUE_DATE_NOT_VERIFIED_DROPPED = "DATE_NOT_VERIFIED_DROPPED"  # 日期核验不过 → 弃用该日期
 ISSUE_FORGED_METADATA_IGNORED = "FORGED_METADATA_IGNORED"      # 自报元数据已忽略
+#: D-291：模型自报的 `material_key` 与"引文逐字出现在哪份材料"不一致，**已按引文改正**
+ISSUE_MATERIAL_KEY_CORRECTED = "MATERIAL_KEY_CORRECTED"
+#: D-291：引文在多份材料里都逐字出现，只能按第一份归属（如实记录，不假装确定）
+ISSUE_MATERIAL_KEY_AMBIGUOUS = "MATERIAL_KEY_AMBIGUOUS"
+#: 两个**已启用** trait_tag 的维度之间族不一致（如 `dimension=TRAIT` 却贴了
+#: `music`）。按 D-283 **采纳标签族、保留原 dimension、如实记录**——不拒收：
+#: R4.3 实测同一个事实在不同来源被抽成不同维度（小提琴在 baike 是 HABIT、
+#: 在大英图书馆是 TRAIT），维度不可靠，以更具体的标签为准。
+#: 非启用维度上的标签一律拒收（`REJECT_TRAIT_TAG_UNEXPECTED_DIMENSION`），
+#: 那是另一回事：那是在允许绕过闸门。
+ISSUE_TRAIT_TAG_DIMENSION_MISMATCH = "TRAIT_TAG_DIMENSION_MISMATCH"
 
 # 模型**不得**自己填写来源元数据：这些键出现即记录，且与材料不符时转待审核
 FORGED_METADATA_KEYS: tuple[str, ...] = (
@@ -136,9 +161,15 @@ _REFUSAL_MARKERS: tuple[str, ...] = (
 
 @dataclass(frozen=True)
 class ValidationLimits:
-    """长度与数量上限（P4.4-A 第三步第 1 点）。**全部可配**。"""
+    """长度与数量上限（P4.4-A 第三步第 1 点）。**全部可配**。
 
-    max_claims: int = 30              # 单次返回最多处理多少条候选
+    `max_claims` 必须**不小于**提示词允许的最大条数
+    （`材料数 × max_claims_per_material`，R4.4 是 9 × 4 = 36）：
+    设小了会让遵守提示词的输出被判 `TOO_MANY_CLAIMS` 拒收，
+    那等于用一个常量把另一条链路的成果作废。
+    """
+
+    max_claims: int = 60              # 单次返回最多处理多少条候选
     max_claim_chars: int = 600        # 单条主张的长度上限
     max_quote_chars: int = 1200       # 单条摘录的长度上限
     max_note_chars: int = 300         # 说明字段上限
@@ -165,7 +196,9 @@ class MaterialText:
     title: str = ""
     url: str = ""
     text: str = ""                    # **送给模型的正文/摘要**（核验只针对它）
-    quality_status: str = ""          # 门禁结论（"" = 未声明，如检索摘要）
+    #: 门禁结论。`""` = 来源方没给；`SUMMARY_ONLY` = 明确声明"我是检索摘要"
+    #: （P4.8 / D-6）。两者不是一回事：前者是信息缺失，后者是信息完整。
+    quality_status: str = ""
     untrusted: bool = False           # 是否检测到疑似提示注入
     injection: list[str] = field(default_factory=list)
 
@@ -188,6 +221,10 @@ class ValidatedClaim:
     derivation_keys: list[str] = field(default_factory=list)
     note: str = ""
     issues: list[str] = field(default_factory=list)
+    #: 受控特征标签（D-280）。**只能从词表里选**，`""` = 没有标签
+    #: （该维度未启用 trait_tag，或模型明示 `null`）。
+    #: 归并键与条目板块都由它决定，`dimension` 不参与（D-283）。
+    trait_tag: str = ""
 
 
 @dataclass
@@ -257,38 +294,49 @@ def _text(value: Any) -> str:
 
 
 def _norm_ws(text: str) -> str:
-    """折空白：把任意连续空白折成一个空格（**不**改大小写、不压语义）。"""
-    return " ".join(str(text or "").split())
+    """折空白：**丢弃**所有空白字符（不是压成一个空格）。
+
+    D-289（R4.6 实测）：早先实现是 `" ".join(text.split())`——把连续空白压成
+    **一个空格**。对中文长材料（PDF 抽取、硬换行）来说这是个真 bug：换行落在
+    句子中间时，材料折完多出一个空格、而模型的引文没有这个空格 ⇒ `find` 返回
+    -1 ⇒ **把真实存在的引文判成"不在材料里"**。三轮实测 4/4 次
+    `QUOTE_NOT_IN_MATERIAL` 全是这种误拒（详见 `docs/P4_8_R46_REAL_SEARCH.md` §5）。
+
+    **为什么丢弃而不是"空格可选匹配"**：丢弃对定位更简单——`_norm_index_map`
+    只为保留的字符记下标，折后串与原文一一对应，命中区间可直接还原；而"每个字符
+    之间允许空白"需要正则回溯，长材料上更慢，还是同一件事。
+
+    **为什么不损失严格性**：丢空白只放过"空白差异"，字符本身必须**按顺序、完整**
+    出现——改写、删字、换序、跨句拼接仍然对不上（见
+    `tests/test_p4_8_quote_whitespace.py` 的反向用例）。
+    """
+    return "".join(str(text or "").split())
 
 
 def _norm_index_map(text: str) -> tuple[str, list[int]]:
-    """折空白后的文本 + 每个折后字符对应的**原文本下标**。
+    """折空白（丢空白）后的文本 + 每个折后字符对应的**原文本下标**。
 
-    有了这张映射，"在折空白文本里找到的位置"才能还原成"原文里的位置"，
-    定位才不是假的。
+    有了这张映射，"在折后文本里找到的位置"才能还原成"原文里的位置"，
+    定位才不是假的：`start=index[found]`、`end=index[found+len-1]+1`。
     """
     chars: list[str] = []
     index: list[int] = []
-    pending_space = False
     for position, char in enumerate(text):
         if char.isspace():
-            if chars:
-                pending_space = True
             continue
-        if pending_space:
-            chars.append(" ")
-            index.append(position)
-            pending_space = False
         chars.append(char)
         index.append(position)
     return "".join(chars), index
 
 
+
 def find_quote_span(quote: str, text: str) -> tuple[int, int] | None:
     """在材料文本里定位摘录，返回 `[start, end)`；找不到返回 `None`。
 
-    两轮匹配：**先逐字**（最严格），再**折空白后逐字**（容忍换行/缩进差异）。
-    两轮都不中 → 找不到，不接受"意思差不多"。
+    两轮匹配：**先逐字**（最严格），再**丢掉空白后逐字**（容忍换行/缩进/PDF 断行
+    在句内插入的空白）。丢空白是 D-289 的修法：早先"压成一个空格"会让
+    "材料有空格、引文没有"这种最常见的差异失配。
+    两轮都不中 → 找不到，**不接受"意思差不多"**。
     """
     needle = str(quote or "")
     haystack = str(text or "")
@@ -419,6 +467,81 @@ def _str_list_strict(value: Any) -> list[str] | None:
     return items
 
 
+def _validate_trait_tag(
+    item: Any,
+    index: int,
+    *,
+    key: str,
+    dimension: str,
+    vocabulary: "TraitVocabulary | None",
+    issues: list[str],
+    result: ClaimValidationResult,
+) -> str | None:
+    """校验 `trait_tag`。
+
+    词表为空（`None` 或没有任何标签）⇒ **彻底的直通**：schema 里不会有
+    这个字段、提示词不会提它、这里也就不管它。这是"不装词表就与
+    trait_tag 上线之前完全一致"的第三道保证（前两道是 schema 与
+    提示词，方案 §8 第 3 项）。
+
+    返回：
+        - `str`：通过。值为归一化后的标签（`""` = 这条没有标签）
+        - `None`：**已拒收**，调用方必须立刻停止本条的后续校验
+
+    与 `_validate_item` 其它检查同一纪律：**一条候选只记一个拒收原因**
+    （先发现最根本的那个），不把同一批字段反复重报。
+    """
+    if vocabulary is None or not vocabulary:
+        return ""
+    raw = item.get("trait_tag")
+    if raw is not None and not isinstance(raw, str):
+        _reject(result, item, REJECT_TYPE_ERROR,
+                f"第 {index} 条候选的 trait_tag 必须是字符串"
+                f"（收到 {type(raw).__name__}）：不做自动转换", key=key)
+        return None
+    tag = _text(raw)
+    enabled = vocabulary.enabled_dimensions()
+    if not tag:
+        #: **显式 `null` 与"字段缺失"是两回事**（D-280 §5）：null 是模型
+        #: 说"这条归不进任何标签"——那是合法的"我不知道"，该条回退按原文
+        #: 归并（与 trait_tag 上线前行为一致）；而字段缺失是模型压根没考虑
+        #: 这件事，正是"可填可不填会让模型随机发挥"的那个漏洞。
+        explicit_null = ("trait_tag" in item and raw is None)
+        if dimension in enabled and not explicit_null:
+            _reject(result, item, REJECT_TRAIT_TAG_MISSING,
+                    f"第 {index} 条候选的 dimension 是 {dimension}，本次已启用 "
+                    f"trait_tag（词表有 {sorted(enabled)} 族的标签），但没有给 "
+                    f"trait_tag。trait_tag 填 null 表示『这条确实贴不上任何标签』"
+                    f"（回退按原文归并）是可以的，不放这个字段不行——"
+                    f"可填可不填会让模型随机发挥，归并就废了", key=key)
+            return None
+        return ""
+    spec = vocabulary.resolve(tag)
+    if spec is None:
+        _reject(result, item, REJECT_TRAIT_TAG_NOT_IN_VOCABULARY,
+                f"第 {index} 条候选用了词表外的 trait_tag {tag!r}："
+                f"本次只允许 {list(vocabulary.all_tags())}。"
+                f"**不接受无法核验的标签，也不把它改写成词表里的某一个**——"
+                f"改写等于替模型做决定，还会静默改变归并结果", key=key)
+        return None
+    if spec.family == dimension:
+        return tag
+    if dimension in enabled:
+        # 两个启用维度之间的族冲突：采纳标签族，原样保留 dimension，如实记录。
+        issues.append(ISSUE_TRAIT_TAG_DIMENSION_MISMATCH)
+        result.issues.append(
+            f"item#{index}: dimension={dimension} 与 trait_tag {tag!r} 的归属族 "
+            f"{spec.family} 不一致，已按标签族归入 {spec.family}"
+            f"（dimension 原样保留）")
+        return tag
+    _reject(result, item, REJECT_TRAIT_TAG_UNEXPECTED_DIMENSION,
+            f"第 {index} 条候选的 dimension 是 {dimension}（未启用 trait_tag）"
+            f"却给了 trait_tag={tag!r}（归属族 {spec.family}）。"
+            f"不放行：否则一句背景描述贴个标签就能绕过稳定性闸门"
+            f"（D-012 / PF-V2 只允许 REPEATED / PATTERN 进 traits）", key=key)
+    return None
+
+
 def _validate_item(
     item: Any,
     index: int,
@@ -431,6 +554,7 @@ def _validate_item(
     tier_values: tuple[str, ...],
     dimension_values: tuple[str, ...],
     result: ClaimValidationResult,
+    vocabulary: "TraitVocabulary | None" = None,
 ) -> None:
     """校验**一条**候选（顺序即文档里的检查顺序）。"""
     from ..core.enums import EvidenceTier
@@ -485,7 +609,21 @@ def _validate_item(
                 f"{list(dimension_values)}", key=key)
         return
 
+    # —— trait_tag（D-280 / D-283）：已启用维度必填、未启用维度必须留空 ——
+    #: 这一段就定了放行/拒收；`None` = 已拒收，本条的后续检查全部跳过。
+    issues: list[str] = []
+    trait_tag = _validate_trait_tag(
+        item, index, key=key, dimension=dimension, vocabulary=vocabulary,
+        issues=issues, result=result)
+    if trait_tag is None:
+        return
+
     # —— 材料溯源（**唯一**可信来源：本次输入的材料）——
+    #: D-291：`material_key` 只是模型的**自报**，它会按"语义相似"就近归因
+    #: （R4.7 实测：探针句逐字在中青报黛玉页，模型却把它填成百度百科宝玉页，
+    #: 因为那页也讲"厌恶四书／禄蠹"）。所以这里只校验"这个 key 存在"，
+    #: **真实归属由引文逐字出现的位置决定**（见下面"原文摘录"一段）——
+    #: 引文是唯一可判定的证据，`material_key` 不是。
     material_key = item.get("material_key")
     if not isinstance(material_key, str) or not material_key.strip():
         _reject(result, item, REJECT_TYPE_ERROR,
@@ -497,17 +635,6 @@ def _validate_item(
                 f"第 {index} 条候选声称来自材料 {material_key!r}，"
                 f"但本次输入里没有这份材料：无法溯源，不登记", key=key)
         return
-    source_id = material.source_id
-
-    # —— 自报来源元数据：模型**无权**生成 ——
-    forged = [name for name in FORGED_METADATA_KEYS if name in item]
-    mismatch: list[str] = []
-    if "source_id" in item and _text(item.get("source_id")) != source_id:
-        mismatch.append("source_id")
-    if "url" in item and _text(item.get("url")) != material.url:
-        mismatch.append("url")
-    if "source_title" in item and _text(item.get("source_title")) != material.title:
-        mismatch.append("source_title")
 
     # —— 主体 ——
     subjects = _str_list_strict(item.get("subject_entity_ids"))
@@ -529,7 +656,8 @@ def _validate_item(
             return
 
     # —— confidence（缺省允许；给了就必须是 0~1 的数）——
-    issues: list[str] = []
+    # `issues` 在这里声明是因为上面几段只 append 不改写；trait_tag 校验
+    # 也可能往里加一条（族冲突），所以它必须比 trait_tag 那一段更早出现。
     confidence = 0.0
     if "confidence" in item and item.get("confidence") is not None:
         number = _number(item.get("confidence"))
@@ -569,11 +697,52 @@ def _validate_item(
             return
         span = find_quote_span(quote, material.text)
         if span is None:
-            _reject(result, item, REJECT_QUOTE_NOT_IN_MATERIAL,
-                    f"第 {index} 条候选声称的原文摘录在该材料里找不到（逐字比对，"
-                    "允许折空白差异）：不接受无法核验的引用，也不改写它", key=key)
-            return
+            #: D-291 两段式：按**声明的**材料找不到，就在全部材料里按**引文逐字**
+            #: 再找一遍。找到即改归属（引文在哪儿，来源就是哪儿）；一份都找不到
+            #: 才拒收——"真伪造"仍然拦得住，只有"引文对、材料写错"被救回来。
+            #:
+            #: 为什么不按 `claim` 文本做模糊匹配来定位：claim 是**概括**
+            #: （"她任情任性…"），同一说法在不同材料里的措辞不同，相似度匹配
+            #: 会把 A 材料的话挂到 B——那正是 D-291 的成因本身。逐字引文
+            #: 是唯一可判定、可复现的口径。
+            relocated = [(view, found)
+                         for view in by_key.values()
+                         if view.key != material.key
+                         for found in (find_quote_span(quote, view.text),)
+                         if found is not None]
+            if not relocated:
+                _reject(result, item, REJECT_QUOTE_NOT_IN_MATERIAL,
+                        f"第 {index} 条候选声称的原文摘录在该材料里找不到（逐字比对；"
+                        "允许空白差异——换行/缩进/PDF 断行——但**不允许改写**）："
+                        "不接受无法核验的引用，也不改写它", key=key)
+                return
+            material, span = relocated[0]
+            if len(relocated) > 1:
+                issues.append(ISSUE_MATERIAL_KEY_AMBIGUOUS)
+                result.issues.append(
+                    f"item#{index}: 模型自报 material_key={material.key!r} 里找不到引文，"
+                    f"而这句话在 {len(relocated)} 份材料里都逐字出现，"
+                    f"已按第一份归属（不确定性如实记录，不假装确定）")
+            else:
+                issues.append(ISSUE_MATERIAL_KEY_CORRECTED)
+                result.issues.append(
+                    f"item#{index}: 模型自报 material_key={material_key.strip()!r} 里"
+                    f"找不到引文，但它在 {material.key!r} 里逐字出现 ⇒ "
+                    f"按引文改正归属（D-291）")
         locator = {"field": "snippet", "start": span[0], "end": span[1]}
+
+    # —— 来源由**最终确定的材料**决定（模型自报的 key 只作线索）——
+    source_id = material.source_id
+
+    # —— 自报来源元数据：模型**无权**生成 ——
+    forged = [name for name in FORGED_METADATA_KEYS if name in item]
+    mismatch: list[str] = []
+    if "source_id" in item and _text(item.get("source_id")) != source_id:
+        mismatch.append("source_id")
+    if "url" in item and _text(item.get("url")) != material.url:
+        mismatch.append("url")
+    if "source_title" in item and _text(item.get("source_title")) != material.title:
+        mismatch.append("source_title")
 
     # —— 推断的根 ——
     derivation = _str_list_strict(item.get("derivation_keys"))
@@ -673,6 +842,7 @@ def _validate_item(
         derivation_keys=derivation,
         note=note,
         issues=issues,
+        trait_tag=trait_tag,
     ))
 
 
@@ -712,10 +882,14 @@ def validate_model_payload(
     targets: Sequence[Any] | None = None,
     limits: ValidationLimits | None = None,
     finish_reason: str = "",
+    vocabulary: "TraitVocabulary | None" = None,
 ) -> ClaimValidationResult:
     """**严格校验**模型返回的文本。纯函数：不联网、不写库、不调模型。
 
     返回的 `accepted` 仍然只是**候选**——登记与否一律由 `Evidence` 决定。
+
+    `vocabulary`（D-280）：受控特征标签词表。为 `None` 或空 ⇒ 不看 `trait_tag`，
+    行为与本字段上线之前完全一致。
     """
     from ..core.enums import EvidenceDimension, EvidenceTier
 
@@ -786,7 +960,8 @@ def validate_model_payload(
             item, index, by_key=by_key, allowed_subjects=allowed,
             subject_checkable=bool(allowed), limits=limits,
             accepted_keys=accepted_keys, tier_values=tier_values,
-            dimension_values=dimension_values, result=result)
+            dimension_values=dimension_values, result=result,
+            vocabulary=vocabulary)
 
     if not allowed:
         result.issues.append(ISSUE_SUBJECT_ALLOWLIST_EMPTY)

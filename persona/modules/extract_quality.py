@@ -62,6 +62,7 @@ from ..core.text_window import (
     iter_content_lines,
     select_prose_window,
 )
+from .text_variants import fold_variants
 
 # --------------------------------------------------------------------------
 # 状态与原因
@@ -70,6 +71,16 @@ from ..core.text_window import (
 QUALITY_VALID = "VALID"
 QUALITY_LOW = "LOW_QUALITY"
 QUALITY_EMPTY = "EMPTY"
+#: **检索摘要**的门禁结论（P4.8 / D-6）。
+#:
+#: 摘要不是"没判过"，而是"它本来就不是正文"——`snippet` 是检索接口返回的
+#: 片段，永远不会有 `VALID / LOW_QUALITY / EMPTY` 这三种正文结论。
+#: 此前摘要留空（`""`）表示"未声明"，而严格模式（`require_gate_verdict=True`）
+#: 会把**所有**摘要一律拒收 ⇒ 抓取一旦失败就必然 0 证据。
+#:
+#: 所以摘要要有**自己的一等状态**：门禁只负责"亮结论"，由证据层的 `tier`
+#: 决定最终可用性（用户拍板：方案 ①）。
+QUALITY_SUMMARY_ONLY = "SUMMARY_ONLY"
 
 REASON_EMPTY = "EMPTY_CONTENT"                      # 正文为空
 REASON_TOO_SHORT = "TOO_SHORT"                      # 内容总量过少
@@ -189,11 +200,16 @@ def text_mentions_any(content: str, names: list[str] | tuple[str, ...]) -> bool:
 
     误判方向是安全的：这个信号只用于"目标**没被提到**才降质/才拒收"，
     多匹配一个短词只会让我们**不**降质、不误杀正常内容。
+
+    **两侧都做字形归一**（P4.8 / D-7）：繁体页面「福爾摩斯」与简体词表
+    「福尔摩斯」是同一个词，折到同一侧之后才能对上。R4.1 实测里，本轮最相关
+    的一条候选（繁体、801 字、明确讲福尔摩斯与华生）就是因为没做这一步被
+    判"无关"而拒收——**判定的是"是不是同一个词"，不是"字符串是否逐字相等"**。
     """
-    lowered = (content or "").lower()
+    lowered = fold_variants(content or "").lower()
     for name in names or []:
         for token in re.split(r"[\s\-_·,，]+", str(name or "")):
-            token = token.strip().lower()
+            token = fold_variants(token.strip()).lower()
             if len(token) >= 2 and token in lowered:
                 return True
     return False

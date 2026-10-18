@@ -158,20 +158,27 @@ def model_call_key_parts(
     material_keys: list[str] | tuple[str, ...],
     target_ids: list[str] | tuple[str, ...] = (),
     prompt_version: str = "",
+    vocabulary_fingerprint: str = "",
 ) -> tuple:
     """模型调用幂等键的**唯一口径**（P4.4-A）。
 
-    组成 = 模型名 | 排序后的材料键 | 排序后的目标对象 | 提示词版本
+    组成 = 模型名 | 排序后的材料键 | 排序后的目标对象 | 提示词版本 | 词表指纹
 
     为什么这些进键而"提示词字数"不进：键要表达的是**请求意图**（拿这批材料、
     对这些人、用这个模型抽一次）。字数是实现的副产品，把它放进键会让
     "同一意图、格式微调"变成两笔新花费——那就不是幂等了。
+
+    `vocabulary_fingerprint`（D-286）：标签清单**不在**提示词版本里。
+    同一批材料从 L1 切到 L2 是**不同的请求意图**（候选格不同），
+    不带指纹就会撞上 L1 那次调用的键被当重复跳过、复用 L1 产出。
+    空串表示"这次调用不涉及词表"（对话等），对既有调用完全兼容。
     """
     return (
         str(model or ""),
         *sorted(str(k) for k in material_keys if str(k or "").strip()),
         *sorted(str(t) for t in target_ids if str(t or "").strip()),
         str(prompt_version or ""),
+        str(vocabulary_fingerprint or ""),
     )
 
 

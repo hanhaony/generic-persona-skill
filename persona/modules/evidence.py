@@ -272,6 +272,11 @@ class EvidenceDraft:
     namespace: ProvenanceNamespace | str = ProvenanceNamespace.PUBLIC_SOURCE
     status: EvidenceStatus | str = EvidenceStatus.ACTIVE
     reliability_snapshot: Reliability | str | None = None  # 空 = 从来源复制
+    #: 受控特征标签（D-280 / D-283）。`""` = 没有标签。
+    #: **归并键与条目板块由它决定，`dimension` 不参与**——R4.3 实测同一个
+    #: 事实在不同来源会被抽成不同维度（小提琴在 baike 是 HABIT、在大英图书馆
+    #: 是 TRAIT），维度不可靠。字段缺失时下游按"没有标签"处理（安全）。
+    trait_tag: str = ""
 
 
 @dataclass
@@ -316,6 +321,11 @@ class EvidenceView:
     #: 一律 `UNKNOWN`），而这里是框架用确定性规则**事后判定**的结果。
     #: 两者语义不同，覆盖写会抹掉"当时登记了什么"这一事实。
     stability_verdict: dict | None = None
+    #: 受控特征标签（D-280）。**归并键与条目板块由它决定**，`dimension`
+    #: 不参与（D-283）：R4.3 实测同一个事实在不同来源会被抽成不同维度
+    #: （小提琴在 baike 是 HABIT、在大英图书馆是 TRAIT），维度不可靠。
+    #: 旧证据没有这个字段 ⇒ 读出来恒 `""`，下游按"没有标签"处理。
+    trait_tag: str = ""
 
     @property
     def effective_stability(self) -> str:
@@ -450,6 +460,16 @@ def _str_list(value: Any) -> list[str]:
     if isinstance(value, str):
         return [value]
     return [str(v) for v in value]
+
+
+def _text(value: Any) -> str:
+    """任意值 → 规整字符串；`None` 与空值都是 `""`。
+
+    `trait_tag` 这类**新增字段**必须对旧数据安全：老行里没有这个键，
+    读出来是 `None`，落库前要变成 `""` 而不是字符串 `"None"`
+    （`_str_list` 就在隔壁，做的事是同一类）。
+    """
+    return str(value or "").strip()
 
 
 def _confidence(value: Any) -> float | None:
@@ -920,6 +940,7 @@ class EvidenceService:
             "conflict_ids": [],
             "status": str(status),
             "tags": _str_list(draft.tags),
+            "trait_tag": _text(draft.trait_tag),
         }
         outcome = self.storage.put(ctx, "EvidenceItem", payload,
                                    project_id=ctx.project_id, namespace=namespace,
@@ -1655,4 +1676,5 @@ class EvidenceService:
             stability_verdict=(row.get("stability_verdict")
                                if isinstance(row.get("stability_verdict"), dict)
                                else None),
+            trait_tag=_text(row.get("trait_tag")),
         )

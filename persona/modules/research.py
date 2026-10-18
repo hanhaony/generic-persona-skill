@@ -84,6 +84,7 @@ from .extract_quality import (
     ContentQuality,
     QUALITY_EMPTY,
     QUALITY_LOW,
+    QUALITY_SUMMARY_ONLY,
     QUALITY_VALID,
     REASON_EMPTY,
     assess_content_quality,
@@ -1257,6 +1258,11 @@ class ResearchService:
             published_at=_text(result.published_at) or None,
             source_kind=_text(result.source_kind_guess),
             subject_entity_ids=_str_list(candidate.target_entity_ids),
+            #: P4.8 / D-6：检索摘要**亮出自己的结论**，不再留空表示"未声明"。
+            #: 空值在严格模式（`require_gate_verdict=True`）下会被一律拒收，
+            #: 于是"正文抓取失败 ⇒ 退回摘要 ⇒ 全部拒收 ⇒ 0 证据"成了死局。
+            #: 摘要就是摘要——它是 `SUMMARY_ONLY`，不是"没判过"。
+            quality_status=QUALITY_SUMMARY_ONLY,
         )
 
     @staticmethod

@@ -52,6 +52,7 @@ from persona.core.usage_ledger import (
 from persona.modules.claim_validation import (
     ISSUE_CONFIDENCE_UNSPECIFIED,
     ISSUE_DATE_NOT_VERIFIED_DROPPED,
+    ISSUE_MATERIAL_KEY_CORRECTED,
     PENDING_DERIVATION_UNRESOLVED,
     PENDING_EMPTY_QUOTE,
     PENDING_INSTRUCTION_LIKE_CLAIM,
@@ -290,15 +291,27 @@ class TestStrictPayloadValidation(unittest.TestCase):
         self.assertEqual([r.reason for r in result.rejected],
                          [REJECT_QUOTE_NOT_IN_MATERIAL])
 
-    def test_quote_from_another_material_is_rejected(self):
-        """拿 B 材料的原文冒充 A 材料的摘录 → 找不到，拒收。"""
+    def test_quote_from_another_material_is_relocated_not_rejected(self):
+        """拿 B 材料的原文冒充 A 材料的摘录 ⇒ **改归属到 B**，不拒收（D-291）。
+
+        旧断言是"拒收"，**已被 D-291 推翻**：引文在 B 里逐字存在，说明证据本身
+        是真的、只是模型把 `material_key` 标错了——因为"来源标错"丢掉一条可核验
+        的证据，正是 R4.7 丢掉探针句的那条路径（探针句逐字在中青报黛玉页，
+        模型填了百度百科宝玉页）。
+
+        原先由本条守着的"防伪造"没有放松：引文哪儿都找不到时仍拒收，
+        见上面的 `test_fabricated_quote_is_rejected`。
+        """
         other = _material(key="key_lamp", source_id="src_lamp",
                           snippet="主创访谈，谈及阿雾与阿灯的相遇。")
         result = validate_model_payload(
             _payload([_item(tier="VERBATIM", verbatim_quote="谈及阿雾与阿灯的相遇")]),
             materials=[MATERIAL_FOG, other])
-        self.assertEqual([r.reason for r in result.rejected],
-                         [REJECT_QUOTE_NOT_IN_MATERIAL])
+        self.assertEqual(result.rejected, [], "不该再因为材料标错而丢掉真引文")
+        self.assertEqual(len(result.accepted), 1)
+        self.assertEqual(result.accepted[0].material_key, "key_lamp")
+        self.assertEqual(result.accepted[0].source_id, "src_lamp")
+        self.assertIn(ISSUE_MATERIAL_KEY_CORRECTED, result.accepted[0].issues)
 
     def test_unknown_material_key_is_rejected(self):
         result = self._validate(_payload([_item(material_key="key_not_given")]))

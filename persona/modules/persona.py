@@ -98,6 +98,51 @@ def _normalize_items(items: Any) -> list:
     return [items]
 
 
+#: `evidence_anchors` 允许的键（**白名单**：多余的键一律丢弃）
+ANCHOR_KEYS: tuple[str, ...] = (
+    "feature", "dimension", "subjects", "evidence_ids", "source_ids",
+    "evidence_count", "source_count", "in_traits",
+)
+
+
+def _anchor_view(anchors: Any) -> list[dict]:
+    """只读锚点视图的**落盘前归一化**：按白名单取键，计数**重算**。
+
+    为什么计数要重算而不是照抄：`evidence_anchors` 的立身之本是"只读、由服务算"。
+    若照抄调用方给的 `source_count`，就退化成另一个可填报的字段——那它和
+    `traits` 的区别只剩"放在哪个键里"。重算后，调用方**可以留空、不可以编造**：
+    声称 5 个来源却只列 2 个，落盘一律记 2。
+
+    键的**内容**仍来自构建方（本模块无法凭 ID 反查来源），所以这不是防篡改，
+    是**防自相矛盾**——与 `coverage` 同级的可信度。
+    """
+    out: list[dict] = []
+    for raw in _normalize_items(anchors):
+        if not isinstance(raw, dict):
+            continue
+        #: 去重后计数：问的是"几条**不同**来源/证据提到"，同一条列两遍不算两条
+        evidence_ids = list(dict.fromkeys(
+            str(x) for x in _normalize_items(raw.get("evidence_ids"))
+            if str(x or "").strip()))
+        source_ids = list(dict.fromkeys(
+            str(x) for x in _normalize_items(raw.get("source_ids"))
+            if str(x or "").strip()))
+        subjects = [str(x) for x in _normalize_items(raw.get("subjects"))
+                    if str(x or "").strip()]
+        out.append({
+            "feature": str(raw.get("feature") or ""),
+            "dimension": str(raw.get("dimension") or ""),
+            "subjects": subjects,
+            "evidence_ids": evidence_ids,
+            "source_ids": source_ids,
+            "evidence_count": len(evidence_ids),
+            "source_count": len(source_ids),
+            #: 锚点**恒不进** `traits`；这里只是把事实写明，交给读的人判断
+            "in_traits": bool(raw.get("in_traits")),
+        })
+    return out
+
+
 # --------------------------------------------------------------------------
 # 端口协议（P1.2-B 定义；本阶段按 INTERFACES §6.2 与已实现面对齐，D-119）
 # --------------------------------------------------------------------------
@@ -241,6 +286,20 @@ class PersonaProfileDraft:
     open_questions: list[str] = field(default_factory=list)
     status: ProfileStatus | str = ProfileStatus.INSUFFICIENT_EVIDENCE
     change_reason: str = ""
+    #: 只读的"证据锚点"视图（D-278 的保守版，**不是** `traits`）。
+    #:
+    #: 每项形如 `{"feature", "dimension", "subjects", "evidence_ids",
+    #: "source_ids", "evidence_count", "source_count", "in_traits"}`，
+    #: 回答"这个特征有几条来源提到"。
+    #:
+    #: 为什么要单独一个字段而不是直接放宽闸门：R4.3 实测 16 条证据
+    #: `stability` 全为 `SINGLE`，`traits` 桶结构性为空。把跨源线索显示出来
+    #: 能救急（档案不至于全空），但**把它塞进 `traits` 就直接违反 D-012 / PF-V2**
+    #: （单次行为不得固化为稳定性格）。所以：看得见，但不进桶。
+    #:
+    #: 计数由服务从**证据本身**算出（`_build_persona_draft`），落盘时再做一次
+    #: 自洽校验（`_anchor_view`）——调用方可以留空，不可以编造。
+    evidence_anchors: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -648,6 +707,8 @@ class PersonaService:
             "controversial_topic_ids": _str_list(draft.controversial_topic_ids),
             "open_questions": _str_list(draft.open_questions),
             "coverage": coverage,
+            #: 只读视图：不参与 `_compute_coverage`，不影响任何板块的条目数
+            "evidence_anchors": _anchor_view(draft.evidence_anchors),
             "status": str(getattr(draft.status, "value", draft.status)),
             "superseded_by": superseded_by,
             "change_reason": str(draft.change_reason or "") or
