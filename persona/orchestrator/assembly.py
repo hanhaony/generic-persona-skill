@@ -73,6 +73,7 @@ from ..modules.research import (
     PersonQueryTarget,
     ResearchDeps,
     ResearchService,
+    TopNExtractionStrategy,
     load_local_materials,
 )
 from ..modules.extract_quality import DEFAULT_MIN_EFFECTIVE_CHARS
@@ -100,6 +101,10 @@ WARNING_STACK_EXTRACTOR_ABSENT = "EXTRACTOR_ABSENT"               # 没有可用
 WARNING_STACK_CHAT_PROVIDER_UNAVAILABLE = "CHAT_PROVIDER_UNAVAILABLE"  # 按配置构造聊天 Provider 失败
 WARNING_STACK_REAL_PROVIDER_BLOCKED = "REAL_PROVIDER_BLOCKED"     # 默认禁止真实外呼，未显式授权
 WARNING_STACK_ANALYZER_DISABLED = "RELATIONSHIP_ANALYZER_DISABLED"  # 按配置关闭了规则分析器
+# D-A：对话阶段没有任何可用聊天 Provider（真跑会在 DIALOGUE_RUN 报"未登记的 fixture"）
+WARNING_STACK_DIALOGUE_OFFLINE = "DIALOGUE_PROVIDER_OFFLINE"
+# D-B：没有正文抓取策略 → 只用检索摘要，`PERSONA_RESEARCH_MAX_EXTRACTS` 不生效
+WARNING_STACK_EXTRACTION_DISABLED = "EXTRACTION_STRATEGY_DISABLED"
 
 
 def _config_wants_network_provider(settings: AppSettings) -> bool:
@@ -161,6 +166,10 @@ class StackOptions:
     #: 对话温度不在这里：那是 `DialogueService` 自己的旋钮（`DIALOGUE_TEMPERATURE`），
     #: 两者刻意不共用。
     extract_temperature: float | None = None
+    #: `False` = **预览模式**：不建表、不读账本历史（P5.1 `--dry` 用）。
+    #: 为什么需要它：`init_schema` 会真的把表写进库文件，"只看一眼清单"
+    #: 不该留下一个 80 KB 的空库；而没建表就不能 hydrate，两者必须一起关。
+    initialize_schema: bool = True
 
 
 # --------------------------------------------------------------------------
@@ -207,6 +216,12 @@ class BusinessStack:
                 "relationship_analyzer": (
                     type(self.relationship_analyzer).__name__
                     if self.relationship_analyzer is not None else None),
+                # D-A / D-B：这两个"是不是真的接上了"必须在装配事实里可读，
+                # 否则调用方（CLI 清单）只能照着配置猜，猜错就是假账。
+                "dialogue_provider": type(self.dialogue.deps.provider).__name__,
+                "extraction_strategy": (
+                    type(self.research.deps.extraction_strategy).__name__
+                    if self.research.deps.extraction_strategy is not None else None),
             },
             "model": {
                 "enabled": self.settings.model.enabled(),
@@ -521,6 +536,74 @@ def register_targets(
     return Ok(targets)
 
 
+@dataclass(frozen=True)
+class TargetPreview:
+    """**不写库**的目标（`--dry` 与"先算账、后授权"用）。
+
+    只带 `plan_calls` 真正用到的字段（名字 / 类型 / 作品 / 版本）。为什么需要它：
+    真实运行是"先看清单、再确认、最后才登记实体"——如果为了算清单就
+    `register_targets`，用户一取消，库里就多出几个同名实体（`register_targets`
+    不去重），下次 `show` 还要问"看哪一份"。
+    """
+
+    entity_id: str
+    display_name: str
+    entity_type: str = "FICTIONAL_CHARACTER"
+    work_titles: list[str] = field(default_factory=list)
+    adaptation_version: str | None = None
+
+
+def plan_targets(specs: "list[TargetSpec]") -> list[TargetPreview]:
+    """`TargetSpec` → 只用于估算的轻目标（零写入）。"""
+    previews: list[TargetPreview] = []
+    for spec in specs:
+        title = str(getattr(spec, "work_title", "") or "").strip()
+        version = str(getattr(spec, "adaptation_version", "") or "").strip()
+        previews.append(TargetPreview(
+            entity_id="",
+            display_name=str(getattr(spec, "display_name", "") or "").strip(),
+            entity_type=str(getattr(spec, "entity_type", "") or "FICTIONAL_CHARACTER"),
+            work_titles=[title] if title else [],
+            adaptation_version=version or None,
+        ))
+    return previews
+
+
+# --------------------------------------------------------------------------
+# 词表（CLI 的名字 → 对象，别名只在这一处展开）
+# --------------------------------------------------------------------------
+
+#: CLI 接受的词表名 → 真实词表名。`l2` 是手打的短名，等价于 `l2-zh-classical`。
+VOCABULARY_ALIASES: dict[str, str] = {
+    "l1": "l1",
+    "l2": "l2-zh-classical",
+    "l2-zh-classical": "l2-zh-classical",
+}
+
+
+def resolve_vocabulary(name: str):
+    """词表名 → `TraitVocabulary`（**未知名字不静默回退**，直接报错）。
+
+    为什么放在装配层：CLI 只能 import `orchestrator`（D-059），而词表属于
+    `modules`。别名映射只此一份，避免 CLI 与脚本各记一套。
+    """
+    from ..modules.trait_vocabulary import vocabulary_by_name
+
+    key = str(name or "").strip().lower()
+    resolved = VOCABULARY_ALIASES.get(key)
+    if resolved is None:
+        return Err(new_error(
+            ErrorCode.VALIDATION_REQUIRED_FIELD,
+            f"未知词表：{name}。可选：l1（默认）、l2 / l2-zh-classical"
+            "（中文古典层，42 个标签）",
+        ))
+    vocabulary = vocabulary_by_name(resolved)
+    if vocabulary is None:
+        return Err(new_error(ErrorCode.VALIDATION_REQUIRED_FIELD,
+                             f"词表 {resolved!r} 不可用"))
+    return Ok(vocabulary)
+
+
 # --------------------------------------------------------------------------
 # 本地材料（P4.7 离线通道）
 # --------------------------------------------------------------------------
@@ -609,16 +692,18 @@ def build_business_stack(
     # schema 一律由装配层保证（`CREATE TABLE IF NOT EXISTS`，对既有库幂等）。
     # 为什么连"外部传进来的库"也要 init：hydrate 紧接着就要读 external_usage_records，
     # 没建表就会读失败——而"读失败"和"没有历史"必须能区分，不能靠调用方记得先 init。
-    initialized = storage.init_schema(ctx)
-    if is_err(initialized):
-        if owns_storage:
-            storage.close()
-        return Err(initialized.error)
+    # 例外：预览模式（`initialize_schema=False`）明确不建表，此时也不读历史。
+    if options.initialize_schema:
+        initialized = storage.init_schema(ctx)
+        if is_err(initialized):
+            if owns_storage:
+                storage.close()
+            return Err(initialized.error)
 
     # ---------------- 2. 账本：hydrate 历史支出（G11） ----------------
     ledger = ledger if ledger is not None else ExternalUsageLedger()
     hydration: HydrationSummary | None = None
-    if options.hydrate_ledger:
+    if options.hydrate_ledger and options.initialize_schema:
         loaded = storage.external_usage_records(ctx)
         if is_err(loaded):
             if settings.model.max_cost is not None:
@@ -651,21 +736,11 @@ def build_business_stack(
     persona = PersonaService(storage)
     relationship = RelationshipService(storage)
     memory = MemoryService(storage)
-    dialogue = DialogueService(DialogueDeps(
-        profiles=persona, relations=relationship, evidence=evidence,
-        memory=memory, storage=storage,
-        provider=dialogue_provider or FakeProvider(),
-        memory_reader=memory,
-        # P4.8 / D-3：对话的模型调用也要进**同一本账**。此前这四项一个都没传，
-        # 于是对话花的钱只在 `ConversationSession.budget_used` 里有 token，
-        # `external_usage_records` 里一行都没有（累计闸门与逐笔对账同时漏账）。
-        # 次数上限与抽取器**共用**：`max_calls` 约束的是"本次运行几次模型调用"，
-        # 不是"抽取几次"。
-        ledger=ledger,
-        limits=model_limits_from_settings(settings),
-        usage_sink=storage,
-        task_id=options.task_id,
-        model_hint=settings.model.model_id or DEFAULT_MODEL_ID))
+    # 对话服务**不在这里构造**（D-A）：它要的聊天 Provider 要到第 5 步才定下来。
+    # 此前这一行写的是 `dialogue_provider or FakeProvider()`，而 `StackOptions`
+    # 根本没有 `dialogue_provider` 这一项、产品路径（`persona run`）从不传 →
+    # 真跑恒用 FakeProvider，DIALOGUE_RUN 必报"未登记的 fixture"。
+    # 构造顺序本身就是根因，所以把它挪到第 5.5 步、与 chat_provider 一起定。
     task_service = TaskService(storage)
 
     # ---------------- 4. 研究（检索 + 正文抓取） ----------------
@@ -692,11 +767,28 @@ def build_business_stack(
             code=WARNING_STACK_SEARCH_OFFLINE,
             message="未注入检索 Provider，使用离线 FakeProvider（需要 fixture_key，"
                     "不会联网）。真实检索需显式 `--allow-real`，且先过 Q-02 的渠道约束"))
+    # —— 正文抓取策略（D-B）——
+    # 此前 `StackOptions.extraction_strategy` 默认 None，而**只有测试**显式注入
+    # `TopNExtractionStrategy()`；`ResearchService` 拿到 None 就直接
+    # `rule="no_extraction"` 返回 → 产品路径（`persona run`）**从来不抓正文**，
+    # `PERSONA_RESEARCH_MAX_EXTRACTS` 是死配置（改 1 还是 3 都无所谓）。
+    # 现在：授权真实外呼且检索出口是真实 Provider 时，默认装上默认策略。
+    extraction_strategy = options.extraction_strategy
+    if extraction_strategy is None and allow_real and search_provider is not None \
+            and not isinstance(search_provider, FakeProvider):
+        extraction_strategy = TopNExtractionStrategy()
+    if extraction_strategy is None:
+        # 不启用就**明确说**：否则清单会照着 `max_extracts` 打出"上限 3 次"这种假账。
+        warnings.append(WarningNote(
+            code=WARNING_STACK_EXTRACTION_DISABLED,
+            message="未启用正文抓取（没有提取策略）：本次只使用检索摘要，"
+                    "`PERSONA_RESEARCH_MAX_EXTRACTS` 不生效"))
+
     research_deps = ResearchDeps(
         provider=search_provider or FakeProvider(),
         evidence=evidence,
         search_metadata=dict(options.search_metadata),
-        extraction_strategy=options.extraction_strategy,
+        extraction_strategy=extraction_strategy,
         # P4.8 / R3 修的一个真缺口：此前 `options.research_limits` 默认 None，
         # 研究阶段就回落到模块默认值（5/5/3）——**配置里的
         # `PERSONA_RESEARCH_MAX_QUERIES/MAX_EXTRACTS` 在产品路径上被静默忽略**
@@ -745,6 +837,34 @@ def build_business_stack(
             code=WARNING_STACK_EXTRACTOR_ABSENT,
             message="没有可用的 claim 抽取器（未配置模型 Provider，也未显式注入）："
                     "研究材料不会自动变成候选 claim，业务链只能靠 evidence_seeds"))
+
+    # ---------------- 5.5 对话服务（D-A：必须在 chat_provider 定下来之后） --------
+    # 对话和抽取用的是**同一个**聊天 Provider：它俩都是"调模型"，没道理一个走真实、
+    # 另一个走桩。显式注入的 `dialogue_provider` 仍然最优先（测试要塞固定台词）。
+    resolved_dialogue_provider = dialogue_provider or chat_provider
+    if resolved_dialogue_provider is None:
+        # 不许再静默回落：FakeProvider 需要预登记 fixture，真跑必炸，
+        # 必须在装配期就把这件事说出来。
+        warnings.append(WarningNote(
+            code=WARNING_STACK_DIALOGUE_OFFLINE,
+            message="对话阶段没有可用的聊天 Provider（未注入、也未构造真实 Provider）："
+                    "已回落到 FakeProvider——它需要预先登记的 fixture，"
+                    "真实运行会在 DIALOGUE_RUN 阶段失败"))
+    dialogue = DialogueService(DialogueDeps(
+        profiles=persona, relations=relationship, evidence=evidence,
+        memory=memory, storage=storage,
+        provider=resolved_dialogue_provider or FakeProvider(),
+        memory_reader=memory,
+        # P4.8 / D-3：对话的模型调用也要进**同一本账**。此前这四项一个都没传，
+        # 于是对话花的钱只在 `ConversationSession.budget_used` 里有 token，
+        # `external_usage_records` 里一行都没有（累计闸门与逐笔对账同时漏账）。
+        # 次数上限与抽取器**共用**：`max_calls` 约束的是"本次运行几次模型调用"，
+        # 不是"抽取几次"。
+        ledger=ledger,
+        limits=model_limits_from_settings(settings),
+        usage_sink=storage,
+        task_id=options.task_id,
+        model_hint=settings.model.model_id or DEFAULT_MODEL_ID))
 
     # ---------------- 6. 关系分析器（D-D：默认装配，可关闭） ----------------
     analyzer = relationship_analyzer

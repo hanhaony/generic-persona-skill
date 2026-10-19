@@ -280,10 +280,18 @@ class TestScriptSideChain(unittest.TestCase):
     def test_a4_verbatim_quotes_land_in_material_with_framework_locator(self):
         """摘录必须能在材料里**逐字命中**，且 `locator` 由框架算出。"""
         snippet = self.r.materials[0].snippet
+        #: D-D：`field` 必须照材料自己的门禁结论写，不能一律写 `snippet`。
+        #: 这批材料是 `materials_from_extracts()` 出来的正文（`quality_status=VALID`），
+        #: 所以这里必须是 `content`；写死 `snippet` 正是"正文被标成摘要"那个缺陷。
+        expected = ("content" if str(self.r.materials[0].quality_status) == "VALID"
+                    else "snippet")
         for c in self.r.outcome.claims:
             self.assertTrue(c.verbatim_quote, f"{c.key} 声称原话却没摘录")
             self.assertIsNotNone(c.locator, f"{c.key} 缺 locator")
-            self.assertEqual(c.locator.get("field"), "snippet")
+            self.assertEqual(c.locator.get("field"), expected,
+                             f"{c.key} 的 locator.field 与材料性质不符"
+                             f"（材料 quality_status="
+                             f"{self.r.materials[0].quality_status!r}）")
             start, end = c.locator.get("start"), c.locator.get("end")
             self.assertIsInstance(start, int)
             self.assertIsInstance(end, int)

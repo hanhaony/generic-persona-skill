@@ -62,7 +62,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Sequence
 
 from .compliance import detect_prompt_injection
-from .extract_quality import QUALITY_VALID
+from .extract_quality import QUALITY_SUMMARY_ONLY, QUALITY_VALID
 
 if TYPE_CHECKING:                        # 只为类型标注；运行期不引入循环依赖
     from .trait_vocabulary import TraitVocabulary
@@ -729,7 +729,26 @@ def _validate_item(
                     f"item#{index}: 模型自报 material_key={material_key.strip()!r} 里"
                     f"找不到引文，但它在 {material.key!r} 里逐字出现 ⇒ "
                     f"按引文改正归属（D-291）")
-        locator = {"field": "snippet", "start": span[0], "end": span[1]}
+        #: D-D：`field` 曾经写死成 `"snippet"`，于是抓回来的正文也被标成摘要——
+        #: 第二次真跑里"正文第 1816 字符"显示成 `定位 snippet[1816:1848]`，
+        #: 摘要不可能那么长，标签是错的；后果是正文证据与摘要证据（后者没过
+        #: 正文门禁、tier 更低）在输出里长得一模一样，"证据可回溯"形同虚设。
+        #:
+        #: 材料究竟是摘要还是正文，`MaterialText.quality_status` 早就判过了
+        #: （门禁结论，`SUMMARY_ONLY` = 明确声明"我是检索摘要"）。这里照抄即可，
+        #: 不重新猜。
+        #: 注意一个反直觉的地方：**不能靠"字段名是不是 snippet"来判断**。
+        #: `materials_from_extracts()` 只交 excerpt 不交全文，正文摘录同样装在
+        #: `snippet` 字段里（P4.4-A）。所以唯一可靠的判据是门禁结论。
+        if material.quality_status == QUALITY_VALID:
+            field_name = "content"          # 抓回来的正文（过了质量门禁）
+        elif material.quality_status == QUALITY_SUMMARY_ONLY:
+            field_name = "snippet"          # 检索摘要（明确声明，不是"没判过"）
+        else:
+            #: 门禁结论缺失（`""`）或既非 VALID 也非 SUMMARY_ONLY（如 LOW）。
+            #: 不猜成正文——往低可信的那一类记，宁可低估也不虚增。
+            field_name = "snippet"
+        locator = {"field": field_name, "start": span[0], "end": span[1]}
 
     # —— 来源由**最终确定的材料**决定（模型自报的 key 只作线索）——
     source_id = material.source_id

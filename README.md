@@ -4,6 +4,39 @@
 
 ---
 
+## 0. 先跑通（P5.1，零依赖）
+
+```bash
+python -m persona selftest          # 离线自检：不联网、不花钱
+```
+
+真正跑一个人（**会联网、会花钱，第一次会问你一次**）：
+
+```bash
+export PERSONA_PROVIDER_API_KEY=sk-...   # 模型（密钥只放环境变量）
+export PERSONA_SEARCH_API_KEY=tvly-...   # 检索
+
+python -m persona run --names "林黛玉,贾宝玉" --work-title 红楼梦 --dry   # 只打清单，不花钱
+python -m persona run --names "林黛玉,贾宝玉" --work-title 红楼梦         # 真跑：先看清单 → 确认 → 开跑
+```
+
+跑完告诉你下一句敲什么（四条只读命令都**不会**建库、不会写任何东西）：
+
+```bash
+python -m persona show 林黛玉                                # 六分区档案
+python -m persona show-relationship 林黛玉,贾宝玉            # A 看 B 与 B 看 A 分列
+python -m persona evidence 林黛玉                            # 每条特征 → 证据 → 来源 URL
+python -m persona export 林黛玉 --format md --out 林黛玉.md  # 可贴进文档的 Markdown
+```
+
+**三件不退让的事**：① 每条特征都能追到 URL，追不到的不会出现在档案里；
+② 只有 ≥2 个独立来源提到的才算"稳定性格"，其余标"非稳定特征"；
+③ 证据不足就输出空档案 + 原因，**不编一条凑数**。
+
+命令清单与实测示例见 `docs/RUNNING.md` §2；受控真跑清单见 `docs/P5_1_REAL_RUN.md`。
+
+---
+
 ## 1. 项目当前状态
 
 | 项目 | 内容 |
@@ -12,7 +45,7 @@
 | 已完成 | P0 规格与架构、P1.1 核心数据模型、P1.2-A 接口契约与错误处理、P1.2-B 代码骨架、P2.1 工程配置、P2.2 配置管理、P2.3 任务生命周期基础闭环（已验收）、P2.4 故障注入测试（已验收）、P2 证据管线第一步（Evidence 本地管理：登记/查询/持久化/校验/追溯/去重/冲突/稳定性；待验收）、P3 第一步（Persona 本地管理：创建/查询/版本更新/证据追溯/不确定性/冲突关联/虚构边界/模拟隔离；待验收）、P3 第二步（Relationship 本地管理：双向视角/共同经历/时间变化/群体互动/证据直达/版本边界/模拟隔离；待验收）、P3 第四步（Dialogue 本地生成基础：会话/轮次管理/动态发言选择/只读上下文组装/经 Mock Provider 生成/严格模拟隔离；待验收）、P3 第五步（Memory 长期记忆基础：写入/关键词检索/去重/冲突记录/版本化更新/过期/归档/删除与派生产物失效/对象边界/模拟隔离；待验收）、P3 第六步（对话 ↔ 记忆集成：模拟记忆检索注入上下文/显式授权的会话级记忆写入/同事务回滚/幂等；待验收）、P3 第七步（Evaluation 核心 + 端到端集成验收：INV-1~4 不变式断言/依赖分层检查/结构指标/真实调用链集成测试；待验收）、H-11A（Research 最小可运行实现：确定性检索计划/经 Provider 检索/过滤排序/经 Evidence 登记/失败纪律/严格隔离；待验收）、H-10A（业务编排型 Orchestrator：一条命令跑完 Research→Evidence→Persona→Relationship→Dialogue，复用既有任务六态机/预算/检查点，区分成功/部分成功/失败；待验收）、G-2（来源材料 → 候选 claim 自动抽取：可注入 `ClaimExtractorPort`，业务入口不再要求调用方提供 claim；三种 claim 机械区分，推断无根即丢弃；待验收） |
 | 代码状态 | **有骨架 + 任务闭环 + 研究（最小实现）+ 证据管理基础 + 人格档案基础 + 关系档案基础 + 对话生成 + 长期记忆 + 对话↔记忆集成 + 只读评测，仍无真实检索/蒸馏业务**：公共契约 / SQLite 最小读写 / Mock Provider / 统一配置 / 六态状态机 + `TaskService` + 预算闸门 + Mock 执行器 / 端口协议 / CLI / **`EvidenceService`（来源·事件·证据·冲突·去重·稳定性）** / **`PersonaService`（档案·版本·证据关联·闸门）** / **`RelationshipService`（双向视角·共同经历·时间变化·群体互动）** / **`DialogueService`（会话·轮次·动态发言·模拟隔离）** / **`MemoryService`（写入·关键词检索·去重·冲突·版本化更新·过期·归档·删除·派生产物失效）** / **Dialogue↔Memory 集成（检索注入 + 显式授权写入 + 同事务回滚）** / **`EvaluationService`（INV-1~4 不变式·依赖分层检查·结构指标，只读不写业务表）** / **`ResearchService`（检索计划·经 Provider 检索·过滤排序·经 Evidence 登记来源，不写证据表）** / **`BusinessOrchestrator`（五阶段业务编排：实现 `UnitHandler` 接既有 `TaskRunner`，阶段间数据只经检查点传递，结果三态自述）** |
 | 尚未实现 | **真实检索接入**（`ResearchService` 已可运行，但只接 `Provider` 抽象 + Mock；真实 Provider 与来源合规规则待拍板）、正文抓取与切分（`content_ref`）、检索结果语义排序、AI 人格/关系蒸馏（`distill`）、**按明确规则自动**把对话写入长期记忆（默认策略即「不写」）、`end_session → Memory.consolidate`、`Evaluation.run_unit_tests`/`run_integration_tests` 接线、FTS5 检索升级、向量检索。`task run` 推进的是**抽象工作单元**，**不是**真实业务；`persona new/chat/sources/memory/eval` 仍是诚实的占位 |
-| 外部调用 | **不调用**任何真实模型 API 或搜索 API；Provider 全是 Mock，**离线可跑** |
+| 外部调用 | **默认不调用**：没有密钥 / 没有显式确认时，Provider 全是 Mock，离线可跑。P4.4 起可在**配了密钥 + 过一次确认**的前提下真实调用模型与检索（`persona run`）；`--dry` 永远零外呼 |
 | 依赖安装 | **无第三方依赖**。只用 Python 标准库（`unittest` / `sqlite3` / `dataclasses`） |
 | 技术选型 | Python 3.12+ / 本地 CLI / 模块化单体 / SQLite / 第一版关键词检索 |
 | 支持对象 | 公开资料较丰富的现实公众人物 + 游戏动漫影视中的虚构角色 |

@@ -31,6 +31,12 @@ dependencies = []
 # 测试同样只用标准库 unittest，暂时无需额外依赖
 dev = []
 
+[project.scripts]
+# `pip install -e .` 之后可以直接敲 `persona show 林黛玉`；
+# 不装也能用：`python -m persona show 林黛玉`（两个入口共用同一个 main）。
+# CLI 自己打印的"下一步"提示写的就是 `persona …`，所以这个入口必须存在。
+persona = "persona.cli.main:main"
+
 [tool.setuptools]
 packages = [
     "persona",

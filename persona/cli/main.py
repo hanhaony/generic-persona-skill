@@ -24,6 +24,13 @@ from ..core.enums import NAMESPACE_WRITE_GATE, ProvenanceNamespace, TaskStatus
 EXIT_OK = 0
 EXIT_NOT_IMPLEMENTED = 2
 
+#: 省略 `--adaptation` 时的取值。**取默认值不是问题，悄悄取才是**——
+#: 清单里必须标注"（未指定，默认）"（P5.1 §3.1.2）。
+DEFAULT_ADAPTATION = "原著"
+
+#: 单任务预算默认值（USD）。与 `.env.example` 的 `PERSONA_MODEL_MAX_COST_PER_TASK` 一致。
+DEFAULT_BUDGET_USD = 0.25
+
 # INTERFACES §11.2 里列出的命令；**仍为占位**的部分（P2.3 只接通了任务生命周期）
 PLACEHOLDER_COMMANDS = (
     "new",
@@ -67,6 +74,68 @@ def build_parser() -> argparse.ArgumentParser:
     p_model.add_argument(
         "--no-dotenv", action="store_true", help="忽略 .env 文件，只看默认值与环境变量",
     )
+
+    p_run = sub.add_parser(
+        "run",
+        help="研究并生成人物档案与关系档案（真实检索 + 模型；第一次会要求确认一次）")
+    p_run.add_argument("--names", required=True, help="人物名，逗号分隔（1 个或更多）")
+    p_run.add_argument("--work-title", default="", help="虚构角色所属作品（虚构角色必填）")
+    p_run.add_argument(
+        "--adaptation", default="",
+        help="适用改编版本。省略时取「原著」，清单会标注是显式指定还是默认值")
+    p_run.add_argument(
+        "--type", dest="entity_type", default="FICTIONAL_CHARACTER",
+        choices=("FICTIONAL_CHARACTER", "REAL_PERSON"),
+        help="人物类型（默认 FICTIONAL_CHARACTER）")
+    p_run.add_argument(
+        "--vocabulary", default="l1",
+        help="特征词表：l1（默认）/ l2（= l2-zh-classical，中文古典层 42 个标签）")
+    p_run.add_argument(
+        "--budget", type=float, default=0.25,
+        help="单次任务最多花多少美元（默认 0.25）。项目累计上限由配置控制，两者取严。")
+    p_run.add_argument(
+        "--extract-temperature", dest="extract_temperature", type=float, default=None,
+        help="抽取温度（默认 0.7 = 生产值）。99%% 的用户不需要改这个。"
+             "设 0 可复现同一批材料的同一份结果，但会降低多样性。")
+    p_run.add_argument("--out", default="", help="数据目录（默认取配置 PERSONA_DATA_DIR）")
+    p_run.add_argument("--project", default="prj_local", help="项目 ID（默认 prj_local）")
+    p_run.add_argument(
+        "--dry", action="store_true",
+        help="只打印清单：不执行、不落库、不花钱、不询问")
+    p_run.add_argument(
+        "--yes", action="store_true",
+        help="非交互环境的显式确认（TTY 下第一次运行只问一次，之后记住）")
+    p_run.add_argument("--no-dotenv", action="store_true", help="忽略 .env 文件")
+
+    p_show = sub.add_parser(
+        "show", help="查看人物档案（稳定性格 / 习惯 / 说话方式 / 单次行为 / 背景 / 经历）")
+    p_show.add_argument("name", help="人物名，或 pe_ 开头的实体 ID")
+    p_show.add_argument("--db", default="", help="数据库路径（默认取配置）")
+    p_show.add_argument("--project", default="prj_local")
+    p_show.add_argument("--version", type=int, default=None, help="档案版本（默认最新）")
+    p_show.add_argument("--no-dotenv", action="store_true")
+
+    p_rel = sub.add_parser("show-relationship", help="查看两人关系档案（双向视角）")
+    p_rel.add_argument("names", help="两个人物名，逗号分隔，如 林黛玉,贾宝玉")
+    p_rel.add_argument("--db", default="", help="数据库路径（默认取配置）")
+    p_rel.add_argument("--project", default="prj_local")
+    p_rel.add_argument("--no-dotenv", action="store_true")
+
+    p_ev = sub.add_parser("evidence", help="查看某人物的证据（按特征分组，可追到 URL）")
+    p_ev.add_argument("name", help="人物名，或 pe_ 开头的实体 ID")
+    p_ev.add_argument("--trait", default="", help="只看某个 trait_tag（如 caustic）")
+    p_ev.add_argument("--db", default="", help="数据库路径（默认取配置）")
+    p_ev.add_argument("--project", default="prj_local")
+    p_ev.add_argument("--no-dotenv", action="store_true")
+
+    p_export = sub.add_parser("export", help="导出可直接贴进文档的 Markdown")
+    p_export.add_argument("name", help="人物名，或 pe_ 开头的实体 ID")
+    p_export.add_argument("--format", default="md", help="导出格式（本期只支持 md）")
+    p_export.add_argument("--out", default="", help="写到文件（默认打印到屏幕）")
+    p_export.add_argument("--db", default="", help="数据库路径（默认取配置）")
+    p_export.add_argument("--project", default="prj_local")
+    p_export.add_argument("--version", type=int, default=None)
+    p_export.add_argument("--no-dotenv", action="store_true")
 
     p_biz = sub.add_parser(
         "business", help="业务链（研究→证据→人物→关系→对话）的装配与运行")
@@ -927,7 +996,16 @@ def _run_task_action(args: Any) -> int:
             if is_err(outcome):
                 print(f"查询失败：{error_of(outcome)}")
                 return 1
-            _print_task(unwrap(outcome))
+            record = unwrap(outcome)
+            _print_task(record)
+            if getattr(args, "status_extra", False):
+                # P5.1：回答两个只读命令最该回答的问题——"我在看哪个库"
+                # 和"下一步敲什么"。其余字段沿用 `_print_task`，不改口径。
+                print(f"  数据库      : {storage.path}")
+                if record.status.value == "SUCCEEDED":
+                    print("  下一步      : persona show <名字>")
+                elif record.status.value == "PAUSED":
+                    print(f"  下一步      : 提高预算后 persona resume {task_id}")
             return EXIT_OK
 
         if action == "start":
@@ -966,6 +1044,534 @@ def _run_task_action(args: Any) -> int:
         storage.close()
 
 
+def _split_names(raw: str) -> list[str]:
+    """逗号分隔的人名 → 去重保序列表（`run` 与只读命令共用一套口径）。"""
+    parts = [piece.strip() for piece in str(raw or "").split(",")]
+    return list(dict.fromkeys(piece for piece in parts if piece))
+
+
+# ---------------------------------------------------------------------------
+# 只读命令（show / show-relationship / evidence / export）
+# ---------------------------------------------------------------------------
+
+
+def _open_read_stack(args: Any) -> Any:
+    """打开只读栈；失败时已打印原因并返回 `None`（不抛异常给命令层）。"""
+    from pathlib import Path
+
+    from ..core.result import error_of, is_err
+    from ..orchestrator import open_read_services
+
+    explicit = str(getattr(args, "db", "") or "").strip()
+    if explicit:
+        path = Path(explicit)
+    else:
+        settings = _load_settings_or_report(
+            use_dotenv=not getattr(args, "no_dotenv", False))
+        if settings is None:
+            return None
+        path = settings.database_path()
+
+    opened = open_read_services(
+        path, project_id=str(getattr(args, "project", "prj_local") or "prj_local"))
+    if is_err(opened):
+        print(f"找不到数据库：{path}")
+        print(f"  原因    ：{error_of(opened)}")
+        print("  提示    ：如果你刚跑完，检查 --out 是否换过目录"
+              "（数据库在 <out>/persona.db）。只读命令**不会**新建数据库。")
+        return None
+    return opened.value
+
+
+def _explain_missing_entity(name: str) -> None:
+    print(f"没有找到「{name}」：本库里没有这个名字的实体。")
+    print(f'  先运行：persona run --names "{name}" --work-title <作品> --adaptation <版本>')
+    print("  或者确认 --db / --project 指向的是同一个库。")
+
+
+def _cmd_show(args: Any) -> int:
+    """`persona show`：六分区档案 + 未并入说明 + 同名提示（全部只读）。"""
+    from ..core.result import is_err
+    from ..orchestrator import persona_report
+    from .render import render_persona
+
+    services = _open_read_stack(args)
+    if services is None:
+        return 1
+    try:
+        outcome = persona_report(services, args.name,
+                                 version=getattr(args, "version", None))
+        if is_err(outcome):
+            _explain_missing_entity(args.name)
+            return 1
+        report = outcome.value
+        print(render_persona(report))
+        return 1 if report.profile_missing else EXIT_OK
+    finally:
+        services.storage.close()
+
+
+def _cmd_show_relationship(args: Any) -> int:
+    """`persona show-relationship`：两人关系档案（A 看 B ≠ B 看 A，分列）。"""
+    from ..core.result import is_err
+    from ..orchestrator import relationship_report, resolve_entity
+    from .render import render_relationship
+
+    names = _split_names(args.names)
+    if len(names) != 2:
+        print("关系档案需要**两个**人物名，逗号分隔："
+              "persona show-relationship 林黛玉,贾宝玉")
+        return 1
+
+    services = _open_read_stack(args)
+    if services is None:
+        return 1
+    try:
+        for name in names:
+            if is_err(resolve_entity(services, name, need_profile=False)):
+                _explain_missing_entity(name)
+                return 1
+        outcome = relationship_report(services, names[0], names[1])
+        if is_err(outcome):
+            print(f"「{names[0]}」和「{names[1]}」还没有关系档案："
+                  f'先运行 persona run --names "{names[0]},{names[1]}" --work-title <作品>')
+            print("  原因    ：关系档案只有在**同一次 run 里同时研究这两个人**时才会生成。")
+            return 1
+        print(render_relationship(outcome.value))
+        return EXIT_OK
+    finally:
+        services.storage.close()
+
+
+def _cmd_evidence(args: Any) -> int:
+    """`persona evidence`：特征 → 证据 → 来源 URL 的完整链条（只读）。"""
+    from ..core.result import is_err
+    from ..orchestrator import evidence_report
+    from .render import render_evidence
+
+    services = _open_read_stack(args)
+    if services is None:
+        return 1
+    try:
+        outcome = evidence_report(services, args.name, trait=getattr(args, "trait", ""))
+        if is_err(outcome):
+            _explain_missing_entity(args.name)
+            return 1
+        print(render_evidence(outcome.value))
+        # 不存在的 trait 不是错误：已经把"可用标签"列出来了，退出码仍是 0。
+        return EXIT_OK
+    finally:
+        services.storage.close()
+
+
+def _cmd_export(args: Any) -> int:
+    """`persona export --format md`：可直接贴进文档的 Markdown。"""
+    from datetime import date
+    from pathlib import Path
+
+    from ..core.result import is_err
+    from ..orchestrator import persona_report
+    from .render import render_markdown
+
+    if str(getattr(args, "format", "md")).lower() != "md":
+        print("本期只支持 --format md（json 需要 schema 约定，等有真实需求再加）")
+        return 1
+
+    services = _open_read_stack(args)
+    if services is None:
+        return 1
+    try:
+        outcome = persona_report(services, args.name,
+                                 version=getattr(args, "version", None))
+        if is_err(outcome):
+            _explain_missing_entity(args.name)
+            return 1
+        report = outcome.value
+        text = render_markdown(report, generated_on=date.today().isoformat())
+        target = str(getattr(args, "out", "") or "").strip()
+        if target:
+            path = Path(target)
+            try:
+                if path.parent and not path.parent.exists():
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding="utf-8")
+            except OSError as exc:
+                print(f"写入失败：{path}（{exc}）")
+                return 1
+            print(f"已写入 {path}（{len(text.splitlines())} 行）")
+        else:
+            print(text, end="")
+        return 1 if report.profile_missing else EXIT_OK
+    finally:
+        services.storage.close()
+
+
+# ---------------------------------------------------------------------------
+# run（唯一会花钱的命令）
+# ---------------------------------------------------------------------------
+
+
+def _friendly_run_config_error(error: Any) -> None:
+    """把配置错误翻译成人话（§7 文案表）。原始信息仍然打印，方便排查。"""
+    message = str(getattr(error, "message", "") or "")
+    print("配置校验：未通过")
+    if "未提供任何密钥" in message or "未设置模型密钥" in message:
+        print("缺少模型密钥：请设置 PERSONA_PROVIDER_API_KEY（或 DEEPSEEK_API_KEY）。")
+        print("  密钥只放环境变量，不要写进 .env（写进去会被忽略并告警）。")
+        print("  说明：`--dry` 也要读配置（否则清单会把检索报成 0 次，等于假账），"
+              "所以缺密钥时它同样会停在这里。")
+    elif "未设置检索密钥" in message:
+        print("缺少检索密钥：请设置 PERSONA_SEARCH_API_KEY（或 TAVILY_API_KEY）。")
+    elif "单价" in message:
+        print("预算配了，但模型单价没配全：请补 PERSONA_MODEL_PRICE_IN_PER_1M / "
+              "PERSONA_MODEL_PRICE_OUT_PER_1M 与 PERSONA_MODEL_PRICE_SOURCE。")
+        print("  没有单价就无法在发送前估算，闸门不会用估计值冒充。")
+    else:
+        print(f"  说明    ：{message}")
+    print("  提示    ：persona config show 可以看到当前生效值与来源。")
+
+
+def _explain_missing_search() -> None:
+    """检索出口不可用时说清"跑下去等于白花模型钱"。"""
+    print("拒绝运行：本次计划里没有任何检索（检索出口离线或没配密钥）。")
+    print("  为什么停    ：persona run 的材料全部来自检索；没有检索就只能拿空材料"
+          "去调模型——钱照花，证据一条没有。")
+    print("  怎么办      ：设置 PERSONA_SEARCH_API_KEY（或 TAVILY_API_KEY）后重试。")
+    print("  说明：本次**没有发起任何请求**。")
+
+
+def _explain_missing_extractor(stack: Any) -> None:
+    """没有抽取器时，说清"为什么跑下去等于白跑"。"""
+    print("拒绝运行：没有可用的 claim 抽取器（材料变不成证据）。")
+    blocked = False
+    for note in getattr(stack, "warnings", []):
+        if note.code in ("CHAT_PROVIDER_UNAVAILABLE", "EXTRACTOR_ABSENT",
+                         "REAL_PROVIDER_BLOCKED"):
+            print(f"  装配告警：{note.message}")
+            blocked = blocked or note.code == "REAL_PROVIDER_BLOCKED"
+    if blocked:
+        print("  原因    ：本次运行没有被授权真实外呼。")
+    else:
+        print("  原因    ：未配置模型 Provider（PERSONA_MODEL_PROVIDER）或未设置密钥。")
+    print("  建议    ：参考 .env.example 配置模型；用 persona config check 复核。")
+    print("  说明    ：本次**没有发起任何请求，也没有产生费用**。")
+
+
+def _print_run_plan(plan: Any, stack: Any, *, names: list[str], work_title: str,
+                    adaptation: str, adaptation_defaulted: bool, vocabulary_name: str,
+                    vocabulary_count: int, budget: float | None,
+                    settings: Any, dry: bool = False) -> None:
+    """打印本次真实调用清单（§3.1.2：**默认值必须标注来源**）。"""
+    print("本次将要发出的真实调用（钱从这里开始算）")
+    print(f"  研究对象      : {'、'.join(names)}")
+    if work_title:
+        mark = "（未指定，默认）" if adaptation_defaulted else "（显式指定）"
+        print(f"  作品 / 改编版本: {work_title} / {adaptation}{mark}")
+
+    if plan.searches == 0:
+        print("  检索          : 0 次")
+    else:
+        credits = "" if plan.est_search_credits is None else \
+            f"（模板查询，basic ≈{plan.est_search_credits:g} credits）"
+        print(f"  检索          : {plan.searches} 次{credits}")
+    # D-B：清单必须反映**实际装配结果**，不能照着配置打印。
+    # `plan.extracts_upper_bound` 来自 `research.max_extracts` 配置，但配置生效的
+    # 前提是装配层真的装了提取策略——没装就是 0 次，打"上限 3 次"就是假账
+    # （2026-10-19 第一次真跑就吃过这个：清单写 3，实际 0）。
+    describe = stack.describe()
+    extraction_on = bool((describe.get("components") or {}).get("extraction_strategy"))
+    if not extraction_on:
+        print(f"  抓取正文      : 0（未启用正文抓取：本库装配没有提取策略，"
+              f"配置 PERSONA_RESEARCH_MAX_EXTRACTS={plan.extracts_upper_bound} 不生效）")
+    elif plan.extracts_upper_bound == 0:
+        print("  抓取正文      : 0 次（已启用，但上限配置为 0）")
+    else:
+        print(f"  抓取正文      : 上限 {plan.extracts_upper_bound} 次"
+              f" + 补救 {plan.remediations} 次")
+    print(f"  模型抽取      : {plan.extractions} 次")
+    if plan.dialogues:
+        # D-A：对话与抽取共用同一个聊天 Provider。装配层没接上时清单必须说出来，
+        # 否则"模拟对话 1 次"是一句会在 DIALOGUE_RUN 阶段当场作废的承诺。
+        components = describe.get("components") or {}
+        if components.get("dialogue_provider") in (None, "FakeProvider"):
+            print(f"  模拟对话      : {plan.dialogues} 次 ⚠️ "
+                  "但对话阶段没有真实聊天 Provider（FakeProvider），"
+                  "DIALOGUE_RUN 会失败（未登记的 fixture）")
+        else:
+            print(f"  模拟对话      : {plan.dialogues} 次")
+    else:
+        print(f"  模拟对话      : {plan.dialogues} 次")
+    print(f"  词表          : {vocabulary_name}（{vocabulary_count} 个标签；"
+          f"--vocabulary l2 启用 42 个中文古典标签）")
+
+    currency = plan.currency
+    if budget is None:
+        print(f"  模型费用上限  : 未设置（单任务）")
+    else:
+        print(f"  模型费用上限  : {budget:.2f} {currency}（单任务，按 task_id 累计）")
+
+    total_cap = getattr(getattr(settings, "model", None), "max_cost", None)
+    if budget is not None and total_cap is not None and total_cap <= budget:
+        print(f"  累计上限      : {total_cap:.2f} {currency}"
+              f"（配置值，与 --budget 取严 → 本次实际生效 {min(total_cap, budget):.2f}）")
+
+    if plan.est_model_cost is None:
+        print("  预估模型费用  : 估不出来（缺单价或 token 估算）")
+    else:
+        print(f"  预估模型费用  : {plan.est_model_cost:.6f} {currency}"
+              "（仅估算；实际以账单为准）")
+        # 2026-10-19 首次真跑实测：真实 token 是估算常量的 3.5×/2.4×，
+        # 单次实际比预估高约 33%。预算有硬上限兜底，但读者得知道这个数偏低。
+        print(f"  口径提醒      : 实测曾为估算值的 1.3 倍（真实 token 远大于"
+              f" EST_TOKENS 常量；见 docs/P5_1_REAL_RUN.md §9.5）")
+
+    ledger = stack.describe().get("ledger") or {}
+    if ledger.get("hydrated"):
+        print(f"  账本已占用    : {ledger.get('occupied_total', 0.0):.6f} {currency}"
+              "（本库历史，含此前运行）")
+    elif dry:
+        # `--dry` 不碰数据库（不建表、不读历史）。既然读不到，就不能假装算出
+        # "本次实际生效 0.25"——累计上限是**减去已用额之后**才生效的。
+        print("  账本已占用    : 未读取（--dry 不碰数据库，累计已用额未知；"
+              "上面的\"实际生效\"未扣除历史支出）")
+    print("  边界          : 清单之外不会有任何调用；出现清单外的调用即为缺陷")
+
+
+def _cmd_run(args: Any) -> int:
+    """`persona run`：真实检索 + 模型抽取 + 档案（**要过一次确认**）。"""
+    from ..config import load_settings
+    from ..core.context import new_call_context
+    from ..core.result import error_of, is_err, unwrap
+    from ..orchestrator import (
+        BusinessRequest,
+        StackOptions,
+        build_business_stack,
+        model_limits_from_settings,
+        plan_calls,
+        plan_targets,
+        register_targets,
+        resolve_vocabulary,
+        TargetSpec,
+    )
+    from ..storage.sqlite import SqliteStorage
+    from . import consent
+
+    names = _split_names(args.names)
+    if not names:
+        print("缺少 --names：至少给一个人物名（逗号分隔）")
+        return 1
+
+    entity_type = str(getattr(args, "entity_type", "FICTIONAL_CHARACTER"))
+    work_title = str(getattr(args, "work_title", "") or "").strip()
+    adaptation_given = bool(str(getattr(args, "adaptation", "") or "").strip())
+    adaptation = str(getattr(args, "adaptation", "") or "").strip()
+    if entity_type == "FICTIONAL_CHARACTER":
+        if not work_title:
+            print("虚构角色必须声明所属作品（PF-V5）：请补 --work-title；"
+                  "或改用 --type REAL_PERSON")
+            return 1
+        if not adaptation:
+            adaptation = DEFAULT_ADAPTATION
+
+    vocabulary_name = str(getattr(args, "vocabulary", "l1") or "l1")
+    resolved_vocab = resolve_vocabulary(vocabulary_name)
+    if is_err(resolved_vocab):
+        print(error_of(resolved_vocab).message)
+        return 1
+    vocabulary = unwrap(resolved_vocab)
+    vocabulary_count = len(vocabulary.all_tags())
+
+    budget = getattr(args, "budget", DEFAULT_BUDGET_USD)
+    if budget is not None and float(budget) < 0:
+        print("--budget 必须是非负数（0 表示不允许任何模型花费）")
+        return 1
+
+    overrides = {
+        # 检索出口：`PERSONA_PROVIDER` 默认 `fake`（离线）；真实检索必须显式指定。
+        "PERSONA_PROVIDER": "tavily",
+        # 真实外呼必然要求 offline_only=false；密钥是否齐备由配置校验兜住。
+        "PERSONA_OFFLINE_ONLY": "false",
+    }
+    out_dir_arg = str(getattr(args, "out", "") or "").strip()
+    if out_dir_arg:
+        overrides["PERSONA_DATA_DIR"] = out_dir_arg
+    if budget is not None:
+        overrides["PERSONA_MODEL_MAX_COST_PER_TASK"] = str(float(budget))
+
+    loaded = load_settings(use_dotenv=not getattr(args, "no_dotenv", False),
+                           overrides=overrides)
+    if is_err(loaded):
+        _friendly_run_config_error(error_of(loaded))
+        return 1
+    settings = unwrap(loaded)
+    for note in loaded.warnings:
+        print(f"提示：{note.message}")
+
+    data_root = settings.database_path().parent
+    db_path = settings.database_path()
+    db_existed = db_path.exists()
+    storage = SqliteStorage(settings.ensure_data_dir())
+    ctx = new_call_context(project_id=str(getattr(args, "project", "prj_local")),
+                           actor="cli")
+    try:
+        built = build_business_stack(
+            settings, ctx, storage=storage,
+            options=StackOptions(
+                build_chat_provider=True,
+                build_search_provider=True,
+                trait_vocabulary=vocabulary,
+                extract_temperature=getattr(args, "extract_temperature", None),
+                # `--dry` = 预览：**不建表**。`init_schema` 会把表真写进库文件，
+                # 于是"只看一眼清单"就留下一个 80 KB 的空库；没建表就不能 hydrate，
+                # 两者在装配层已经绑在一起关掉。
+                initialize_schema=not getattr(args, "dry", False),
+            ),
+            # `--dry` 也走真实装配：**只构造 Provider，不发请求**。否则清单会把
+            # "本次将会发生 2 次检索"报成 0 次，等于给用户看一份假账。
+            allow_real=True,
+        )
+        if is_err(built):
+            print(f"装配失败：{error_of(built)}")
+            return 1
+        stack = unwrap(built)
+        if stack.claim_extractor is None:
+            _explain_missing_extractor(stack)
+            return 1
+
+        specs = [
+            TargetSpec(display_name=name, entity_type=entity_type,
+                       work_title=work_title, adaptation_version=adaptation)
+            for name in names
+        ]
+        # **先算账、后登记**：`register_targets` 每次都会新建实体（不去重），
+        # 放在授权之前意味着"用户点了取消，库里多出几个同名实体"。
+        plan = plan_calls(stack, plan_targets(specs), materials=[], max_rounds=1)
+        model_calls = plan.extractions + plan.dialogues
+        if plan.searches == 0:
+            # 没有检索出口还继续跑 = 拿空材料去花模型钱。清单上会写"检索 0 次"，
+            # 但那个 0 不是"省了钱"，是"这条路走不通"，必须当场停。
+            _explain_missing_search()
+            return 1
+        _print_run_plan(
+            plan, stack, names=names, work_title=work_title, adaptation=adaptation,
+            adaptation_defaulted=not adaptation_given, vocabulary_name=vocabulary_name,
+            vocabulary_count=vocabulary_count, budget=budget, settings=settings,
+            dry=bool(getattr(args, "dry", False)),
+        )
+
+        limits = model_limits_from_settings(settings)
+        if limits.max_calls is not None and model_calls > int(limits.max_calls):
+            print()
+            print(f"模型调用上限 {int(limits.max_calls)} 次 < 本次需要 {model_calls} 次。"
+                  f"请设 PERSONA_MODEL_MAX_CALLS={model_calls}（或更大）。")
+            print("  说明：本次**没有发起任何请求**。")
+            return 1
+        if (budget is not None and plan.est_model_cost is not None
+                and plan.est_model_cost > float(budget)):
+            print()
+            print(f"预算不足：本次计划 {model_calls} 次模型调用、"
+                  f"预估 {plan.est_model_cost:.4f} {plan.currency}，"
+                  f"--budget 只给了 {float(budget):.3f}。")
+            print("  要么调大 --budget，要么少传几个名字。")
+            print("  说明：本次**没有发起任何请求**。")
+            return 1
+
+        if getattr(args, "dry", False):
+            print()
+            print("（--dry：只打印清单，没有发生任何调用）")
+            # `--dry` 承诺"不落库"：装配阶段的账本 hydrate 会连库、sqlite 会顺手
+            # 建一个 0 字节文件。若这个库**本来是空的**，把它删掉——否则用户
+            # 只是看一眼清单，回来发现多了一个空数据库。
+            storage.close()
+            if not db_existed and db_path.exists() and db_path.stat().st_size == 0:
+                try:
+                    db_path.unlink()
+                except OSError:
+                    pass
+            return EXIT_OK
+
+        interactive = _stdin_is_tty() and _stdout_is_tty()
+        if not interactive:
+            if not getattr(args, "yes", False):
+                print()
+                print("检测到非交互环境（stdin 不是终端）。真实调用需要显式确认，"
+                      "请在命令末尾加 --yes 重跑。")
+                return 1
+        elif consent.is_confirmed(data_root):
+            print()
+            print(consent.previous_note(data_root))
+        else:
+            print()
+            print(consent.build_question(
+                searches=plan.searches, model_calls=model_calls,
+                estimated_usd=plan.est_model_cost, budget_usd=budget,
+                currency=plan.currency))
+            try:
+                answer = input("> ").strip().lower()
+            except EOFError:
+                answer = ""
+            if answer not in ("y", "yes"):
+                print("已取消，没有发生任何调用。")
+                return 1
+            consent.remember(data_root, estimated_usd=plan.est_model_cost)
+
+        registered = register_targets(storage, ctx, specs)
+        if is_err(registered):
+            print(f"登记人物失败：{error_of(registered)}")
+            return 1
+        targets = unwrap(registered)
+
+        print()
+        print(f"开跑：{len(targets)} 名目标")
+        result = stack.orchestrator.run(
+            ctx, BusinessRequest(targets=targets, materials=[], max_rounds=1))
+        if is_err(result):
+            print(f"运行失败：{error_of(result)}")
+            return 1
+        run = unwrap(result)
+
+        records = stack.ledger.records()
+        spent = sum(float(getattr(record, "cost_confirmed", None) or 0.0)
+                    for record in records)
+        print()
+        print(f"  结论            : {run.status}（任务 {run.task_id} / {run.task_status}）")
+        for step in run.steps:
+            print(f"  - {step.name:<22}{step.status:<16}{step.message}")
+            for note in step.warnings:
+                print(f"      ⚠️ [{note.code}] {note.message}")
+        print(f"  来源 / 证据     : {len(run.source_ids)} / {len(run.evidence_ids)}")
+        print(f"  人物 / 关系档案 : {len(run.persona_profile_ids)} / "
+              f"{len(run.relationship_profile_ids)}")
+        if records:
+            print(f"  费用            : {spent:.7f} {plan.currency}"
+                  f"（{len(records)} 次模型调用）")
+        print()
+        print("接下来可以：")
+        for name in names:
+            print(f"  persona show {name}")
+        if len(names) >= 2:
+            print(f"  persona show-relationship {names[0]},{names[1]}")
+        print(f"  persona evidence {names[0]}")
+        print(f"  persona export {names[0]} --format md --out {names[0]}.md")
+        return EXIT_OK if run.is_complete() else 1
+    finally:
+        storage.close()
+
+
+def _stdin_is_tty() -> bool:
+    try:
+        return bool(sys.stdin.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+def _stdout_is_tty() -> bool:
+    try:
+        return bool(sys.stdout.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
@@ -998,6 +1604,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_business_action(args)
     if args.command == "usage":
         return _run_usage_action(args)
+    if args.command == "run":
+        return _cmd_run(args)
+    if args.command == "show":
+        return _cmd_show(args)
+    if args.command == "show-relationship":
+        return _cmd_show_relationship(args)
+    if args.command == "evidence":
+        return _cmd_evidence(args)
+    if args.command == "export":
+        return _cmd_export(args)
     if args.command == "task":
         if not getattr(args, "task_action", ""):
             # 没有子动作时打印 task 的帮助（argparse 的 --help 会走 SystemExit）
@@ -1017,13 +1633,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 task_action=alias[args.command],
                 task_id=getattr(args, "task_id", ""),
                 reason=getattr(args, "reason", "USER"),
+                status_extra=(args.command == "status"),
             )
         )
 
     print(f"命令 `persona {args.command}` 尚未实现。")
     print(f"当前阶段：{STAGE}")
-    print("可用命令：persona info / persona selftest / persona config / persona model / "
-          "persona business / persona usage / persona task")
+    print("可用命令：persona run / status / show / show-relationship / evidence / export / "
+          "info / selftest / config / model / business / usage / task")
     return EXIT_NOT_IMPLEMENTED
 
 

@@ -11,7 +11,9 @@ P1.2-B：只有状态机与检查点的数据结构。
 from .assembly import (
     WARNING_STACK_ANALYZER_DISABLED,
     WARNING_STACK_CHAT_PROVIDER_UNAVAILABLE,
+    WARNING_STACK_DIALOGUE_OFFLINE,
     WARNING_STACK_EXTRACTOR_ABSENT,
+    WARNING_STACK_EXTRACTION_DISABLED,
     WARNING_STACK_LEDGER_HYDRATION_FAILED,
     WARNING_STACK_LEDGER_NOT_HYDRATED,
     WARNING_STACK_REAL_PROVIDER_BLOCKED,
@@ -20,11 +22,14 @@ from .assembly import (
     BusinessStack,
     CallPlan,
     StackOptions,
+    TargetPreview,
     TargetSpec,
     build_business_stack,
     materials_from_files,
     plan_calls,
+    plan_targets,
     register_targets,
+    resolve_vocabulary,
     work_id_for,
 )
 from .budget import (
@@ -92,6 +97,25 @@ from .state import (
     transition_error,
 )
 from .tasks import TaskDraft, TaskService
+from .readmodels import (
+    SECTION_TITLES,
+    EntityRef,
+    EvidenceGroupView,
+    EvidenceReport,
+    EvidenceRow,
+    ItemView,
+    PersonaReport,
+    ReadServices,
+    RelationshipPerspective,
+    RelationshipReport,
+    SectionView,
+    UnmergedView,
+    evidence_report,
+    open_read_services,
+    persona_report,
+    relationship_report,
+    resolve_entity,
+)
 
 __all__ = [
     # 状态机
@@ -136,7 +160,10 @@ __all__ = [
     "BusinessStack",
     "StackOptions",
     "TargetSpec",
+    "TargetPreview",
+    "plan_targets",
     "register_targets",
+    "resolve_vocabulary",
     "work_id_for",
     "materials_from_files",
     "plan_calls",
@@ -149,6 +176,8 @@ __all__ = [
     "WARNING_STACK_CHAT_PROVIDER_UNAVAILABLE",
     "WARNING_STACK_REAL_PROVIDER_BLOCKED",
     "WARNING_STACK_ANALYZER_DISABLED",
+    "WARNING_STACK_DIALOGUE_OFFLINE",
+    "WARNING_STACK_EXTRACTION_DISABLED",
     "BusinessRequest",
     "BusinessRunResult",
     "BusinessStepResult",
@@ -183,4 +212,22 @@ __all__ = [
     # 真实聊天 Provider 装配（P4.4-C）
     "chat_provider_config",
     "chat_provider_from_settings",
+    # 只读查询层（P5.1）：CLI 的 show / show-relationship / evidence
+    "open_read_services",
+    "resolve_entity",
+    "persona_report",
+    "relationship_report",
+    "evidence_report",
+    "ReadServices",
+    "EntityRef",
+    "ItemView",
+    "SectionView",
+    "EvidenceRow",
+    "UnmergedView",
+    "PersonaReport",
+    "RelationshipPerspective",
+    "RelationshipReport",
+    "EvidenceGroupView",
+    "EvidenceReport",
+    "SECTION_TITLES",
 ]

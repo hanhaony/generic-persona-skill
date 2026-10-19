@@ -106,6 +106,11 @@ python -m persona selftest     # 临时库 + Mock Provider 冒烟（退出码 0�
 | `python -m persona task cancel <task_id>` | 取消（**不可**续跑，与暂停不同） | 0 / 1 |
 | `python -m persona task sweep --project X` | 把上次中断的 `RUNNING` 任务安全回退为 `PAUSED(DEPENDENCY)` | 0 / 1 |
 | `persona status / pause / resume / cancel <task_id>` | 上面四个 `task` 命令的快捷方式 | 0 / 1 |
+| `python -m persona run --names A,B --work-title … [--dry] [--yes]` | **研究并生成档案**（真实检索 + 模型）：先打印清单 → 过一次确认 → 开跑。`--dry` 只打清单（零写入零外呼） | 0 / 1 |
+| `python -m persona show <名字\|pe_…> [--version N] [--db …]` | 看六分区档案（稳定性格/习惯/说话方式/单次行为/背景/经历）+ 未并入说明 | 0 / **1**（无档案） |
+| `python -m persona show-relationship A,B [--db …]` | 看两人关系档案（A 看 B 与 B 看 A **分列**） | 0 / 1 |
+| `python -m persona evidence <名字\|pe_…> [--trait 标签] [--db …]` | 按"档案条目 → 证据 → 来源 URL"看每条特征凭什么；**无匹配的标签也是退出码 0**（会列出可用标签） | 0 / 1 |
+| `python -m persona export <名字\|pe_…> [--format md] [--out 文件] [--db …]` | 导出可贴进文档的 Markdown（本期只支持 `md`） | 0 / 1 |
 | `persona new / chat / sources / memory / eval` | **占位**：明确打印"尚未实现" | **2** |
 
 > 占位命令**故意返回退出码 2 并说明"尚未实现"**，不假装能用。
@@ -125,6 +130,31 @@ python -m persona task run    <task_id> --project prj_demo      # → 再次 PAU
 
 最后一步是**关键的预算证明**：额度没提高时，恢复后**一个单元也没多做、一次调用也没多花**，
 说明检查确实发生在消耗之前（D-089）。
+
+**P5.1：从"跑一次"到"看得懂"（五条命令，2026-10-19）**
+
+```bash
+# 1) 先看清单（不花钱、不落库、不询问）
+python -m persona run --names "林黛玉,贾宝玉" --work-title 红楼梦 --vocabulary l2 --dry
+
+# 2) 真跑（第一次会问一次，答 y 之后同一个数据目录不再问；脚本里用 --yes）
+python -m persona run --names "林黛玉,贾宝玉" --work-title 红楼梦 --vocabulary l2
+
+# 3) 看结果（全部只读：不建库、不写审计、不写 usage）
+python -m persona show 林黛玉
+python -m persona show-relationship 林黛玉,贾宝玉
+python -m persona evidence 林黛玉 --trait caustic
+python -m persona export 林黛玉 --format md --out 林黛玉.md
+```
+
+四条只读命令的 `--db` 默认取配置里的数据库；换了 `--out` 就换库，跨目录看库要显式给 `--db`。
+
+> **只读命令绝不建库**：库不存在时报错并提示"只读命令**不会**新建数据库"，
+> 而不是顺手造一个空库让你以为跑过了（§12 纪律 4）。
+>
+> **确认文件**：TTY 里答 `y` 会在数据目录下写 `.persona_consent.json`（只有
+> `version` / `confirmed_at` / `estimated_usd` 三个键，不存密钥、不存命令、不存人名）。
+> 删掉它就重新启用询问；`--yes` 与 `--dry` 都**不写**这个文件。
 
 ---
 
@@ -1150,6 +1180,32 @@ item_id=pi_ev_bbb  text="阿雾在黄昏时分总要先点亮灯塔再锁门"  e
 
 ---
 
+## 5.19 P5.1 遗留：两个待修小项（下一轮，不阻塞）
+
+都是第二次受控真跑期间发现的**显示/易用性**问题，不影响正确性，本次不修。
+
+### 5.19.1 `.env` 的值解析器**不吃行内注释**
+
+`PERSONA_RESEARCH_MAX_EXTRACTS=3   # 临时调到 3` 会把整行（含注释）当成值，
+配置校验于是报"取值 '3   # 临时调到 3' 不是整数"。
+
+- **规避**：注释必须独占一行。`.env` 里已就地写明这条。
+- **要修**：要么在 loader 里裁掉 ` #` 之后的内容，要么在配置校验的报错里
+  明确提示"疑似行内注释"。后者成本更低，也更不容易误伤合法值。
+
+### 5.19.2 `persona status` 的调用上限显示 `None`
+
+```
+预算 : 已用 8 次调用（上限 None）
+```
+
+上限其实是配了的（`.env` 的 `PERSONA_MODEL_MAX_CALLS=3`），`status` 命令没读到。
+
+- **影响**：只影响显示，闸门本身照常工作（真跑时上限确实生效）。
+- **要修**：`status` 走的路径没有加载 `settings.model.max_calls`，补上即可。
+
+---
+
 ## 6. 变更历史
 
 | 日期 | 版本 | 变更 |
@@ -1177,3 +1233,4 @@ item_id=pi_ev_bbb  text="阿雾在黄昏时分总要先点亮灯塔再锁门"  e
 | 2026-10-17 | v0.22 | **P4.7 验收 + 整改**：① 装配层**默认禁止真实外呼**（`build_business_stack(allow_real=False)`，未授权时记 `REAL_PROVIDER_BLOCKED` 且不构造；CLI `business run --allow-real` 才授权，见 §5.15 规则登记 / D-245）；② 新增 `tests/test_p4_7_real_call_gate.py`（9 项，含"默认不碰网络"的 `urlopen` 断言替身）；③ 新增 §5.16 **G12 登记**（跨源同句 ⇒ `traits` 两条同文本条目，用户拍板单独立轮）；④ 人工累计确认 **0.0097980 USD**（含 §5.15 那次未授权调用，**不重置**） | 待确认 |
 | 2026-10-17 | v0.23 | **P4.8：R1 + R3（均零成本）**。① **G12 已修**（方案 A）：档案条目身份 = `pi_<sha256(维度\|归一化说法\|主体集合)[:16]>`，跨源同句合并成一个条目、`evidence_refs` 收全部；background/expression 重复文本只留一次（引用不丢）；旧档案不做 id 迁移。改 **3 处**断言（P1a 1 处、e2e 2 处），新增 2 项边界用例（P1a 共 8 项）。② **Tavily 接线**：`search_provider_from_settings`（`max_retries` 强制 0）＋装配层 `build_search_provider` 同受 `allow_real` 管（§5.17）。③ 顺手修 `research.*` 配置在产品路径被忽略的缺口。④ `plan_calls()`：执行前打印检索/抓取/模型调用次数与估算。新增 `tests/test_p4_8_search_wiring.py`（20 项）；全量 **1301 项**通过 | 待确认 |
 | 2026-10-17 | v0.24 | **P4.8 R4：首次真实检索 e2e**（用户授权：2 检索 + ≤1 抓取 + 3 模型）。实际 1 检索成功 + 1 检索超时 + 1 抓取 + 1 模型，清单外调用 0。新增 `scripts/e2e_p4_8_real_search.py`（`--dry` 物理断网 / 真实运行留痕 / `--report-only` 只读重放）与 `docs/P4_8_R4_REAL_SEARCH.md`。**修 D-1**（作品名没进检索词，+4 项测试）；登记 **D-2 过滤无相关性判定**、**D-3 对话调用未进逐笔账本**、**D-4 对话次数口径偏大**（§5.18）。唯一配置改动：`.env` 的 `PERSONA_MODEL_MAX_CALLS` 1→3。全量 **1305 项**通过 | 待确认 |
+| 2026-10-19 | v0.25 | **P5.1 CLI 收口**：新增只读层 `orchestrator/readmodels.py`、渲染层 `cli/render.py`、授权确认 `cli/consent.py`，CLI 补齐 `run/show/show-relationship/evidence/export` 五命令（含 `run` 的清单 + 授权流程 + `--dry` 零写入）；`assembly.py` 修 **D-A**（对话拿不到真实 Provider，恒用 `FakeProvider` ⇒ 真跑必 FAILED）与 **D-B**（`extraction_strategy` 默认 `None` ⇒ 产品路径从不抓正文，`PERSONA_RESEARCH_MAX_EXTRACTS` 是死配置、清单在说假账）；清单改为**只打装配事实**、不许照配置猜。**两次受控真跑**（合计 ≈0.0166 USD + 3.0 credits，均在上限 0.05 内）：第二次 5/5 阶段全绿、验收 8/9。真跑暴露并修掉 **D-D**（`locator.field` 硬编码 `snippet`，正文证据不可回溯）。登记未修项：**D-C**（`task_id` 进不了账单表）与 §5.19 两小项（`.env` 不吃行内注释、`status` 上限显示 `None`）。新增 `docs/P5_1_CLI_PLAN.md` / `docs/P5_1_REAL_RUN.md` 与 6 个测试文件；全量 **1550 → 1725 项**通过 | 待确认 |

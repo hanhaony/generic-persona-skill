@@ -124,8 +124,17 @@ def verify(artifact: dict) -> Report:
                 quote_problems.append(
                     f"{key}: locator 切片 != 摘录（{sliced[:20]!r} vs {str(quote)[:20]!r}）")
                 continue
-            if loc.get("field") != "snippet":
-                quote_problems.append(f"{key}: locator.field != snippet")
+            # ③ locator.field 必须**如实反映材料性质**（D-D）。
+            #    门禁结论 VALID = 抓回来的正文 ⇒ 必须写 `content`；
+            #    写 `snippet` 等于把正文冒充成检索摘要——第二次真跑实测到的缺陷
+            #    （正文第 1816 字符被标成 `snippet[1816:1848]`）。
+            #    这里刻意不信任产品代码：按材料自己声明的 `quality_status` 判定。
+            status = str(material.get("quality_status") or "")
+            expected_field = "content" if status == "VALID" else "snippet"
+            if loc.get("field") != expected_field:
+                quote_problems.append(
+                    f"{key}: locator.field={loc.get('field')!r} != {expected_field!r}"
+                    f"（材料 quality_status={status!r}）")
         else:
             if quote:
                 quote_problems.append(f"{key}: 非 VERBATIM 却带摘录")
