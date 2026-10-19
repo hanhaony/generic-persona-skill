@@ -33,12 +33,16 @@ python -m persona selftest     # 临时库 + Mock Provider 冒烟（退出码 0�
 本次**实测**过的解释器（G-2 起累计 694 项）：
 
 ```bash
-# Python 3.13.14（托管；安装目录名为 3.13.12，实际版本以 --version 为准）
-"C:/Users/36135/.workbuddy/binaries/python/versions/3.13.12/python.exe" -m unittest discover -s tests -t .
+# Python 3.13.x（把 python3.13 换成你自己的解释器路径）
+python3.13 -m unittest discover -s tests -t .
 
-# Python 3.14.7（系统）
-"C:/Users/36135/AppData/Local/Programs/Python/Python314/python.exe" -m unittest discover -s tests -t .
+# Python 3.14.x
+python3.14 -m unittest discover -s tests -t .
 ```
+
+> 路径说明：这里原本写的是实测机器的两条绝对路径，属于本机环境、对读者无意义，
+> 已改为占位写法（发布前清掉本机路径）。版本下限以 `pyproject.toml` 的
+> `requires-python = ">=3.12"` 为准，上面两个只是**实测过**的版本。
 
 本次实测（G-2）：Python **3.13.14 / 3.14.7 均 `Ran 694 tests ... OK`**（**694 通过 / 0 失败 / 0 错误**）。
 
