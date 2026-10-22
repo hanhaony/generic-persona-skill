@@ -39,6 +39,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -65,6 +66,7 @@ from ..providers.base import ChatRequest, Message, Provider
 from ..storage.sqlite import SqliteStorage
 from .evidence import EvidenceReader
 from .memory import MemoryQuery, MemoryView
+from .memory_writeback import RULE_VERSION, derive_report
 from .model_budget import (
     check_model_budget,
     count_chat_calls,
@@ -82,18 +84,144 @@ USER_SPEAKER_ID = "__user__"
 # 发言人选择策略名（INTERFACES §8.2 `speaker_selection_policy`）
 POLICY_LEAST_RECENTLY_SPOKEN = "least_recently_spoken"
 
-# 记忆写入策略（P3.6，DECISIONS §2.22）：
+# 记忆写入策略（P3.6，DECISIONS §2.22；P6.2-b 扩展 `rule`，DECISIONS §2.32）：
 #   none     —— 默认。**绝不**把对话内容写入长期记忆（用户目标 3）。
 #   explicit —— 仅当调用方在 `commit_turn` 显式给出 memory_candidates 时才写入。
+#   rule     —— 会话级显式授权后，由**确定性规则引擎**（`memory_writeback`）
+#               从**用户原话**派生候选并写入。规则引擎零模型调用、只记用户原文切片，
+#               拿不到模型回答（防回声室）。
+#
+# ⚠️ `rule` 不改变"默认不写"：默认值仍是 `none`，必须在 `start_session` 时
+#    显式选择 `rule` 才会启用。评估链路（`scripts/run_dialogue_eval.py`）**必须**
+#    保持 `none`，否则记忆会污染后续题目的上下文（见该脚本 `assert_eval_memory_policy`）。
 POLICY_MEMORY_WRITE_NONE = "none"
 POLICY_MEMORY_WRITE_EXPLICIT = "explicit"
-MEMORY_WRITE_POLICIES = (POLICY_MEMORY_WRITE_NONE, POLICY_MEMORY_WRITE_EXPLICIT)
+POLICY_MEMORY_WRITE_RULE = "rule"
+MEMORY_WRITE_POLICIES = (
+    POLICY_MEMORY_WRITE_NONE,
+    POLICY_MEMORY_WRITE_EXPLICIT,
+    POLICY_MEMORY_WRITE_RULE,
+)
+#: 允许 `commit_turn` 写入记忆的策略集合。`none` 不在其中（给候选即拒绝）。
+MEMORY_WRITE_AUTHORIZED = (
+    POLICY_MEMORY_WRITE_EXPLICIT,
+    POLICY_MEMORY_WRITE_RULE,
+)
 
 # 注入上下文的模拟记忆条数上限（防止无关记忆淹没 prompt）。
 MEMORY_CONTEXT_LIMIT = 5
 
+# ---------------------------------------------------------------- topic 门禁
+#: **跨会话检索（R2）的话题质量门禁**（P6.3，DECISIONS §2.33）。
+#:
+#: 为什么门禁只能做在 topic 身上：**`MemoryService._matches` 是按空白切词 +
+#: 子串包含**，而中文 topic 整串只是一个 term；`_score` 在单 term 命中时 `base`
+#: 恒为 1.0，只反映 salience 与新旧，**不反映 topic 宽窄**。所以"命中之后按分数
+#: 砍一刀"是假防线——实测（docs/P6_3_TOPIC_PLAN.md §4.4.1）：真实库里 2 条记忆，
+#: `topic="我"` 一个字把**两条全捞进来**。门禁必须卡在进入检索之前。
+TOPIC_MIN_LEN = 2
+TOPIC_MAX_LEN = 64
+
+#: 停用词表。**匹配语义比词表更重要**（见 `topic_is_retrievable`）：
+#: 不是"topic 里出现停用词就拒"，而是**剥掉**停用词后看还剩什么。
+TOPIC_STOPWORDS: tuple[str, ...] = (
+    # 代词
+    "我们", "你们", "他们", "她们", "它们", "咱们",
+    "我", "你", "他", "她", "它", "其", "某",
+    # 虚词 / 助词 / 连词 / 介词 / 语气词
+    "一个", "这个", "那个", "这么", "那么", "这样", "那样",
+    "的", "了", "是", "在", "有", "和", "就", "都", "而", "及",
+    "与", "着", "或", "也", "很", "太", "还", "再", "又", "把",
+    "被", "给", "对", "从", "向", "到", "过", "吗", "呢", "吧", "啊",
+    # 疑问词
+    "什么", "怎么", "为什么", "怎样", "如何",
+    "哪", "谁", "几",
+)
+
+#: 按长度降序：**"我们"必须先于"我"被剥**，否则"我们的西厢记"会先被剥成
+#: "的西厢记"再剥成"西厢记"——碰巧也对，但"我们的我们"这类会算错，而且顺序
+#: 一旦写反，更长的词形永远不会被匹配到（有变异测试钉死，见
+#: `tests/test_p6_3_topic.py::test_stopwords_stripped_longest_first`）。
+_STOPWORDS_BY_LEN: tuple[str, ...] = tuple(
+    sorted(TOPIC_STOPWORDS, key=len, reverse=True))
+
+#: **一次对话调用的实测单价**（USD）。
+#:
+#: 为什么不用配置里的 `PERSONA_MODEL_EST_TOKENS_*`：那两个常量是为**抽取**校准的，
+#: 照搬到对话会高估约 50 倍（对话输入虽带六分区档案，但输出短得多）。P6.0 起历次
+#: 真跑反推（docs/RUNNING.md §5.25 / §5.29 / §5.34）：
+#:   Step 1 ≈0.000376 → D+E ≈0.000512 → 13 全量 ≈0.000513 → Step 3 ≈0.000491
+#: 趋稳在 ≈0.0005，取这个值（宁可略微高估，也不重犯"低估 4.3 倍"的错）。
+#:
+#: 这是**唯一的对话单价出处**：`persona chat` 的授权清单与
+#: `scripts/run_dialogue_eval.py` 的预算闸门都从这里取，不许各处抄一遍数字。
+DIALOGUE_MEASURED_COST_PER_CALL_USD = 0.0005
+
 #: 对话提示词的版本号（进幂等键：改了提示词 = 不同请求意图）
-DIALOGUE_PROMPT_VERSION = "g2-dialogue-2026-10-16"
+#:
+#: ⚠️ **改 prompt 内容必须 bump 这里**。它参与 `_call_key` 的幂等键，不 bump 会让
+#: 新旧 prompt 的真实调用共用同一个键，账本把两笔花费折叠成一笔（漏账）。
+#: P6.0 N1/N2/N4：引入证据级引用 `[ev:<id>]`、补齐 single_events 等分区注入、
+#: 规定无依据时的回答格式 → `g2-*` → `p6-*`。
+#: P6.0 A2 修复（RUNNING §5.22）：引用示例改为真实前缀 `evd_` + "原样抄写"。
+#: 同日第二次 bump 用 `b` 后缀区分（`p6-` 前缀被测试钉住，不能换成 `p6b-`）。
+#: 同日第三次 bump（`c`）：N4 拒答规则收窄为**三档回答**（RUNNING §5.26）——
+#: 无条件拒答把观点题与对话承接也拒了，真跑 D/E 维度全灭。
+#: 同日第四次 bump（`d`）：P1/P2 三档边界补全（档二补转述句式、档三补深入请求，
+#: RUNNING §5.27）——"有人说你X"被误读成档案记载询问、"后来呢"被误读成事实追问。
+DIALOGUE_PROMPT_VERSION = "p6-dialogue-2026-10-20d"
+
+# ---- 证据级引用（P6.0 N1）----
+#
+# 为什么要有它：此前 `referenced_persona_item_ids` 装的其实是 entity_id（档案 ID），
+# 不是条目 ID、更不是证据 ID——"回答能追到证据"只是个**字段名**，没有真实链路。
+# 现在：① 把证据 ID 随档案内容一起注入 prompt；② 要求模型用 `[ev:<id>]` 标注依据；
+# ③ 从模型回答里**解析**出引用（不是把注入的全集抄一遍，否则追溯仍然是假的）。
+#: 故意放宽到"非 `]` 非空白的任意字符"，而不是 `[A-Za-z0-9_-]+`：
+#: 模型写出 `[ev:不存在]` 这种非标准 ID 时，**照样要被解析出来并打越界标记**。
+#: 用窄正则会把这类引用静默丢掉——那就又是"追溯看起来存在、实际没有"。
+EVIDENCE_REF_RE = re.compile(r"\[ev:([^\]\s]+)\]")
+#: 解析出的引用里出现了**本次上下文未提供的**证据 ID → 打这个标记。
+#: 判定是纯集合运算，不靠模型自述。
+FLAG_EVIDENCE_REF_OUT_OF_CONTEXT = "EVIDENCE_REF_OUT_OF_CONTEXT"
+
+# ---- 无依据时的回答格式（P6.0 N4）----
+#
+# 为什么必须有固定格式：幻觉检测要靠"回答包含拒答词"来做**确定性断言**。
+# 不规定格式的话，模型今天说"资料没写"、明天说"我无从得知"，词表命中率随措辞
+# 漂移，断言就不确定了。所以 prompt 里明确要求以这个前缀开头。
+NO_EVIDENCE_PREFIX = "资料没写"
+
+# ---- 各分区注入时的标签（P6.0 N2）----
+#
+# `single_events` 的标签是**硬要求**：只有一份资料提到的行为，必须在 prompt 里就
+# 标成"不得说成一贯"，否则模型会把它当作风陈述（违反 AC-7 / D-012 / PF-V2）。
+LABEL_TRAITS = "稳定特质（多份资料支持，可作为一贯作风陈述）"
+LABEL_HABITS = "习惯"
+LABEL_EXPRESSION = "说话风格"
+LABEL_EXPERIENCES = "经历"
+LABEL_SINGLE_EVENTS = (
+    "单次行为（只有一份资料提到，只发生过一次，**不得**说成一贯/总是/向来/从来）")
+
+# ---- traits 注入上限（P6.0 N3）----
+#
+# 为什么取消截断：此前写死 `traits[:5]`。后果有两个——
+#   ① **评估假失败**：档案里第 6 条之后的特质根本没进 prompt，模型"没说"被记成
+#      "说错"，事实追溯 / 角色一致性两个维度的结论就不可信；而 Step 1 调 Prompt、
+#      Step 2 做记忆写入都拿评估结论当依据，评估歪了后面全歪。
+#   ② **内部不一致**：用户看 `persona show` 能看见全部 traits，对话时却只有 5 条，
+#      同一个档案两种可见性，且没有任何地方告诉用户"对话只用了前 5 条"。
+#
+# 为什么不设一个更大的整数上限而直接全量：`traits` 是**闸控分区**（每条都要
+# ≥2 个独立来源才能进 traits，见 evidence.judge_stability），条数天然有限——
+# 实测真实档案黛玉 traits=1、宝玉 traits=0，本次评估用到的档案也都远低于 10。
+# 而截断带来的代价（假失败）远大于它省下的 token。
+#
+# 保留这个常量的唯一目的：**给"将来有人想省 token 又加回截断"留一个显式开关**。
+# `None` = 全量注入；改成整数 N = 只注入前 N 条。一旦改成整数，评估脚本
+# `scripts/eval_dialogue.py` 的前置检查会自动在报告里标注"此维度结果受截断影响"，
+# 免得假失败悄悄回来。
+TRAITS_INJECT_LIMIT: int | None = None
 
 # 隔离声明：注入给模型的 prompt 必须显式声明"以下为模拟情节，非真实事件"。
 SIMULATION_NOTICE = (
@@ -235,6 +363,13 @@ class TurnDraftResult:
     referenced_relationship_item_ids: list[str]
     safety_flags: list[str]
     usage: UsageDelta | None
+    #: **从模型回答里解析出来的**证据引用（`[ev:<id>]`），P6.0 N1。
+    #:
+    #: 与 `referenced_persona_item_ids`（装的是 entity_id）区分开：这里才是
+    #: 真正可核对到证据的一层。**故意不做有效性过滤**——模型引用了上下文里
+    #: 没给的 ID 也要如实记下来（同时打 `FLAG_EVIDENCE_REF_OUT_OF_CONTEXT`），
+    #: 这样评估器才抓得住；产品层偷偷丢掉错误引用 = 伪造追溯。
+    referenced_evidence_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -251,6 +386,8 @@ class TurnView:
     generated_memory_ids: list[str]
     safety_flags: list[str]
     provider_usage: dict
+    #: 见 `TurnDraftResult.referenced_evidence_ids`：从回答里解析出的证据引用。
+    referenced_evidence_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -309,6 +446,76 @@ def _str_list(value: Any) -> list[str]:
 def _text(value: Any) -> str:
     """去首尾空白的字符串（`None` → `""`）。"""
     return "" if value is None else str(value).strip()
+
+
+def _parse_evidence_refs(text: str) -> list[str]:
+    """从模型回答里解析 `[ev:<id>]`（有序去重，原样保留，不做有效性过滤）。
+
+    为什么不过滤：过滤是评估器的事。产品层如实记录模型引用了什么——包括引用了
+    上下文里根本没有的 ID——追溯才不是装饰品。
+    """
+    out: list[str] = []
+    for match in EVIDENCE_REF_RE.finditer(str(text or "")):
+        eid = str(match.group(1) or "").strip()
+        if eid and eid not in out:
+            out.append(eid)
+    return out
+
+
+def _strip_topic_stopwords(text: str) -> str:
+    """剥掉 topic 里的停用词，返回残留（**按长度降序**剥）。
+
+    "我们的西厢记" → "西厢记"（放行）；"我" → ""（拒）。
+    """
+    for word in _STOPWORDS_BY_LEN:
+        if word in text:
+            text = text.replace(word, "")
+    return text.strip()
+
+
+def topic_is_retrievable(topic: str | None) -> Result[str | None]:
+    """这条 topic 能不能拿去跨会话（R2）取记忆？**纯函数，两处用法**。
+
+    返回：
+      - `Ok(None)` —— **无 topic**（`None` 或纯空白）。与 P6.2 的口径完全一致：
+        不取 R2，**也不报错**（用户没说要跨会话，不是错误）。
+      - `Ok(str)`  —— 合规，值是规范化后的 topic（已 strip）。**检索用原值，不按
+        残留改写**：门禁只回答"让不让取"，不替用户改写查询（不精简、不纠错）。
+        代价是 `我们的西厢记` 会按字面检索、可能 0 命中——与"拼错"同属
+        **取不到**，不是取错，空结果不注入任何东西，因此不污染。
+      - `Err(...)` —— 有 topic 但信息量不够。两处调用方**各自决定怎么办**：
+
+        ① `start_session`：**Err 直接返回**（用户显式给的坏值，不静默丢弃——
+           静默丢弃等于"我按你说的做了"，其实没有）；
+        ② `_retrieve_memories`：**跳过 R2**（历史脏数据不能让整轮失败，读路径
+           不为一条脏行挂掉）。
+
+    门禁只回答"信息量够不够"，**不回答"词完不整 / 有没有拼错"**：
+    `西厢`（2 字非完整词）放行——子串匹配下它命中的就是西厢记相关记忆；
+    `西厢记记`（拼错）也放行——拼错属于"取不到"（检索返回 0 条），不是"取错"，
+    空结果不注入任何东西，因此不污染。
+    """
+    raw = _text(topic)
+    if not raw:
+        return Ok(None)
+    if len(raw) > TOPIC_MAX_LEN:
+        preview = raw[:20] + "…"
+        return Err(new_error(
+            ErrorCode.VALIDATION_TOPIC_TOO_LONG,
+            f'topic "{preview}" 太长：最多 {TOPIC_MAX_LEN} 个字，'
+            f'topic 是话题标签，不是整段话', ))
+    residual = _strip_topic_stopwords(raw)
+    if not residual:
+        return Err(new_error(
+            ErrorCode.VALIDATION_TOPIC_TOO_BROAD,
+            f'topic "{raw}" 太宽泛：去掉停用词后什么都没剩，'
+            f'请换一个更具体的话题（例如「西厢记」）'))
+    if len(residual) < TOPIC_MIN_LEN:
+        return Err(new_error(
+            ErrorCode.VALIDATION_TOPIC_TOO_SHORT,
+            f'topic "{raw}" 太短：至少 {TOPIC_MIN_LEN} 个字'
+            f'（去掉停用词后计算），请换一个更具体的话题'))
+    return Ok(raw)
 
 
 # --------------------------------------------------------------------------
@@ -389,6 +596,13 @@ class DialogueService:
         if is_err(problem):
             return problem
 
+        # topic 门禁（P6.3）：用户**显式**给的坏 topic 直接 Err，不静默丢弃。
+        # 空白 = 没给 topic（Ok(None)），与"不跨会话"同义，不报错。
+        topic_check = topic_is_retrievable(draft.topic)
+        if is_err(topic_check):
+            return topic_check
+        topic = topic_check.value
+
         # 快照版本号（可复现性）
         persona_versions, rel_versions = self._snapshot_versions(
             ctx, participants, draft)
@@ -396,7 +610,7 @@ class DialogueService:
         session_id = new_id("ConversationSession")
         payload = {
             "participant_entity_ids": participants,
-            "topic": draft.topic,
+            "topic": topic,
             "persona_profile_ids": _str_list(draft.persona_profile_ids),
             "relationship_profile_ids": _str_list(draft.relationship_profile_ids),
             "speaker_selection_policy": str(draft.speaker_selection_policy),
@@ -416,7 +630,7 @@ class DialogueService:
             return outcome
         self.deps.storage.append_audit(
             ctx, "INFO", "dialogue.start_session",
-            detail=f"{session_id} participants={participants} topic={draft.topic!r}")
+            detail=f"{session_id} participants={participants} topic={topic!r}")
         return Ok(self._session_view(session_id, payload))
 
     # ------------------------------------------------------------ 发言人选择
@@ -559,6 +773,15 @@ class DialogueService:
                 ErrorCode.EXTERNAL_UNAVAILABLE,
                 "Provider 返回空回复，不伪造成功回复", trace_ref=ctx.trace_ref))
 
+        # P6.0 N1：解析引用 + 越界判定。**纯集合运算**，不靠模型自述。
+        # 引用了本次上下文没给的证据 ID → 打标记，但**照原样记下来**，
+        # 交给评估器去抓（产品层悄悄丢掉 = 伪造追溯）。
+        evidence_refs = _parse_evidence_refs(text)
+        flags = list(context["safety_flags"])
+        allowed = {str(x) for x in (context.get("evidence_in_context") or [])}
+        if any(r not in allowed for r in evidence_refs):
+            flags.append(FLAG_EVIDENCE_REF_OUT_OF_CONTEXT)
+
         return Ok(TurnDraftResult(
             session_id=session_id,
             index=next_index,
@@ -568,8 +791,9 @@ class DialogueService:
             referenced_memory_ids=context["referenced_memory_ids"],
             referenced_persona_item_ids=context["referenced_persona_item_ids"],
             referenced_relationship_item_ids=context["referenced_relationship_item_ids"],
-            safety_flags=context["safety_flags"],
+            safety_flags=flags,
             usage=resp.value.usage,
+            referenced_evidence_ids=evidence_refs,
         ))
 
     # ------------------------------------------------------------ 记账
@@ -617,9 +841,10 @@ class DialogueService:
         幂等：同一 `(session_id, index)` 重复 commit 返回同一 turn_id（连同此前
         记录的 `generated_memory_ids`），**不产生第二轮、也不重复写记忆**。
 
-        **记忆写入触发规则（P3.6，用户目标 3/4/8）**：默认**不写**长期记忆。
-        只有同时满足才写入——① 会话 `memory_write_policy="explicit"`；
-        ② 调用方显式传入 `memory_candidates`。候选必须是**会话级**
+        **记忆写入触发规则（P3.6，用户目标 3/4/8；P6.2-b 扩展 `rule`）**：默认**不写**长期记忆。
+        只有同时满足才写入——① 会话 `memory_write_policy` 为 `explicit` 或 `rule`
+        （`none` 给候选 → 直接拒绝，非静默忽略）；② 调用方传入 `memory_candidates`
+        （`rule` 下由 `run_round` 的规则引擎派生后传入）。候选必须是**会话级**
         （`scope=SESSION`，缺省即会话级），单轮内容不得直接升级为实体级/人格级
         稳定记忆（INV-1）。`scope_id` / `source_turn_id` / `related_entity_ids`
         由本方法补齐，`namespace` 与 `source_type` 由 `Memory.write_simulated`
@@ -657,7 +882,7 @@ class DialogueService:
         policy = str(srow.get("memory_write_policy", POLICY_MEMORY_WRITE_NONE))
         candidates = [dict(c) for c in (memory_candidates or [])]
         if candidates:
-            if policy != POLICY_MEMORY_WRITE_EXPLICIT:
+            if policy not in MEMORY_WRITE_AUTHORIZED:
                 return Err(new_error(
                     ErrorCode.VALIDATION_GATE_REJECTED,
                     f"会话 {session_id} 的记忆写入策略为 {policy!r}，未经显式授权"
@@ -688,6 +913,7 @@ class DialogueService:
             "referenced_memory_ids": _str_list(draft.referenced_memory_ids),
             "referenced_persona_item_ids": _str_list(draft.referenced_persona_item_ids),
             "referenced_relationship_item_ids": _str_list(draft.referenced_relationship_item_ids),
+            "referenced_evidence_ids": _str_list(draft.referenced_evidence_ids),
             "generated_memory_ids": [],
             "provider_usage": _usage_to_dict(draft.usage),
             "safety_flags": _str_list(draft.safety_flags),
@@ -767,6 +993,7 @@ class DialogueService:
             "referenced_memory_ids": [],
             "referenced_persona_item_ids": [],
             "referenced_relationship_item_ids": [],
+            "referenced_evidence_ids": [],
             "generated_memory_ids": [],
             "provider_usage": _usage_to_dict(None),
             "safety_flags": [],
@@ -788,6 +1015,62 @@ class DialogueService:
 
     # ------------------------------------------------------------ 组合
 
+    def _memory_derivation_inputs(
+        self, ctx: CallContext, srow: dict
+    ) -> tuple[list[str], list[tuple[str, str]]]:
+        """规则引擎所需的两个只读输入（P6.2-b）。
+
+        - `profile_texts`：档案里已有的文本，**只**用于 N4「档案已有的不再记一遍」；
+        - `participants`：`(entity_id, display_name)`，**只**用于 R-REL 的指称判断。
+
+        只读、零模型调用。档案读失败（无档案 / 坏档案）**不阻断**派生：少一份
+        `profile_texts` 只会让 N4 少拦一类重复，不会造成把模型的话写进记忆。
+        """
+        participants = _str_list(srow.get("participant_entity_ids"))
+        people: list[tuple[str, str]] = []
+        texts: list[str] = []
+        for pid in participants:
+            name = ""
+            row = self.deps.storage.get(ctx, "PersonEntity", pid)
+            if not is_err(row) and row.value is not None:
+                name = _text(row.value.get("display_name"))
+            people.append((pid, name))
+            view = self.deps.profiles.get_persona(ctx, pid)
+            if is_err(view):
+                continue
+            prof = view.value
+            texts.append(_text(prof.background.text))
+            texts.append(_text(prof.expression_style.text))
+            for items in (prof.traits, prof.habits, prof.experiences,
+                          prof.single_events):
+                texts.extend(_text(getattr(it, "text", "")) for it in items)
+        return [t for t in texts if t], people
+
+    def _derive_memory_candidates(
+        self, ctx: CallContext, session_id: str, srow: dict, user_message: str
+    ) -> list[dict] | None:
+        """`rule` 策略下按确定性规则派生候选；其它策略返回 `None`（= 不派生）。
+
+        ⚠️ **必须按策略短路**：`none` 下若也派生候选，`commit_turn` 的闸门会把
+        **每一轮**都判成 `VALIDATION.gate_rejected`——默认路径会从"零写入"变成
+        "每轮报错"。这不是防御性写法，是正确性要求。
+
+        `explicit` 也返回 `None`：该策略的语义是"调用方自己给候选"，引擎不越俎。
+        """
+        policy = str(srow.get("memory_write_policy", POLICY_MEMORY_WRITE_NONE))
+        if policy != POLICY_MEMORY_WRITE_RULE:
+            return None
+        profile_texts, people = self._memory_derivation_inputs(ctx, srow)
+        report = derive_report(
+            user_message, profile_texts=profile_texts, participants=people)
+        # 审计只记代码与计数，**绝不记内容**（N5 敏感信息的原文不能进审计）。
+        self.deps.storage.append_audit(
+            ctx, "INFO", "dialogue.memory_derive",
+            detail=(f"session={session_id} policy={policy} rule={RULE_VERSION} "
+                    f"candidates={len(report.candidates)} "
+                    f"rejected={sorted({r.code for r in report.rejections})}"))
+        return [dict(c) for c in report.candidates]
+
     def run_round(
         self, ctx: CallContext, session_id: str, user_message: str | None = None,
         *, memory_candidates: list[dict] | None = None,
@@ -796,11 +1079,22 @@ class DialogueService:
 
         可选 `user_message`：先落盘用户消息，再选角色发言人生成回复（用户目标 2）。
         可选 `memory_candidates`：透传给 `commit_turn`（默认无 → 不写记忆）。
+
+        **P6.2-b**：会话策略为 `rule` 且调用方没给候选时，用规则引擎从
+        `user_message` 派生。调用方显式给了候选就尊重调用方（不再派生）。
         """
-        if user_message is not None and str(user_message).strip():
-            user_turn = self.add_user_message(ctx, session_id, user_message)
+        text = "" if user_message is None else str(user_message)
+        if text.strip():
+            user_turn = self.add_user_message(ctx, session_id, text)
             if is_err(user_turn):
                 return user_turn
+        candidates = memory_candidates
+        if candidates is None and text.strip():
+            session = self._get_session(ctx, session_id)
+            if is_err(session):
+                return session
+            candidates = self._derive_memory_candidates(
+                ctx, session_id, session.value, text)
         speaker = self.select_speaker(ctx, session_id)
         if is_err(speaker):
             return speaker
@@ -810,7 +1104,7 @@ class DialogueService:
         if is_err(draft):
             return draft
         return self.commit_turn(
-            ctx, session_id, unwrap(draft), memory_candidates=memory_candidates)
+            ctx, session_id, unwrap(draft), memory_candidates=candidates)
 
     def run(
         self, ctx: CallContext, session_id: str, max_rounds: int
@@ -913,29 +1207,70 @@ class DialogueService:
         referenced_relationship: list[str] = []
         safety_flags: list[str] = []
         persona_briefs: list[str] = []
+        #: 本次上下文里**实际出现过**的证据 ID（有序去重）。模型只能引用这些；
+        #: 引用了集合外的 ID 会被打上 `FLAG_EVIDENCE_REF_OUT_OF_CONTEXT`。
+        evidence_in_context: list[str] = []
         for pid in participants:
             view = self.deps.profiles.get_persona(ctx, pid)
             if is_err(view):
                 continue
             referenced_persona.append(pid)
-            traits = "; ".join(f"{i.text}(可信度{i.confidence})"
-                               for i in view.value.traits[:5])
-            persona_briefs.append(
-                f"- 角色 {pid}（状态 {view.value.status}）："
-                f"{view.value.background.text or '（无背景）'}"
-                + (f" 关键特质：{traits}" if traits else ""))
+            prof = view.value
+            lines = [
+                f"- 角色 {pid}（状态 {prof.status}）："
+                f"{prof.background.text or '（无背景）'}"
+                + self._fmt_refs(prof.background, evidence_in_context)]
+            # P6.0 N2：此前**只注入 traits[:5]**，`single_events` / `habits` /
+            # `experiences` / `expression_style` 一个字都不进 prompt，于是模型
+            # 根本看不到"单次行为"，却会被问"TA 一贯如何"。现在全部注入，
+            # 并且**逐分区标注稳定性**——尤其 `single_events` 必须带着
+            # "不得说成一贯"的标签（AC-7 / D-012 / PF-V2）。
+            #
+            # P6.0 N3：traits 的 `[:5]` 也一并放开为全量（`TRAITS_INJECT_LIMIT`
+            # 为 `None` 时），理由见该常量处的注释——截断会造成评估假失败。
+            traits = (list(prof.traits) if TRAITS_INJECT_LIMIT is None
+                      else list(prof.traits[:TRAITS_INJECT_LIMIT]))
+            for label, items in (
+                (LABEL_TRAITS, traits),
+                (LABEL_HABITS, list(prof.habits)),
+                (LABEL_EXPERIENCES, list(prof.experiences)),
+                (LABEL_SINGLE_EVENTS, list(prof.single_events)),
+            ):
+                line = self._fmt_items(label, items, evidence_in_context)
+                if line:
+                    lines.append(line)
+            if _text(prof.expression_style.text):
+                lines.append(
+                    f"  {LABEL_EXPRESSION}：{_text(prof.expression_style.text)}"
+                    + self._fmt_refs(prof.expression_style, evidence_in_context))
+            persona_briefs.append("\n".join(lines))
         rel_briefs: list[str] = []
         for rid in _str_list(session_row.get("relationship_profile_ids")):
             view = self.deps.relations.get_relationship(ctx, rid)
             if is_err(view):
                 continue
             referenced_relationship.append(rid)
-            note = view.value.coverage.get("group_dynamics", {})
-            rel_briefs.append(
-                f"- 关系 {rid}（参与者 {view.value.participant_entity_ids}，"
-                f"状态 {view.value.status}）"
-                + (f"，群体互动覆盖：{note}" if note else ""))
-            if _str_list(view.value.conflict_ids):
+            rel = view.value
+            note = rel.coverage.get("group_dynamics", {})
+            lines = [
+                f"- 关系 {rid}（参与者 {rel.participant_entity_ids}，"
+                f"状态 {rel.status}）"
+                + (f"，群体互动覆盖：{note}" if note else "")]
+            # 本轮发言人的**单向**视角优先注入（RL-V1：A 看 B ≠ B 看 A，不合并）。
+            block = (rel.perspectives or {}).get(speaker_entity_id)
+            if block is not None:
+                items: list[Any] = []
+                for target_items in (block.view_of_targets or {}).values():
+                    items.extend(target_items)
+                items.extend(block.feeling_toward or [])
+                items.extend(block.expression_toward or [])
+                line = self._fmt_items(
+                    f"{speaker_entity_id} 的单向视角（不得与对方视角合并）",
+                    items, evidence_in_context)
+                if line:
+                    lines.append(line)
+            rel_briefs.append("\n".join(lines))
+            if _str_list(rel.conflict_ids):
                 safety_flags.append("CONFLICT_ASSERTION_GUARD")
 
         # 记忆检索（只读；按 P3.6 规则，只取 SIMULATED；失败传播不吞错）
@@ -960,7 +1295,43 @@ class DialogueService:
             "referenced_persona_item_ids": referenced_persona,
             "referenced_relationship_item_ids": referenced_relationship,
             "safety_flags": safety_flags,
+            "evidence_in_context": evidence_in_context,
         })
+
+    # -------------------------------------------------- 上下文渲染（P6.0 N1/N2）
+
+    @staticmethod
+    def _fmt_refs(section: Any, sink: list[str]) -> str:
+        """把一个 `ProfileSection`（background / expression_style）的证据 ID
+        收进 `sink`，并返回用来拼进 prompt 的尾巴。"""
+        refs = [r for r in _str_list(getattr(section, "evidence_refs", [])) if r]
+        for r in refs:
+            if r not in sink:
+                sink.append(r)
+        return f"（证据 {', '.join(refs)}）" if refs else "（无证据锚点）"
+
+    @staticmethod
+    def _fmt_items(label: str, items: list[Any], sink: list[str]) -> str:
+        """把一个条目分区渲染成一行：`标签：文本（证据 ev_x, ev_y）；…`。
+
+        每条的证据 ID 同时收进 `sink`（有序去重），供模型引用与越界判定。
+        条目没有 `evidence_refs` 时显式标"（无证据锚点）"——不静默省略，
+        免得模型以为可以随便说。
+        """
+        parts: list[str] = []
+        for item in items:
+            text = _text(getattr(item, "text", ""))
+            if not text:
+                continue
+            refs = [r for r in _str_list(getattr(item, "evidence_refs", [])) if r]
+            for r in refs:
+                if r not in sink:
+                    sink.append(r)
+            tail = f"（证据 {', '.join(refs)}）" if refs else "（无证据锚点）"
+            parts.append(f"{text}{tail}")
+        if not parts:
+            return ""
+        return f"  {label}：" + "；".join(parts)
 
     def _retrieve_memories(
         self, ctx: CallContext, session_row: dict
@@ -981,7 +1352,11 @@ class DialogueService:
             return Ok([])
         participants = _str_list(session_row.get("participant_entity_ids"))
         session_id = str(session_row.get("id") or "")
-        topic = session_row.get("topic")
+        # 读路径的门禁（P6.3）：历史脏 topic（绕过 `start_session` 直接写进库的
+        # 行）不合规 → **跳过 R2**，不让整轮失败。Err 在这里被**有意吞掉**——
+        # 一条脏行不该让整轮对话挂掉，记录都不必（写 audit 会淹没真正的错误）。
+        topic_check = topic_is_retrievable(session_row.get("topic"))
+        topic = topic_check.value if not is_err(topic_check) else None
         sim = ProvenanceNamespace.SIMULATED.value
         active = MemoryStatus.ACTIVE.value
 
@@ -994,9 +1369,9 @@ class DialogueService:
                 limit=MEMORY_CONTEXT_LIMIT,
             )
         ]
-        if topic and str(topic).strip():
+        if topic:  # 已过门禁并 strip：None/空白/不合规都到这里是 None
             queries.append(MemoryQuery(
-                text=str(topic),
+                text=topic,
                 entity_ids=participants,
                 namespaces_include=[sim],
                 lifecycle_states=[active],
@@ -1030,6 +1405,50 @@ class DialogueService:
         if "CONFLICT_ASSERTION_GUARD" in context["safety_flags"]:
             system += ("\n\n⚠️ 注意：本轮涉及存在冲突的主题，不得给出"
                        "『唯一确定事实』式的表述，需保留多方说法。")
+        # ---- P6.0 N1 证据级引用 + N4v2 无依据时的三档回答 ----
+        #
+        # N4 为什么必须是**固定格式**：幻觉检测要靠"回答含拒答词"做确定性断言；
+        # 不规定格式的话措辞会漂移，词表命中率就不可控，断言也随之失效。
+        if context.get("evidence_in_context"):
+            # ⚠️ 示例 ID 的**前缀必须与真实 ID 一致**（真实库一律 `evd_`）：
+            # 2026-10-20 真跑 [A2] 里，模型把正确的 `evd_xxx` 照旧示例 `[ev:ev_abc123]`
+            # "规范化"成了 `ev_xxx` → 事实追溯维度假失败（RUNNING §5.22）。
+            # 一个前缀不对的示例比没有示例更糟：它教模型**改动** ID。
+            system += ("\n\n【引用规则】陈述上面任何档案内容时，必须在句末用 "
+                       "[ev:<证据ID>] 标注依据（例如 [ev:evd_abc123]）。"
+                       "**只能**引用上面出现过的证据 ID，不得写出上面没有的 ID；"
+                       "ID 必须**原样抄写**上面出现的字符串，"
+                       "不要改动任何字符（包括前缀）。")
+        # N4 第二代：**三档回答**（2026-10-20 Step 2 真跑后收窄，RUNNING §5.26）。
+        #
+        # 第一代只有一条无条件规则——"问到上面没有的内容时，必须以资料没写：开头"。
+        # 真跑证明它作用域过宽：模型把①观点态度题（"你怎么想？"）和②对话内承接
+        # （对方第二轮提起的话题）也一并拒答 → D 维度零关键词、E 维度末轮丢话题，
+        # 两个维度全灭。C 维度 2/2 通过反证：该拒的拒对了，问题只在"不该拒的也拒"。
+        #
+        # 三档的边界（产品语义，不是评估技巧）：
+        #   档案事实（发生过什么/长什么样/说过什么）缺 → 拒答，这是幻觉红线；
+        #   观点态度（怎么想/认不认/喜不喜欢）→ 角色化回答，可以开口；
+        #   对话内已出现的内容 → 顺着承接，可以开口；
+        # 后两档允许开口，但**不得反过来声称"资料里记着"**——那换了个外套还是幻觉，
+        # 评估侧用 FABRICATION_CUES 单独把关。
+        system += ("\n【没有依据时怎么答】分三种情况，区别在『什么能答』：\n"
+                   f"一、问到**档案事实**而上面没有（发生过什么、是什么样、"
+                   f"说过什么话）→ 必须以「{NO_EVIDENCE_PREFIX}：」开头回答，"
+                   "并一句话说明缺什么依据；不得编造、不得猜测、"
+                   "不得用『可能是』蒙过去。\n"
+                   "二、问你的**看法、态度、感受**（怎么想、认不认、喜不喜欢）"
+                   "→ 以角色身份直接回答，可以说明『这只是我的感受』；"
+                   "但不得声称上面档案里记着某件上面没有的事。"
+                   "若对方转述别人的评价问你『有人说你……，你认吗』，"
+                   "就针对那个评价本身以角色身份回应（认、或不认、或说我的感受），"
+                   "不要答『档案里没有这条记载』——那是在用第一档拒答挡第二档。\n"
+                   "三、**本段对话里**已经出现过的内容（对方提起过的话题、"
+                   "说过的事）→ 顺着上文承接、展开；同样不得把它说成档案记载。"
+                   "若对方让你『接着讲、展开说、细说上头正在聊的话题』"
+                   "（如『后来呢』『再讲讲』），就顺着上文继续说；"
+                   "『没有依据』只用于第一档的档案事实类问题（人物经历、设定），"
+                   "不用于本段对话里正在聊的话题。")
         system += f"\n\n本轮请以角色 {speaker_entity_id} 的视角发言。"
         if context["safety_flags"]:
             system += "\n\n安全标记（必须遵循，并传达给模型）：" + " ".join(
@@ -1142,4 +1561,5 @@ class DialogueService:
             generated_memory_ids=_str_list(row.get("generated_memory_ids")),
             safety_flags=_str_list(row.get("safety_flags")),
             provider_usage=dict(row.get("provider_usage") or {}),
+            referenced_evidence_ids=_str_list(row.get("referenced_evidence_ids")),
         )

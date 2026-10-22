@@ -37,15 +37,63 @@ python -m persona export 林黛玉 --format md --out 林黛玉.md  # 可贴进�
 
 ---
 
+## 0.5 跑一场对话（P6.2 / P6.3，会花钱）
+
+**前提**：同一批人名**先跑过 `persona run`**。对话只读已有档案，不会自己造设定；
+库里没有档案就直接拒绝，不假装认识这个人。
+
+```bash
+# 交互模式：逐行输入，/exit 或 Ctrl-D 结束，Ctrl-C 干净中止（已写的记忆不回滚）
+python -m persona chat --names "林黛玉,贾宝玉" --rounds 3
+
+# 单发一句（不进交互）
+python -m persona chat --names "林黛玉,贾宝玉" --message "你最近在读什么书？"
+```
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `--names` | **必填** | 逗号分隔，**至少 2 人**（对话要在参与者之间轮换发言） |
+| `--rounds` | 1 | **轮数就是调用数**——每轮恰好 1 次模型调用，不玩"预估 × 系数" |
+| `--message` | 空 | 给了就单发这一句（不进交互模式） |
+| `--memory-write` | **`off`** | `rule` = 按确定性规则把**你原话**里值得记的片段写成会话级模拟记忆（0 额外调用） |
+| `--topic` | 空 | 跨会话检索的话题。**不给 = 不跨会话取记忆** |
+| `--budget` / `--db` / `--project` / `--yes` | — | 与 `persona run` **同口径**，授权确认是**同一套**（同一个 `.persona_consent.json`） |
+
+**记忆写入（`--memory-write rule`，默认 `off` 即一条不写）的四条边界**：
+
+1. 只记**你的原话**，**不记模型说过的话**——否则就是让角色把 AI 自己编的话当成"你说的"，
+   滚雪球成回声室（规则引擎的签名里**没有**模型回答这个参数，结构上堵死）；
+2. 只写**会话级**模拟记忆（`namespace=SIMULATED` + `scope=SESSION`），
+   **永远不进真实证据库**，也不会升级成"稳定性格"；
+3. 寒暄、问句、纯情绪**不记**；同一句说两遍只留一条（去重在写入层）；
+4. 写入内容与你的原话**逐字一致**（`content` 恒为用户原话的子串），规则不改写、不总结。
+
+**跨会话检索（`--topic`）**：不给 topic 就**只取本会话**的记忆；给了 topic，才会去库里找
+**同一批参与者**且内容命中该话题的会话级模拟记忆并注入上下文。topic 至少 2 个字、
+不能全是停用词——`--topic "我"` 会命中库里**每一条**记忆，所以它在**花钱之前**就被拦下
+（报错退出、0 次调用）。topic 拼错 = **取不到**（0 条），不是取错：空结果不注入任何东西，
+因此不会污染上下文。
+
+> 对话是**模拟**：产出的一切都带 `SIMULATED` 标记，永远不会反过来改写档案或证据
+> （这是本项目的技术红线之一，有不变式断言守着）。
+
+命令细节见 `docs/RUNNING.md` §5.41（`chat`）与 §5.43（`--topic`）；实测对账见 §5.42 / §5.43。
+
+---
+
 ## 1. 项目当前状态
 
 | 项目 | 内容 |
 | --- | --- |
-| 当前阶段 | **P5.1 CLI 收口已完成 → 正在进行 P5.2（对外文档 + 灰度试用）**。P5.1 = 六命令（`run` / `status` / `show` / `show-relationship` / `evidence` / `export`）+ 只读层 `orchestrator/readmodels.py` + 授权流程；全量 **1725 项测试全绿**，**两次受控真跑通过**（五阶段全 `EXECUTED`，实测 2 人约 0.008 USD）。详见 `docs/P5_1_REAL_RUN.md` |
-| 已完成 | P0 规格与架构、P1.1 核心数据模型、P1.2-A 接口契约与错误处理、P1.2-B 代码骨架、P2.1 工程配置、P2.2 配置管理、P2.3 任务生命周期基础闭环（已验收）、P2.4 故障注入测试（已验收）、P2 证据管线第一步（Evidence 本地管理：登记/查询/持久化/校验/追溯/去重/冲突/稳定性；待验收）、P3 第一步（Persona 本地管理：创建/查询/版本更新/证据追溯/不确定性/冲突关联/虚构边界/模拟隔离；待验收）、P3 第二步（Relationship 本地管理：双向视角/共同经历/时间变化/群体互动/证据直达/版本边界/模拟隔离；待验收）、P3 第四步（Dialogue 本地生成基础：会话/轮次管理/动态发言选择/只读上下文组装/经 Mock Provider 生成/严格模拟隔离；待验收）、P3 第五步（Memory 长期记忆基础：写入/关键词检索/去重/冲突记录/版本化更新/过期/归档/删除与派生产物失效/对象边界/模拟隔离；待验收）、P3 第六步（对话 ↔ 记忆集成：模拟记忆检索注入上下文/显式授权的会话级记忆写入/同事务回滚/幂等；待验收）、P3 第七步（Evaluation 核心 + 端到端集成验收：INV-1~4 不变式断言/依赖分层检查/结构指标/真实调用链集成测试；待验收）、H-11A（Research 最小可运行实现：确定性检索计划/经 Provider 检索/过滤排序/经 Evidence 登记/失败纪律/严格隔离；待验收）、H-10A（业务编排型 Orchestrator：一条命令跑完 Research→Evidence→Persona→Relationship→Dialogue，复用既有任务六态机/预算/检查点，区分成功/部分成功/失败；待验收）、G-2（来源材料 → 候选 claim 自动抽取：可注入 `ClaimExtractorPort`，业务入口不再要求调用方提供 claim；三种 claim 机械区分，推断无根即丢弃；待验收）、**P5.1（CLI 收口：六命令 `run`/`status`/`show`/`show-relationship`/`evidence`/`export` + 只读层 `orchestrator/readmodels.py` + 授权流程「先看清单 → 再确认 → 才开跑」；1725 项测试全绿，两次受控真跑通过，**已验收**，commit `fe18087` / `d9ebc88`）** |
+| 当前阶段 | **P6 二期（对话 + 记忆写入 + 跨会话检索）已完成，进入阶段三（产品化）**。二期 = `persona chat`（P6.2-c）+ 确定性规则记忆写入（P6.2-a/b）+ `--topic` 跨会话检索（P6.3）+ 五维对话质量评估（P6.0/P6.1）；**二期真跑合计 12 次调用 / 0.0052962 USD，逐条对账全对**；全量 **1935 项测试全绿**。P5.1（六命令 `run`/`status`/`show`/`show-relationship`/`evidence`/`export` + 只读层 + 授权流程）见 `docs/P5_1_REAL_RUN.md`；二期总结与已知局限见 `docs/RUNNING.md` §5.44 |
+| 已完成 | P0 规格与架构、P1.1 核心数据模型、P1.2-A 接口契约与错误处理、P1.2-B 代码骨架、P2.1 工程配置、P2.2 配置管理、P2.3 任务生命周期基础闭环（已验收）、P2.4 故障注入测试（已验收）、P2 证据管线第一步（Evidence 本地管理：登记/查询/持久化/校验/追溯/去重/冲突/稳定性；待验收）、P3 第一步（Persona 本地管理：创建/查询/版本更新/证据追溯/不确定性/冲突关联/虚构边界/模拟隔离；待验收）、P3 第二步（Relationship 本地管理：双向视角/共同经历/时间变化/群体互动/证据直达/版本边界/模拟隔离；待验收）、P3 第四步（Dialogue 本地生成基础：会话/轮次管理/动态发言选择/只读上下文组装/经 Mock Provider 生成/严格模拟隔离；待验收）、P3 第五步（Memory 长期记忆基础：写入/关键词检索/去重/冲突记录/版本化更新/过期/归档/删除与派生产物失效/对象边界/模拟隔离；待验收）、P3 第六步（对话 ↔ 记忆集成：模拟记忆检索注入上下文/显式授权的会话级记忆写入/同事务回滚/幂等；待验收）、P3 第七步（Evaluation 核心 + 端到端集成验收：INV-1~4 不变式断言/依赖分层检查/结构指标/真实调用链集成测试；待验收）、H-11A（Research 最小可运行实现：确定性检索计划/经 Provider 检索/过滤排序/经 Evidence 登记/失败纪律/严格隔离；待验收）、H-10A（业务编排型 Orchestrator：一条命令跑完 Research→Evidence→Persona→Relationship→Dialogue，复用既有任务六态机/预算/检查点，区分成功/部分成功/失败；待验收）、G-2（来源材料 → 候选 claim 自动抽取：可注入 `ClaimExtractorPort`，业务入口不再要求调用方提供 claim；三种 claim 机械区分，推断无根即丢弃；待验收）、**P5.1（CLI 收口：六命令 `run`/`status`/`show`/`show-relationship`/`evidence`/`export` + 只读层 `orchestrator/readmodels.py` + 授权流程「先看清单 → 再确认 → 才开跑」；1725 项测试全绿，两次受控真跑通过，**已验收**，commit `fe18087` / `d9ebc88`）、**P6.2-a/b/c（按确定性规则写会话级模拟记忆：规则引擎 + `rule` 策略 + `run_round` 接线 + 最小 `persona chat`；默认仍是一条不写；1912 项测试全绿，真实外呼 0，详见 `docs/RUNNING.md` §5.39~§5.41）、
+**P6.2-d（真跑 6 次逐条对账：该记的记了、不该记的没记，详见 §5.42）**、
+**P6.3（`--topic` 跨会话检索入口 + topic 质量门禁；真跑 A′→B′→C′ 6 次调用两层验收全过，
+详见 §5.43）**、**P6.4（二期收尾：README / SKILL.md / RUNNING.md / ROADMAP.md 四份文档对齐，
+二期总结见 §5.44；1935 项测试全绿）** |
 | 代码状态 | **CLI 六命令可用，真实检索与模型抽取已通过两次受控真跑**：公共契约 / SQLite 最小读写 / Mock Provider / 统一配置 / 六态状态机 + `TaskService` + 预算闸门 + Mock 执行器 / 端口协议 / CLI / **`EvidenceService`（来源·事件·证据·冲突·去重·稳定性）** / **`PersonaService`（档案·版本·证据关联·闸门）** / **`RelationshipService`（双向视角·共同经历·时间变化·群体互动）** / **`DialogueService`（会话·轮次·动态发言·模拟隔离）** / **`MemoryService`（写入·关键词检索·去重·冲突·版本化更新·过期·归档·删除·派生产物失效）** / **Dialogue↔Memory 集成（检索注入 + 显式授权写入 + 同事务回滚）** / **`EvaluationService`（INV-1~4 不变式·依赖分层检查·结构指标，只读不写业务表）** / **`ResearchService`（检索计划·经 Provider 检索·过滤排序·经 Evidence 登记来源，不写证据表）** / **`BusinessOrchestrator`（五阶段业务编排：实现 `UnitHandler` 接既有 `TaskRunner`，阶段间数据只经检查点传递，结果三态自述）** |
-| 尚未实现 | **对话与记忆管理（第二期，真实链路未验证）**、正文抓取与切分（`content_ref`）、检索结果语义排序、AI 人格/关系蒸馏（`distill`）、**按明确规则自动**把对话写入长期记忆（默认策略即「不写」）、`end_session → Memory.consolidate`、`Evaluation.run_unit_tests`/`run_integration_tests` 接线、FTS5 检索升级、向量检索。`task run` 推进的是**抽象工作单元**，**不是**真实业务；`persona new/chat/sources/memory/eval` 仍是诚实的占位 |
-| 外部调用 | **默认不调用**：没有密钥 / 没有显式确认时，Provider 全是 Mock，离线可跑。P4.4 起可在**配了密钥 + 过一次确认**的前提下真实调用模型与检索（`persona run`）；`--dry` 永远零外呼 |
+| 尚未实现 | 正文抓取与切分（`content_ref`）、检索结果语义排序、AI 人格/关系蒸馏（`distill`）、**记忆管理命令**（查看/清理/编辑已写入的记忆）、`end_session → Memory.consolidate`、`Evaluation.run_unit_tests`/`run_integration_tests` 接线、FTS5 检索升级、向量检索。**topic 自动提取**（本期只做显式 `--topic`）、流式输出、多用户身份。`task run` 推进的是**抽象工作单元**，**不是**真实业务；`persona new/sources/memory/eval` 仍是诚实的占位（`persona chat` 已于 **P6.2-c** 接通真实对话、`--topic` 于 **P6.3** 接通跨会话检索，均已真跑验证；详见 `docs/RUNNING.md` §5.41 / §5.43 / §5.44） |
+| 外部调用 | **默认不调用**：没有密钥 / 没有显式确认时，Provider 全是 Mock，离线可跑。**只有 `persona run` 与 `persona chat` 会花钱**，都要求"配了密钥 + 过一次确认"（`chat` 只需模型密钥，不发检索）；`run` 的 `--dry` 永远零外呼 |
 | 依赖安装 | **无第三方依赖**。只用 Python 标准库（`unittest` / `sqlite3` / `dataclasses`） |
 | 技术选型 | Python 3.12+ / 本地 CLI / 模块化单体 / SQLite / 第一版关键词检索 |
 | 支持对象 | 公开资料较丰富的现实公众人物 + 游戏动漫影视中的虚构角色 |
@@ -211,6 +259,7 @@ python -m persona export 林黛玉 --format md --out 林黛玉.md  # 可贴进�
 | 11 | `docs/CONFIG.md` | **配置项、环境变量与密钥管理**：18 项非敏感配置 + 2 项敏感配置、优先级、本地设置方法 | 要改配置或接真实 Provider 的人 |
 | 12 | `docs/P5_1_REAL_RUN.md` | P5.1 的**两次受控真跑**记录：调用清单、账单、验收结论、暴露并修掉的缺陷 | 想知道「真实链路到底跑成什么样」的人 |
 | 13 | `docs/GRAY_RELEASE.md` | **试用说明**：当前状态、预算事实、必读边界、已知限制、反馈格式 | **准备试用的人，先看这个** |
+| 14 | `docs/P6_0_DIALOGUE_EVAL_PLAN.md` / `P6_2_MEMORY_WRITE_PLAN.md` / `P6_3_TOPIC_PLAN.md` | 二期（对话质量评估 / 记忆写入 / 跨会话检索）的**方案与真跑对账** | 想知道「二期怎么验的、验到什么程度」的人 |
 
 > **接口真源**：`ARCHITECTURE.md` 只做总览与指向；**接口细节一律以 `INTERFACES.md` 为准**。两者冲突时以 `INTERFACES.md` 为准。
 
@@ -309,8 +358,9 @@ generic-persona-skill/
 - 不做网页界面（先做本地命令行）
 - 不训练、不微调自己的模型
 - **默认离线；仅在显式授权 + 先看清单之后才真跑**：没有密钥、没有过一次确认时，Provider 全是 Mock，
-  一个请求都不发。`persona run` 是唯一会花钱的命令，它会**先打印清单**（几次检索、几次模型调用、
-  预估多少 USD）**再问一次**「继续？[y/N]」——直接回车 = 取消、零调用零花费。`--dry` 永远只打清单不执行
+  一个请求都不发。**只有 `persona run` 与 `persona chat` 两个命令会花钱**，两者共用**同一套**
+  确认机制：先打印清单（几次检索 / 几次调用、预估多少 USD）**再问一次**「继续？[y/N]」——
+  直接回车 = 取消、零调用零花费。`run` 的 `--dry` 永远只打清单不执行
 - 不硬编码任何特定人物的设定、事实、关系或"标准答案"
 - 不生成给用户看的长篇研究报告
 - 不做多租户、登录鉴权
@@ -326,12 +376,18 @@ generic-persona-skill/
 | 1 | 账单表 `external_usage_records.task_id` 恒为 `null` | 账单**无法按任务对账**；项目累计口径退化为全库累计（**比原设计更严**，不会超支） | 用量表 `usage_records.scope` 里有任务 ID，可按它查 |
 | 2 | `persona status` 里模型调用上限显示为 `None` | 只是**显示**问题，预算闸门照常生效 | 以 `persona config show` 里的实际值为准 |
 | 3 | `.env` **不吃行内注释**（`KEY=3 # 注释` 会把整行当值） | 配置校验报「不是整数」 | 注释必须**独占一行** |
+| 4 | 账单表 `external_usage_records.task_id` 在 `chat` 路径恒为 `null` | `chat` 的调用**无法按任务对账**（`run` 路径同此，见上表 #1） | 按 `usage_records.scope` 查 |
+| 5 | `PERSONA_MODEL_MAX_CALLS` 只数**本次进程**的调用次数 | 默认 3 会拦住 `--rounds 4` 的对话 | 临时抬高用**进程级环境变量**（`PERSONA_MODEL_MAX_CALLS=4 python -m persona chat …`） |
+
+> 二期（对话 / 记忆 / 跨会话检索）的**完整已知局限清单**见 `docs/RUNNING.md` §5.44.3。
 
 ## 8. 现在该做什么
 
 1. **跑一次 `persona run` 试用**（最推荐）：照 `SKILL.md` 的四行跑通来——先 `--dry` 看清单，确认后再真跑；
    跑完用 `show` / `show-relationship` / `evidence` / `export` 看结果。
-2. 或者**读 `SKILL.md` 了解边界**（67 行）：能做什么、绝不编造什么、来源怎么数、什么时候算「够」。
-3. 准备给别人试用：见 `docs/GRAY_RELEASE.md`（预算事实、必读边界、已知限制、反馈格式）。
+2. **接着跑一场 `persona chat`**（会花钱，但很便宜：实测 ≈0.0005 USD/次）：先 `--rounds 2` 试交互，
+   再加 `--memory-write rule --topic "某个话题"` 看记忆写入与跨会话记住。
+3. 或者**读 `SKILL.md` 了解边界**：能做什么、绝不编造什么、来源怎么数、什么时候算「够」。
+4. 准备给别人试用：见 `docs/GRAY_RELEASE.md`（预算事实、必读边界、已知限制、反馈格式）。
 
 如需修改任何标记为「已确认」的决定，请走 `docs/DECISIONS.md` 里的变更流程，不要直接改文档内容。

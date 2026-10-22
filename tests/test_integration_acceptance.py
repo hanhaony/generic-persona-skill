@@ -433,7 +433,8 @@ class TestModuleBoundaries(AcceptanceTestCase):
         """未实现的业务命令必须明确报"尚未实现"，不假装能用。"""
         from persona.cli.main import EXIT_NOT_IMPLEMENTED, main as cli_main
 
-        for argv in (["chat", PROJECT], ["new", "--names", "甲,乙"], ["eval"]):
+        # `chat` 已于 P6.2-c 接通（tests/test_p6_2_chat_cli.py），不再是占位。
+        for argv in (["new", "--names", "甲,乙"], ["eval"]):
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(cli_main(argv), EXIT_NOT_IMPLEMENTED, argv)
 

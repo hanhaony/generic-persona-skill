@@ -558,6 +558,31 @@ D-020）、`status=AMBIGUOUS/INSUFFICIENT_EVIDENCE/CONFLICTED`（D-008）、
 
 ---
 
+### 2.32 P6.2 记忆写回：`rule` 策略、评估链路隔离、D-189 修正（2026-10-20，用户拍板）
+
+> 背景：写记忆的管道（`commit_turn(memory_candidates=)` + `write_simulated`）P3.6 就通了，
+> 但**没有人自动派生候选**、也没有产品入口，所以默认路径永远是零写入。P6.2 补的正是
+> "谁派生、谁授权"这一层。方案见 `docs/P6_2_MEMORY_WRITE_PLAN.md`。
+
+| 编号 | 决定 | 依据 | 状态 |
+| --- | --- | --- | --- |
+| D-296 | **D-179 扩展：新增会话级策略 `memory_write_policy="rule"`，默认仍是 `none`**。语义：会话创建时**显式**选 `rule` ⇒ `run_round` 用确定性规则引擎（`persona/modules/memory_writeback.py`）从**用户原话**派生候选并写入；`explicit` 保持"调用方自己给候选"；`none` 一律不写。`commit_turn` 的闸门由"必须 == explicit"放宽为"∈ {explicit, rule}"（`MEMORY_WRITE_AUTHORIZED`）。**四条不可让**：① 默认值不改（`SessionDraft.memory_write_policy` 仍是 `none`）；② `none` 下**不得派生**——派生了会被闸门判 `gate_rejected`，默认路径从"零写入"变成"每轮报错"；③ 引擎签名**没有**任何接收模型回答的参数（防回声室）；④ 候选内容必须是用户原话切片（verbatim）。审计新增 `dialogue.memory_derive`，**只记规则版本/候选数/否决代码，不记内容** | 用户拍板（P6.2 决策点 ①） | 已实现（接线 13 项测试 + 变异验证） |
+| D-297 | **评估链路必须保持 `memory_write_policy=none`，且做成硬失败**。`scripts/run_dialogue_eval.py` 起每题会话后**读回**策略（`start_eval_session` → `assert_eval_memory_policy`），非 `none` 直接 `RuntimeError`；拿不到该字段同样失败（fail-closed）。理由：`rule` 一旦在评估里开着，记忆会进下一题上下文，**而没有任何断言会发现**——分数会安静地变好看或变难看。另加静态扫描测试，禁止脚本出现 `POLICY_MEMORY_WRITE_RULE/EXPLICIT` 或 `memory_write_policy="rule"` | 用户要求（P6.2-b 第 ② 条） | 已实现（6 项测试） |
+| D-298 | **D-189 修正：`write_simulated` 改为走去重判定**（与 `write()` 同口径：`namespace`+`scope`+`scope_id`+`content` 且 `ACTIVE` 时返回既有 id + `MEMORY_DEDUP_HIT`）。D-189 原为"接受不去重"（跨轮同内容各写一条），P6.2-a 起**推翻**：规则引擎每轮都会派生，同一句"我昨天去城南看桃花"连续两轮就会写出两条，并被下一轮当上下文重复注入。**会话之间仍不互相去重**（`scope_id` 不同）。修在写入层而非规则层：漏一个入口就会重复入库 | 用户拍板（P6.2 决策点 ③） | 已实现（dedupe 2 项直接测试 + 集成 12 项） |
+| D-299 | **授权确认只有一份实现：`cli/main.py::_authorize_real_calls`**，`persona run` 与 `persona chat` **都调它**。理由：两个命令各写一套确认，用户就会在两个入口遇到两种问法、两种"记住"行为（一边记住了另一边还在问）。同口径包括：同一个问句（`consent.build_question`）、同一个 `.persona_consent.json`（放在**数据库所在目录**，换库即重问）、同一条"非交互必须显式 `--yes`"、同一条"`--yes` 不写确认文件"（脚本的同意不等于人的长期约定） | 用户要求（P6.2-c 第 ② 条） | 已实现（`run` 的授权块原样抽出，P5.1 六分支测试继续绿） |
+| D-300 | **对话单价只在一个地方定义：`modules/dialogue.py::DIALOGUE_MEASURED_COST_PER_CALL_USD = 0.0005`**。`persona chat` 的授权清单与 `scripts/run_dialogue_eval.py` 的 `MEASURED_PER_CALL_USD` **都从这里取**（后者改为引用，不再各抄一个数字）。不用 `PERSONA_MODEL_EST_TOKENS_*`：那是给抽取校准的，照搬到对话高估约 50 倍 | 用户要求"费用口径一致"+ 反重复（同 D-298 的合并原则） | 已实现 |
+| D-301 | **Ctrl-C 干净中止的退出码是 130，不是 0**。`persona chat` 被中断时：已完成的轮次与记忆**保留**（每轮一个事务，不回滚）、会话**必置 `ENDED`**（`finally` 里 `end_session`；留 ACTIVE 的会话会被下次 `chat` 当成"还能继续聊"）、`KeyboardInterrupt` 不许逃逸。用 130 而非 0：轮次可能只跑了一半，返回 0 会把"半截运行"伪装成完整运行 | 用户要求（P6.2-c 第 ① 条） | 已实现（1 项测试 + 变异验证：把处理分支改成 `raise` 即红） |
+| D-302 | **CLI 需要的对话符号由 `persona.orchestrator` 转发，不由 CLI 直连 `persona.modules`**（D-059 / F-7 的静态断言 `test_cli_does_not_import_business_modules` 会红）。转发清单：`SessionDraft` / `POLICY_LEAST_RECENTLY_SPOKEN` / `POLICY_MEMORY_WRITE_NONE` / `POLICY_MEMORY_WRITE_RULE` / `DIALOGUE_MEASURED_COST_PER_CALL_USD`。**只转发、不包装**：语义仍只有领域层那一份，CLI 侧不许出现第二个"策略名字符串" | P6.2-c 实现中被静态断言挡下 | 已实现 |
+| D-303 | **记忆检索分两层记账，缺哪一层要分开说**（P6.2-d 真跑实测）：R1 本会话（`scope_id=本会话`，无条件）**已在产品路径生效**——会话 A 第 3 轮起 `referenced_memory_ids` 非空；R2 跨会话**代码在、产品路径永不触发**，因为 `persona chat` 没有 `--topic` 入口、`SessionDraft.topic` 恒 `None`，而"无 topic 不取 R2"是刻意设计（防无关记忆进上下文）。因此**修法是给 `chat` 加 topic 入口，不是放宽 R2 的条件**；在入口出现前，跨会话能力只在存储层与检索端口层成立（直连 `MemoryService.search` 能查到），prompt 注入层不成立 | 用户要求"报告里必须明确说明这次验证了哪一层" | 已定位（P6.3） |
+| D-304 | **`PERSONA_MODEL_MAX_CALLS` 数的是"本次进程"的 CHAT 次数**，历史笔只进费用累计（`occupied_cost`）、不进次数（`count_chat_calls` 只看 `ledger.records()`）。所以"换个命令跑几轮"要重看一次上限：`.env` 里的 3 会拦住 4 轮会话。需要临时抬高时用**进程级环境变量**（第 3 层覆盖 `.env` 第 2 层），**不改 `.env`**；`_cmd_chat` 在发起前就会拦住并提示该设多少 | P6.2-d 真跑前发现（`.env` 为 3，会话 A 需 4） | 已记录（RUNNING §5.42） |
+| D-305 | **跨会话检索（R2）的入口是显式 `--topic`，本期不做自动提取**。理由两条：① 不装依赖 ⇒ 没有中文分词器，规则法对"我现在觉得你比从前可亲多了"这类句子提不出有效 topic；② 自动提取 = 把"要不要跨会话召回"这个语义决策交给**启发式默认值**，正是 D-A/D-B/D-D 与 `none` 派生陷阱那一族。`--topic` 缺省 = 不跨会话取记忆（与 P6.2 同口径），**不是"默认捞一批"** | 用户拍板（P6.3 决策点 1） | 已实现 |
+| D-306 | **topic 门禁是一个纯函数 `topic_is_retrievable()`、两处用法**，`Ok(None)`=无 topic（不报错、不取 R2）/ `Ok(str)`=放行 / `Err`=不合规。`start_session` 用它 **Err**（显式给的坏值不静默丢弃）；`_retrieve_memories` 用它 **跳过 R2**（历史脏行不让整轮失败，读路径不为一条脏数据挂掉）。**防线不能只放 CLI**——只放 CLI 就是"能力只存在于一条路径" | 用户拍板（P6.3 决策点 2） | 已实现（3 条 + 变异 ②） |
+| D-307 | **门禁只能卡 topic 本身的质量，不能卡命中之后的打分**。`MemoryService._matches` 是按空白切词 + 子串包含，中文 topic 整串只是一个 term；`_score` 在单 term 命中时 `base` 恒为 1.0，只反映 salience 与新旧，**不反映 topic 宽窄** ⇒ 加 score 阈值是**假防线**。实测依据（`docs/P6_3_TOPIC_PLAN.md` §4.4.1）：真实库 2 条记忆，`topic="我"` 一个字把**两条全捞进来**；`topic="西厢"` 命中 1 条（放行是对的，拦了才是错）；`topic="西厢记记"` 0 条（拼错属于"取不到"，不是"取错"） | 方案阶段对真实库实测（零外呼） | 已实现 |
+| D-308 | **停用词按长度降序剥离后判空，且检索用原值**。"出现即拒"会误杀 `我们的西厢记`（很具体的话题）；剥离后判空才能区分 `我`（拒）与 `我们的西厢记`（放行）。检索**不按残留改写查询**：不精简、不纠错，门禁只回答"让不让取" | 用户要求"停用词表要明确列出"+ 配套变异测试 ④⑤ | 已实现 |
+| D-309 | **跨会话验收分两层，归属要分开**：第一层看 `referenced_memory_ids` 是否非空（检索层，自动断言）；第二层看回答是否含具体词（如"西厢记"/"崔莺莺"）且**不含"资料没写/没有记载"**（行为层，人工判定，防"泛泛而谈看起来对了但没真用上记忆"）。**第一层过、第二层不过 ⇒ prompt 问题，记为已知局限，P6.3 照常判通过**（与 P6.0 里 E1 的处理一致，不为此放宽判据） | 用户要求（P6.3 验收标准） | 已实现（真跑 B′ 两层全过） |
+
+---
+
 ## 3. 尚未确定的开放问题
 
 > ⚠️ 以下问题是**真的没定**。任何人不得以"我猜是这样"为由自行实现。

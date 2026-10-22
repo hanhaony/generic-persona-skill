@@ -298,7 +298,16 @@ class MemoryService:
         return Ok(refs, warnings=warnings)
 
     def write_simulated(self, ctx: CallContext, draft: dict) -> Result[MemoryRef]:
-        """`Dialogue` 唯一可用的记忆写入通道。强制 `namespace=SIMULATED` + `source_type=SIMULATED_DIALOGUE`。"""
+        """`Dialogue` 唯一可用的记忆写入通道。强制 `namespace=SIMULATED` + `source_type=SIMULATED_DIALOGUE`。
+
+        去重与 `write()` 同口径（P6.2-a 修复）：同 `namespace` + 同 `scope` + 同
+        `scope_id` + 同 `content` 且仍 `ACTIVE` 的既有记忆，直接返回它（带
+        `MEMORY_DEDUP_HIT` 提示），**不再落第二条**。
+
+        为什么这条必须在写入层修、而不是只在调用方预查：`commit_turn` 的事务里
+        逐条调用本方法，调用方（规则引擎 / 重放 / 将来任何入口）都不该各自实现一遍
+        查重；漏一个入口，重复记忆就会进库，并被下一轮当上下文注入。
+        """
         required = (
             "scope",
             "scope_id",
@@ -326,6 +335,21 @@ class MemoryService:
         err = self._validate_draft(full, ctx)
         if is_err(err):
             return err
+        dup = self._find_duplicate(ctx, full)
+        if dup is not None:
+            return Ok(
+                MemoryRef(
+                    id=dup["id"],
+                    kind=dup["kind"],
+                    content_excerpt=str(dup.get("content", ""))[:120],
+                    namespace=dup["namespace"],
+                    lifecycle_status=dup["lifecycle_status"],
+                    duplicate_of_memory_id=dup["id"],
+                ),
+                warnings=[WarningNote(
+                    code="MEMORY_DEDUP_HIT",
+                    message=f"内容已存在：{dup['id']}")],
+            )
         mid = new_id("MemoryItem")
         payload = self._build_payload(
             full,

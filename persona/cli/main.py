@@ -23,6 +23,9 @@ from ..core.enums import NAMESPACE_WRITE_GATE, ProvenanceNamespace, TaskStatus
 
 EXIT_OK = 0
 EXIT_NOT_IMPLEMENTED = 2
+#: Ctrl-C 干净中止（P6.2-c）。用 130 而不是 0：轮次可能只跑了一半，
+#: "成功退出"会把它伪装成一次完整运行；130 与 shell 对 SIGINT 的惯例一致。
+EXIT_INTERRUPTED = 130
 
 #: 省略 `--adaptation` 时的取值。**取默认值不是问题，悄悄取才是**——
 #: 清单里必须标注"（未指定，默认）"（P5.1 §3.1.2）。
@@ -31,10 +34,16 @@ DEFAULT_ADAPTATION = "原著"
 #: 单任务预算默认值（USD）。与 `.env.example` 的 `PERSONA_MODEL_MAX_COST_PER_TASK` 一致。
 DEFAULT_BUDGET_USD = 0.25
 
+#: `persona chat --memory-write` 的可选值。**产品面只暴露两个**：
+#: `off`（默认，一条都不写）与 `rule`（按确定性规则从**用户原话**派生候选）。
+#: 不暴露 `explicit`——命令行没有"调用方显式给候选"这条路径，给了也用不上，
+#: 只会被误当成"另一种自动写"。
+CHAT_MEMORY_WRITE_CHOICES = ("rule", "off")
+
 # INTERFACES §11.2 里列出的命令；**仍为占位**的部分（P2.3 只接通了任务生命周期）
+# `chat` 已于 P6.2-c 接通（docs/RUNNING.md §5.41），从这里移出。
 PLACEHOLDER_COMMANDS = (
     "new",
-    "chat",
     "sources",
     "memory",
     "eval",
@@ -106,6 +115,40 @@ def build_parser() -> argparse.ArgumentParser:
         "--yes", action="store_true",
         help="非交互环境的显式确认（TTY 下第一次运行只问一次，之后记住）")
     p_run.add_argument("--no-dotenv", action="store_true", help="忽略 .env 文件")
+
+    p_chat = sub.add_parser(
+        "chat",
+        help="和库里已有档案的人物对话（真实模型；第一次会要求确认一次）")
+    p_chat.add_argument(
+        "--names", required=True,
+        help="人物名，逗号分隔（**至少 2 人**：对话要轮换发言，一个人开不了会话）")
+    p_chat.add_argument(
+        "--rounds", type=int, default=1,
+        help="最多跑几轮（默认 1）。每轮 = 1 次模型调用；轮数就是调用数")
+    p_chat.add_argument(
+        "--message", default="",
+        help="只发这一句（给了就不进交互模式）。缺省时逐行读你的输入，"
+             "空行忽略、/exit 或 Ctrl-D 结束、Ctrl-C 干净中止")
+    p_chat.add_argument(
+        "--memory-write", dest="memory_write", default="off",
+        choices=CHAT_MEMORY_WRITE_CHOICES,
+        help="off（默认）：一条记忆都不写。rule：把**你原话**里值得记的片段写成"
+             "**会话级模拟记忆**（确定性规则，零额外调用；不记模型说过的话）")
+    p_chat.add_argument(
+        "--topic", default="",
+        help="跨会话检索的话题（不给 = **不跨会话取记忆**，与 P6.2 一致）。"
+             "给了 topic，才会去库里找**同一批参与者**、内容命中该话题的"
+             "会话级模拟记忆并注入上下文；至少 2 个字、不能全是停用词"
+             "（「我」「这个」这类会被拦——一个字就能命中库里每条记忆）")
+    p_chat.add_argument(
+        "--budget", type=float, default=DEFAULT_BUDGET_USD,
+        help=f"本次最多花多少美元（默认 {DEFAULT_BUDGET_USD}）")
+    p_chat.add_argument("--db", default="", help="数据库路径（默认取配置）")
+    p_chat.add_argument("--project", default="prj_local", help="项目 ID（默认 prj_local）")
+    p_chat.add_argument(
+        "--yes", action="store_true",
+        help="非交互环境的显式确认（TTY 下第一次运行只问一次，之后记住）")
+    p_chat.add_argument("--no-dotenv", action="store_true", help="忽略 .env 文件")
 
     p_show = sub.add_parser(
         "show", help="查看人物档案（稳定性格 / 习惯 / 说话方式 / 单次行为 / 背景 / 经历）")
@@ -268,7 +311,6 @@ def build_parser() -> argparse.ArgumentParser:
     for name in PLACEHOLDER_COMMANDS:
         help_text = {
             "new": "新建项目（尚未实现）",
-            "chat": "运行多人对话（尚未实现）",
             "sources": "查看来源清单（可选追溯，尚未实现）",
             "memory": "查看或清理记忆（尚未实现）",
             "eval": "运行评测（尚未实现）",
@@ -276,10 +318,8 @@ def build_parser() -> argparse.ArgumentParser:
         p = sub.add_parser(name, help=help_text)
         if name == "new":
             p.add_argument("--names", default="", help="两个或更多人物名，用逗号分隔")
-        if name in ("chat", "sources", "memory"):
+        if name in ("sources", "memory"):
             p.add_argument("project_id", nargs="?", default="")
-        if name == "chat":
-            p.add_argument("--rounds", type=int, default=0)
 
     return parser
 
@@ -1490,30 +1530,12 @@ def _cmd_run(args: Any) -> int:
                     pass
             return EXIT_OK
 
-        interactive = _stdin_is_tty() and _stdout_is_tty()
-        if not interactive:
-            if not getattr(args, "yes", False):
-                print()
-                print("检测到非交互环境（stdin 不是终端）。真实调用需要显式确认，"
-                      "请在命令末尾加 --yes 重跑。")
-                return 1
-        elif consent.is_confirmed(data_root):
-            print()
-            print(consent.previous_note(data_root))
-        else:
-            print()
-            print(consent.build_question(
-                searches=plan.searches, model_calls=model_calls,
-                estimated_usd=plan.est_model_cost, budget_usd=budget,
-                currency=plan.currency))
-            try:
-                answer = input("> ").strip().lower()
-            except EOFError:
-                answer = ""
-            if answer not in ("y", "yes"):
-                print("已取消，没有发生任何调用。")
-                return 1
-            consent.remember(data_root, estimated_usd=plan.est_model_cost)
+        if not _authorize_real_calls(
+            data_root=data_root, searches=plan.searches, model_calls=model_calls,
+            estimated_usd=plan.est_model_cost, budget_usd=budget,
+            currency=plan.currency, yes=bool(getattr(args, "yes", False)),
+        ):
+            return 1
 
         registered = register_targets(storage, ctx, specs)
         if is_err(registered):
@@ -1554,6 +1576,371 @@ def _cmd_run(args: Any) -> int:
         print(f"  persona evidence {names[0]}")
         print(f"  persona export {names[0]} --format md --out {names[0]}.md")
         return EXIT_OK if run.is_complete() else 1
+    finally:
+        storage.close()
+
+
+def _authorize_real_calls(
+    *, data_root: Any, searches: int, model_calls: int,
+    estimated_usd: float | None, budget_usd: float | None,
+    currency: str = "USD", yes: bool = False,
+) -> bool:
+    """真实调用前的**那一次确认**（P5.1；P6.2-c 起 `run` 与 `chat` 共用这一份）。
+
+    **为什么不许复制一份**：两个命令各写一套确认，用户就会在两个入口遇到
+    两种问法、两种"记住"行为——一边记住了另一边还问，或者反过来。确认只有
+    一种说法（同一个问句、同一个 `.persona_consent.json`、同一条"非交互必须
+    `--yes`"），所以这里必须是**唯一实现**，两个命令都来调它。
+
+    返回 `False` = 不该跑（调用方直接返回退出码 1，且**此时零调用**）。
+    """
+    from . import consent
+
+    interactive = _stdin_is_tty() and _stdout_is_tty()
+    if not interactive:
+        if not yes:
+            print()
+            print("检测到非交互环境（stdin 不是终端）。真实调用需要显式确认，"
+                  "请在命令末尾加 --yes 重跑。")
+            return False
+        return True
+    if consent.is_confirmed(data_root):
+        print()
+        print(consent.previous_note(data_root))
+        return True
+    print()
+    print(consent.build_question(
+        searches=int(searches), model_calls=int(model_calls),
+        estimated_usd=estimated_usd, budget_usd=budget_usd, currency=currency))
+    try:
+        answer = input("> ").strip().lower()
+    except EOFError:
+        answer = ""
+    if answer not in ("y", "yes"):
+        print("已取消，没有发生任何调用。")
+        return False
+    consent.remember(data_root, estimated_usd=estimated_usd)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# chat（P6.2-c：第二个会花钱的命令）
+#
+# 刻意不做：流式输出、多用户身份、记忆管理命令、任何"帮你润色"的改写。
+# 这一版的唯一目标是让"规则引擎写记忆"这条链路**在产品路径上真的跑得起来**
+# ——否则 P6.2 就又是 D 家族第 N 例：能力只存在于测试显式注入的那条路上。
+# ---------------------------------------------------------------------------
+
+
+def _chat_memory_policy(raw: str) -> str:
+    """`--memory-write rule|off` → 会话的 `memory_write_policy`。
+
+    `off` 映射到 `none`（不是新增一个值）：默认不写这件事**只有一种说法**，
+    产品面换个词就够了，领域层不该长出第二个"什么都不写"。
+    """
+    # 经协调层取常量：CLI 不许直连 `persona.modules`（D-059 / F-7）。
+    from ..orchestrator import POLICY_MEMORY_WRITE_NONE, POLICY_MEMORY_WRITE_RULE
+
+    return (POLICY_MEMORY_WRITE_RULE if str(raw or "").strip() == "rule"
+            else POLICY_MEMORY_WRITE_NONE)
+
+
+def _print_chat_plan(*, names: list[str], rounds: int, policy: str,
+                     estimated_usd: float, budget: float | None,
+                     currency: str, db_path: Any, occupied: float,
+                     topic: str | None = None) -> None:
+    """对话的调用清单。**轮数就是调用数**，不玩"预估 × 系数"的花招。"""
+    from ..orchestrator import POLICY_MEMORY_WRITE_RULE
+
+    print("本次将要发出的真实调用（钱从这里开始算）")
+    print(f"  对话人物      : {'、'.join(names)}")
+    print(f"  数据库        : {db_path}")
+    print(f"  对话轮次      : {rounds}（每轮 1 次模型调用，共 {rounds} 次）")
+    if topic:
+        print(f"  跨会话话题    : {topic}（只取**同一批参与者**、内容命中该话题的"
+              "会话级模拟记忆；**额外 0 次调用**：记忆检索走本地库，不花钱）")
+    else:
+        print("  跨会话话题    : 无（**不跨会话取记忆**，只取本会话自己写下的）")
+    if policy == POLICY_MEMORY_WRITE_RULE:
+        print("  记忆写入      : rule（把**你原话**里值得记的片段写成会话级模拟记忆；"
+              "确定性规则，0 次额外调用）")
+    else:
+        print("  记忆写入      : off（默认。**一条都不写**：对话内容不会进长期记忆）")
+    if budget is None:
+        print("  模型费用上限  : 未设置（单任务）")
+    else:
+        print(f"  模型费用上限  : {float(budget):.2f} {currency}（单任务）")
+    print(f"  预估模型费用  : {estimated_usd:.6f} {currency}"
+          "（按对话实测单价 0.0005/次，不是抽取用的 EST 常量）")
+    if occupied:
+        print(f"  账本已占用    : {occupied:.6f} {currency}（本库历史，含此前运行）")
+    print("  边界          : 清单之外不会有任何调用；出现清单外的调用即为缺陷")
+
+
+def _explain_missing_chat_provider(stack: Any) -> None:
+    """没有真实聊天 Provider 时说清"为什么开不了会话"。"""
+    print("拒绝运行：对话阶段没有真实聊天 Provider（装配结果里是 FakeProvider）。")
+    for note in getattr(stack, "warnings", []):
+        if note.code in ("CHAT_PROVIDER_UNAVAILABLE", "REAL_PROVIDER_BLOCKED"):
+            print(f"  装配告警：{note.message}")
+    print("  怎么办      ：设置 PERSONA_MODEL_PROVIDER 与 PERSONA_PROVIDER_API_KEY"
+          "（或 DEEPSEEK_API_KEY），再用 persona config check 复核。")
+    print("  说明        ：本次**没有发起任何请求，也没有产生费用**。")
+
+
+def _read_user_line() -> str | None:
+    """REPL 读一行。`None` = 结束（Ctrl-D / `/exit`）；`""` = 空行（忽略，不计轮次）。
+
+    **不在这里捕获 `KeyboardInterrupt`**：Ctrl-C 要交给外层统一收尾
+    （结束会话 + 打印已写记忆 + 返回中断退出码），在这里吞掉就没人知道
+    该收尾了。
+    """
+    try:
+        raw = input("你> ")
+    except EOFError:
+        print()
+        return None
+    text = str(raw).strip()
+    if text in ("/exit", "/quit"):
+        return None
+    return text
+
+
+def _print_chat_turn(index: int, message: str | None, view: Any,
+                     display: dict[str, str]) -> None:
+    if message:
+        print(f"你：{message}")
+    name = display.get(view.speaker_entity_id) or view.speaker_entity_id
+    print(f"{name}：{view.content}")
+    if view.referenced_evidence_ids:
+        print(f"    依据：{'、'.join(view.referenced_evidence_ids)}")
+    if view.generated_memory_ids:
+        print(f"    记忆：{'、'.join(view.generated_memory_ids)}")
+
+
+def _cmd_chat(args: Any) -> int:
+    """`persona chat`：拿库里**已有**的档案开一次多轮对话（真实模型，要过确认）。
+
+    三件事是硬要求（P6.2-c）：
+      ① 开会话时把 `--memory-write` 映射成的策略**真的传进去**（默认 `none`）；
+      ② 每轮走 `run_round`（`rule` 策略下由它派生候选并写记忆）；
+      ③ 结束时打印写下的记忆 ID 与会话终态——**写了什么必须能看见**。
+    """
+    from pathlib import Path
+
+    from ..config import load_settings
+    from ..core.context import new_call_context
+    from ..core.result import error_of, is_err, unwrap
+    # 全部经协调层：CLI 不许直连 `persona.modules`（D-059 / F-7）。
+    from ..orchestrator import (
+        DIALOGUE_MEASURED_COST_PER_CALL_USD,
+        POLICY_LEAST_RECENTLY_SPOKEN,
+        POLICY_MEMORY_WRITE_RULE,
+        ReadServices,
+        SessionDraft,
+        StackOptions,
+        build_business_stack,
+        model_limits_from_settings,
+        resolve_entity,
+        topic_is_retrievable,
+    )
+    from ..storage.sqlite import SqliteStorage
+
+    names = _split_names(getattr(args, "names", ""))
+    if len(names) < 2:
+        print("persona chat 至少要 2 个人物：对话要在参与者之间轮换发言，"
+              "一个人开不了会话。")
+        print('  例：persona chat --names "林黛玉,贾宝玉" --rounds 3')
+        return 1
+
+    raw_rounds = getattr(args, "rounds", 1)
+    try:
+        rounds = int(raw_rounds)
+    except (TypeError, ValueError):
+        print(f"--rounds 必须是整数（收到 {raw_rounds!r}）")
+        return 1
+    if rounds < 1:
+        print(f"--rounds 必须是正整数（收到 {rounds}）：0 轮就是不调用，不用开会话。")
+        return 1
+
+    policy = _chat_memory_policy(getattr(args, "memory_write", "off"))
+    budget = getattr(args, "budget", DEFAULT_BUDGET_USD)
+    if budget is not None and float(budget) < 0:
+        print("--budget 必须是非负数（0 表示不允许任何模型花费）")
+        return 1
+
+    # topic 门禁：**在任何调用之前**，更在授权确认之前——坏 topic 一步钱都不动。
+    # 「不给 topic」= 不跨会话取记忆（Ok(None)，不报错）；「给了坏 topic」= 报错退出。
+    topic_check = topic_is_retrievable(getattr(args, "topic", ""))
+    if is_err(topic_check):
+        print(f"ERROR: {error_of(topic_check).message}")
+        print('  例如：--topic "西厢记"')
+        print("  说明：本次**没有发起任何请求**。")
+        return 1
+    topic = topic_check.value
+
+    overrides = {
+        # 对话要调模型，`offline_only=true` 下装配层根本不会构造真实 Provider。
+        "PERSONA_OFFLINE_ONLY": "false",
+    }
+    explicit_db = str(getattr(args, "db", "") or "").strip()
+    if explicit_db:
+        # 确认文件放在**数据库旁边**：换库 = 重新问一次，符合"记住的是这个库"。
+        overrides["PERSONA_DATA_DIR"] = str(Path(explicit_db).parent)
+
+    loaded = load_settings(use_dotenv=not getattr(args, "no_dotenv", False),
+                           overrides=overrides)
+    if is_err(loaded):
+        _friendly_run_config_error(error_of(loaded))
+        return 1
+    settings = unwrap(loaded)
+    for note in loaded.warnings:
+        print(f"提示：{note.message}")
+
+    db_path = Path(explicit_db) if explicit_db else settings.database_path()
+    if not db_path.exists():
+        # 对话不建库：没有档案就没有角色依据，建一个空库只会让人以为"能聊"。
+        print(f"找不到数据库：{db_path}")
+        print("  对话用的是库里**已有的人物档案**，没有档案就没有角色依据。")
+        print('  先运行：persona run --names "林黛玉,贾宝玉" --work-title <作品>')
+        print("  或者确认 --db / --project 指向的是同一个库。")
+        return 1
+    data_root = db_path.parent
+
+    storage = SqliteStorage(db_path)
+    ctx = new_call_context(project_id=str(getattr(args, "project", "prj_local")),
+                           actor="cli")
+    try:
+        built = build_business_stack(
+            settings, ctx, storage=storage,
+            options=StackOptions(build_chat_provider=True,
+                                 build_search_provider=False),
+            allow_real=True,
+        )
+        if is_err(built):
+            print(f"装配失败：{error_of(built)}")
+            return 1
+        stack = unwrap(built)
+        components = (stack.describe().get("components") or {})
+        if components.get("dialogue_provider") in (None, "FakeProvider"):
+            _explain_missing_chat_provider(stack)
+            return 1
+
+        services = ReadServices(
+            storage=stack.storage, ctx=ctx, evidence=stack.evidence,
+            persona=stack.persona, relationship=stack.relationship,
+            database_path=db_path)
+        people: list[tuple[str, str]] = []
+        for name in names:
+            got = resolve_entity(services, name, need_profile=True)
+            if is_err(got):
+                _explain_missing_entity(name)
+                return 1
+            ref = unwrap(got)[0]
+            if is_err(stack.persona.get_persona(ctx, ref.entity_id)):
+                print(f"「{name}」在库里还没有人物档案：对话要靠档案当角色依据，"
+                      "没有档案就只能瞎编。")
+                print(f'  先运行：persona run --names "{name}" --work-title <作品>')
+                return 1
+            people.append((ref.entity_id, ref.display_name))
+
+        currency = str(getattr(settings.model, "currency", "") or "USD").strip() or "USD"
+        estimated_usd = round(rounds * float(DIALOGUE_MEASURED_COST_PER_CALL_USD), 6)
+        limits = model_limits_from_settings(settings)
+        _print_chat_plan(
+            names=[display for _, display in people], rounds=rounds, policy=policy,
+            estimated_usd=estimated_usd, budget=budget, currency=currency,
+            db_path=db_path, occupied=stack.ledger.occupied_cost(), topic=topic)
+
+        if limits.max_calls is not None and rounds > int(limits.max_calls):
+            print()
+            print(f"模型调用上限 {int(limits.max_calls)} 次 < 本次需要 {rounds} 次。"
+                  f"请设 PERSONA_MODEL_MAX_CALLS={rounds}（或更大）。")
+            print("  说明：本次**没有发起任何请求**。")
+            return 1
+        if budget is not None and estimated_usd > float(budget):
+            print()
+            print(f"预算不足：本次计划 {rounds} 次模型调用、预估 "
+                  f"{estimated_usd:.4f} {currency}，--budget 只给了 {float(budget):.3f}。")
+            print("  要么调大 --budget，要么减少 --rounds。")
+            print("  说明：本次**没有发起任何请求**。")
+            return 1
+
+        # 授权：与 `persona run` **同一个函数、同一份 `.persona_consent.json`**。
+        if not _authorize_real_calls(
+            data_root=data_root, searches=0, model_calls=rounds,
+            estimated_usd=estimated_usd, budget_usd=budget, currency=currency,
+            yes=bool(getattr(args, "yes", False)),
+        ):
+            return 1
+
+        started = stack.dialogue.start_session(ctx, SessionDraft(
+            participant_entity_ids=[pid for pid, _ in people],
+            persona_profile_ids=[pid for pid, _ in people],
+            speaker_selection_policy=POLICY_LEAST_RECENTLY_SPOKEN,
+            memory_write_policy=policy, topic=topic))
+        if is_err(started):
+            print(f"开启会话失败：{error_of(started)}")
+            return 1
+        session = unwrap(started)
+        display = dict(people)
+        first = str(getattr(args, "message", "") or "").strip()
+
+        print()
+        memory_ids: list[str] = []
+        done = 0
+        interrupted = False
+        try:
+            for index in range(rounds):
+                if first:
+                    # `--message` 只发这一句；后续轮次没有新输入（角色接着说）。
+                    message = first if index == 0 else None
+                else:
+                    message = _read_user_line()
+                    if message is None:
+                        break
+                    if not message:
+                        continue
+                turn = stack.dialogue.run_round(ctx, session.id, message)
+                if is_err(turn):
+                    print(f"第 {index + 1} 轮失败：{error_of(turn)}")
+                    return 1
+                view = unwrap(turn)
+                done += 1
+                memory_ids.extend(view.generated_memory_ids)
+                _print_chat_turn(done, message, view, display)
+        except KeyboardInterrupt:
+            interrupted = True
+            print()
+            print("（Ctrl-C：已中断。已完成的轮次与记忆**都保留**，不回滚）")
+        finally:
+            # 无论正常结束、Ctrl-C 还是 EOF，会话都不能留在 ACTIVE：
+            # 一个 OPEN 的会话会被下一次 `chat` 当成"还能继续聊"，而它其实
+            # 已经没有主人了。
+            closed = stack.dialogue.end_session(
+                ctx, session.id, reason="ctrl_c" if interrupted else "completed")
+            if is_err(closed):
+                print(f"会话结束失败：{error_of(closed)}")
+
+        print()
+        # 状态**照实报**：结束失败就说失败，不用"ENDED"把收尾失败盖过去。
+        status = "" if is_err(closed) else str(getattr(closed.value, "status", "") or "")
+        print(f"会话 {session.id}：完成 {done} 轮，状态 {status or '未能结束'}，"
+              f"记忆写入策略 {policy}")
+        if memory_ids:
+            print(f"写入记忆 {len(memory_ids)} 条：{'、'.join(memory_ids)}")
+            print("  （会话级模拟记忆，scope=SESSION；不会升级成人物档案或证据）")
+        elif policy == POLICY_MEMORY_WRITE_RULE:
+            print("写入记忆 0 条：这几句里没有规则认定该记的内容（不是故障）")
+        else:
+            print("写入记忆 0 条（默认 off：对话内容不进长期记忆；"
+                  "要写请加 --memory-write rule）")
+        records = stack.ledger.records()
+        if records:
+            spent = sum(float(getattr(record, "cost_confirmed", None) or 0.0)
+                        for record in records)
+            print(f"费用：{spent:.7f} {currency}（{len(records)} 次模型调用）")
+        return EXIT_INTERRUPTED if interrupted else EXIT_OK
     finally:
         storage.close()
 
@@ -1606,6 +1993,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_usage_action(args)
     if args.command == "run":
         return _cmd_run(args)
+    if args.command == "chat":
+        return _cmd_chat(args)
     if args.command == "show":
         return _cmd_show(args)
     if args.command == "show-relationship":
@@ -1639,8 +2028,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(f"命令 `persona {args.command}` 尚未实现。")
     print(f"当前阶段：{STAGE}")
-    print("可用命令：persona run / status / show / show-relationship / evidence / export / "
-          "info / selftest / config / model / business / usage / task")
+    print("可用命令：persona run / chat / status / show / show-relationship / evidence / "
+          "export / info / selftest / config / model / business / usage / task")
     return EXIT_NOT_IMPLEMENTED
 
 

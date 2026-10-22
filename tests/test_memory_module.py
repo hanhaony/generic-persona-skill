@@ -238,6 +238,31 @@ class TestDedup(FixtureTestCase):
         # 库中只应有 1 条 ACTIVE
         self.assertEqual(self.fx.count("MemoryItem"), 1)
 
+    def test_write_simulated_dedupes_same_content_in_same_session(self):
+        """P6.2-a：`write_simulated` 与 `write` 同口径去重。
+
+        对话写入是逐轮发生的，"用户同一句话说了两遍"在真实会话里很常见；
+        写入层不去重就会落两条，并被下一轮当上下文重复注入（放大权重）。
+        """
+        d1 = self.fx.simulated_draft()
+        first = unwrap(self.service.write_simulated(self.fx.ctx, d1))
+        second_res = self.service.write_simulated(self.fx.ctx, dict(d1))
+        second = unwrap(second_res)
+
+        self.assertEqual(second.id, first.id, "同一句话写了两条记忆")
+        self.assertEqual(second.duplicate_of_memory_id, first.id)
+        self.assertIn("MEMORY_DEDUP_HIT", [w.code for w in second_res.warnings])
+        self.assertEqual(self.fx.count("MemoryItem"), 1)
+
+    def test_write_simulated_dedupe_does_not_cross_session(self):
+        """去重键含 scope_id：不同会话是不同记忆，不能互相吞掉。"""
+        d1 = self.fx.simulated_draft(scope_id="css_s1", content="跨会话同一句话")
+        d2 = self.fx.simulated_draft(scope_id="css_s2", content="跨会话同一句话")
+        a = unwrap(self.service.write_simulated(self.fx.ctx, d1))
+        b = unwrap(self.service.write_simulated(self.fx.ctx, d2))
+        self.assertNotEqual(a.id, b.id)
+        self.assertEqual(self.fx.count("MemoryItem"), 2)
+
 
 class TestConflict(FixtureTestCase):
     def test_link_conflict_both_conflicted_and_linked(self):

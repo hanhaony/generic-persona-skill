@@ -97,6 +97,20 @@ from .state import (
     transition_error,
 )
 from .tasks import TaskDraft, TaskService
+# ---- 对话（P6.2-c）----
+#
+# CLI **不得**直连 `persona.modules`（D-059 / F-7，`tests/test_integration_acceptance.py`
+# 的静态断言）。`persona chat` 要开会话就得拿到 `SessionDraft` 与策略常量，
+# 所以由协调层转发这五个符号——**不做任何包装、不改语义**，CLI 拿到的就是
+# 领域层那一个对象/常量（两边不许出现第二份"策略名字符串"）。
+from ..modules.dialogue import (  # noqa: E402
+    DIALOGUE_MEASURED_COST_PER_CALL_USD,
+    POLICY_LEAST_RECENTLY_SPOKEN,
+    POLICY_MEMORY_WRITE_NONE,
+    POLICY_MEMORY_WRITE_RULE,
+    SessionDraft,
+    topic_is_retrievable,
+)
 from .readmodels import (
     SECTION_TITLES,
     EntityRef,
@@ -230,4 +244,12 @@ __all__ = [
     "EvidenceGroupView",
     "EvidenceReport",
     "SECTION_TITLES",
+    # 对话（P6.2-c）：CLI 开会话用的入参与策略常量（转发自 modules.dialogue）
+    "SessionDraft",
+    "POLICY_LEAST_RECENTLY_SPOKEN",
+    "POLICY_MEMORY_WRITE_NONE",
+    "POLICY_MEMORY_WRITE_RULE",
+    "DIALOGUE_MEASURED_COST_PER_CALL_USD",
+    # 对话（P6.3）：跨会话检索话题的门禁（转发自 modules.dialogue）
+    "topic_is_retrievable",
 ]

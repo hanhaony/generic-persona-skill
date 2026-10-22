@@ -76,8 +76,13 @@ class TestCliStartup(unittest.TestCase):
 
 class TestCliPlaceholderCommands(unittest.TestCase):
     def test_business_commands_are_honest_placeholders(self):
-        """研究 / 对话 / 记忆 / 评测**仍**是占位，不假装能用。"""
-        for argv in (["new", "--names", "甲,乙"], ["chat", "prj_1"],
+        """研究 / 记忆 / 评测**仍**是占位，不假装能用。
+
+        `chat` 已于 P6.2-c 接通真实对话（见 tests/test_p6_2_chat_cli.py），
+        所以它**不在这份占位清单里**——留在这里就会在 argparse 层报错，
+        把"已实现"误报成"未实现"。
+        """
+        for argv in (["new", "--names", "甲,乙"],
                      ["sources", "prj_1"], ["memory", "prj_1"], ["eval"]):
             with self.subTest(argv=argv):
                 with redirect_stdout(io.StringIO()) as out:

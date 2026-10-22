@@ -78,6 +78,10 @@ class ErrorCode(_StrEnum):
     VALIDATION_UNKNOWN_KIND = "VALIDATION.unknown_kind"        # 新增，待回填文档
     VALIDATION_UNKNOWN_FILTER = "VALIDATION.unknown_filter"    # 新增，待回填文档
     VALIDATION_CONFIG_INVALID = "VALIDATION.config_invalid"    # P2.2 新增：配置值非法/超范围（D-083）
+    # P6.3 新增：topic（跨会话检索话题）质量门禁（见 docs/P6_3_TOPIC_PLAN.md §4.2）
+    VALIDATION_TOPIC_TOO_BROAD = "VALIDATION.topic_too_broad"  # 去掉停用词后什么都没剩
+    VALIDATION_TOPIC_TOO_SHORT = "VALIDATION.topic_too_short"  # 残留长度 < 2
+    VALIDATION_TOPIC_TOO_LONG = "VALIDATION.topic_too_long"    # 原值长度 > 64
 
     # P2.3 新增：任务生命周期需要的 4 个码（INTERFACES §12.3 已点名，见模块顶部说明）
     VALIDATION_CHECKPOINT_MISSING = "VALIDATION.checkpoint_missing"
@@ -185,6 +189,9 @@ for _code, _category, _hint in [
     (ErrorCode.VALIDATION_UNKNOWN_KIND, ErrorCategory.VALIDATION, "未知的实体种类"),
     (ErrorCode.VALIDATION_UNKNOWN_FILTER, ErrorCategory.VALIDATION, "查询条件里有未登记的过滤键"),
     (ErrorCode.VALIDATION_CONFIG_INVALID, ErrorCategory.VALIDATION, "配置项取值非法或超出允许范围"),
+    (ErrorCode.VALIDATION_TOPIC_TOO_BROAD, ErrorCategory.VALIDATION, "跨会话检索话题太宽泛（去掉停用词后为空）"),
+    (ErrorCode.VALIDATION_TOPIC_TOO_SHORT, ErrorCategory.VALIDATION, "跨会话检索话题太短"),
+    (ErrorCode.VALIDATION_TOPIC_TOO_LONG, ErrorCategory.VALIDATION, "跨会话检索话题太长（topic 是话题标签，不是整段话）"),
     (ErrorCode.VALIDATION_CHECKPOINT_MISSING, ErrorCategory.VALIDATION, "该任务没有可续跑的检查点"),
     (ErrorCode.VALIDATION_ARTIFACT_MISSING, ErrorCategory.VALIDATION, "检查点引用的产出已丢失"),
     (ErrorCode.VALIDATION_UNKNOWN_TASK_TYPE, ErrorCategory.VALIDATION, "未知的任务类型"),

@@ -812,13 +812,15 @@ class DialogueDeps:
 
 > **注意顺序**：先写 `ConversationTurn` → 再写 `MemoryItem` → 最后写 `AuditRecord`，**全部在同一事务内**。任一步失败整体回滚，避免"有对话无记忆"或"有记忆无出处"的中间态。
 
-> **写入触发规则（P4 集成补充，见 `DECISIONS.md` §2.22 D-179 / D-180）**：`commit_turn(ctx, session_id, draft, *, memory_candidates=None)`。**默认不写长期记忆**——只有会话创建时显式选择 `memory_write_policy="explicit"` **且** 调用方在 `commit_turn` 显式传入 `memory_candidates` 时才写；两者缺一即不写，有候选但策略为 `none` → `VALIDATION.gate_rejected`（拒绝而非静默忽略）。候选 `scope` 必须是 `SESSION`（`ENTITY` / `RELATIONSHIP` / `PROJECT` 一律拒绝，防止单轮对话内容被升级为稳定人格特征）。`scope_id` / `source_turn_id` / `related_entity_ids` 由 Dialogue 补齐；`namespace` / `source_type` 由 `MemoryWriter.write_simulated` 内部锁定。
+> **写入触发规则（P4 集成补充，见 `DECISIONS.md` §2.22 D-179 / D-180；P6.2-b 扩展见 §2.32 D-296）**：`commit_turn(ctx, session_id, draft, *, memory_candidates=None)`。**默认不写长期记忆**——只有会话创建时显式选择 `memory_write_policy` 为 `"explicit"`（调用方自己给候选）或 `"rule"`（由确定性规则引擎从用户原话派生，P6.2-b 新增）**且** 调用方在 `commit_turn` 传入 `memory_candidates` 时才写；两者缺一即不写，有候选但策略为 `none` → `VALIDATION.gate_rejected`（拒绝而非静默忽略）。候选 `scope` 必须是 `SESSION`（`ENTITY` / `RELATIONSHIP` / `PROJECT` 一律拒绝，防止单轮对话内容被升级为稳定人格特征）。`scope_id` / `source_turn_id` / `related_entity_ids` 由 Dialogue 补齐；`namespace` / `source_type` 由 `MemoryWriter.write_simulated` 内部锁定。
 >
 > **上下文记忆检索（P4 集成补充）**：`draft_turn` 经 `memory_reader.search` 按 **R1 本会话**（`scope=SESSION` 且 `scope_id=本会话`）与 **R2 跨会话**（`related_entity_ids` ∩ 参与者，且会话有 `topic` 时须命中话题关键词）两条规则检索，**两条都硬限 `namespace=SIMULATED` + `lifecycle=ACTIVE`**；检出结果原样带出 `namespace` 标记后注入 prompt。检索失败**传播 `Err`**，不降级为"无记忆继续生成"。
 
-#### `run_round(ctx, session_id) -> Result[TurnView]`
+#### `run_round(ctx, session_id, user_message=None, *, memory_candidates=None) -> Result[TurnView]`
 
 `select_speaker` → `draft_turn` → `commit_turn` 的组合。**每轮结束写一次检查点**（含 `turn_index`），保证 resume 不重复生成已完成的轮次。
+
+`user_message` 给出时先落盘用户消息（`add_user_message`），再选角色发言人生成回复。`memory_candidates` 透传给 `commit_turn`；**P6.2-b（D-296）**：调用方未给候选且会话策略为 `rule` 时，本方法用确定性规则引擎从 `user_message` 派生候选后透传，**其它策略一律不派生**（`none` 下派生会让每轮被闸门拒绝）。
 
 #### `run(ctx, session_id, max_rounds) -> Result[SessionResult]`
 
@@ -1007,12 +1009,36 @@ class DialogueDeps:
 | `persona resume <task_id>` | `resume` | 经 Orchestrator |
 | `persona pause <task_id>` | `pause(reason=USER)` | 经 Orchestrator |
 | `persona cancel <task_id>` | `cancel` | 经 Orchestrator |
-| `persona chat <project_id> [--rounds N]` | `create_task(DIALOGUE_RUN)` → `start` | 经 Orchestrator |
+| `persona chat --names A,B --rounds N [--message M] [--memory-write rule\|off]`（P6.2-c 接通，形态见 §11.3） | `build_business_stack` → `DialogueService.start_session` / `run_round` / `end_session` | 经 Orchestrator（写会话/轮次/模拟记忆） |
 | `persona sources <project_id>` | Storage 只读查询（**可选追溯，不是必经步骤**） | ❌ 只读 |
 | `persona memory <scope> --list \| --forget <id> \| --clear-simulated` | `Memory` 的只读查询 / 经 Orchestrator 发起删除任务 | 经 Orchestrator |
 | `persona eval [--suite]` | `Evaluation.report` | ❌ 不影响正式数据 |
 
 **输出约定**：面向非技术用户。进度展示"找到 17 个来源 / 提取 84 条证据 / 记录 5 处冲突"，展示行数，不展示堆栈。错误展示**一句话原因 + 一句话建议**，并在末尾附 `trace_ref`。
+
+### 11.3 `persona chat`（P6.2-c，P6.3 加 `--topic`）
+
+```
+persona chat --names "林黛玉,贾宝玉" --rounds N [--message "一句话"]
+             [--memory-write rule|off] [--topic "西厢记"] [--budget 0.25]
+             [--db <persona.db>] [--project prj_x] [--yes] [--no-dotenv]
+```
+
+| 参数 | 默认 | 语义 |
+| --- | --- | --- |
+| `--names` | 必填 | 逗号分隔，**≥2 人**（`start_session` 要求 2 个以上参与者） |
+| `--rounds` | 1 | 最多轮数；**每轮恰好 1 次模型调用** |
+| `--message` | 空 | 给了就单发这一句；不给则逐行读 stdin（空行忽略、`/exit`/Ctrl-D 结束、Ctrl-C 中止） |
+| `--memory-write` | `off` | `off→none`（一条不写）/ `rule`（确定性规则从**用户原话**派生会话级模拟记忆） |
+| `--topic` | 空（**不跨会话取记忆**） | 跨会话检索（R2）的入口：给了才去库里找**同一批参与者**、内容命中该话题的会话级模拟记忆并注入上下文。质量门禁：`topic_is_retrievable()`（≥2 字、去停用词后非空、≤64 字）；**不合规 → 报错退出、0 次调用**。检索走本地库，**额外 0 次调用**（D-305~D-308） |
+
+**三条硬约束**：① 开会话时策略必须真的传进去；② 每轮走 `run_round`；
+③ 结束时打印记忆 ID 与会话终态，且会话必置 `ENDED`（含 Ctrl-C 路径，退出码 130）。
+
+**授权**：与 `persona run` **同一个函数** `_authorize_real_calls`、同一个
+`.persona_consent.json`（D-299）；单价取自 `DIALOGUE_MEASURED_COST_PER_CALL_USD`（D-300）。
+
+**不做**：流式输出、多用户身份、记忆管理命令。
 
 ---
 
