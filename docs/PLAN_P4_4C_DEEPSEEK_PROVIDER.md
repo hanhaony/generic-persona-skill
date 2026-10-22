@@ -35,7 +35,7 @@
 | prompt 缺 "json" 的后果 | 原文：模型可能 **"generate an unending stream of whitespace until the generation reaches the token limit"**（长跑、看起来像卡死） | Create Chat Completion |
 | 输出上限字段 | **只有 `max_tokens`**（1 ~ 384K）；**没有** `max_completion_tokens` | Create Chat Completion |
 | `temperature` | 0–2，**默认 1**；官方注：**"Has no effect in thinking mode"** | Create Chat Completion |
-| `thinking` | `{"type": "enabled"｜"disabled"}`，文档标默认 `enabled` | Create Chat Completion |
+| `thinking` | `{"type": "enabled"/"disabled"}`，文档标默认 `enabled` | Create Chat Completion |
 | `reasoning_effort` | `none`/`low`/`high`/`max`，默认 `high` | Create Chat Completion |
 | `stream` | 默认非流式；官方另注：非流式等待期会持续返回空行 keep-alive，**10 分钟未开始推理则服务端关连接** | Pricing / Rate limit 页 |
 | 响应 `id` | 顶层 `id`（唯一标识，用于对账/报障） | Create Chat Completion |

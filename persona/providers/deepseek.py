@@ -53,7 +53,7 @@ DeepSeek 不支持严格 schema（**没有** `json_schema` 值），所以本类
 | `response_format` | **仅** `text` / `json_object`（无 `json_schema`） |
 | 输出上限字段 | **只有** `max_tokens`（无 `max_completion_tokens`） |
 | `temperature` | 0–2，官方默认 **1**（抽取器显式发 0.7，覆盖该默认，D2） |
-| `thinking` | `{"type":"enabled"｜"disabled"}`，文档标默认 `enabled`（故显式传） |
+| `thinking` | `{"type": "enabled"/"disabled"}`，文档标默认 `enabled`（故显式传） |
 | `finish_reason` | `stop`/`length`/`content_filter`/`tool_calls`/`insufficient_system_resource`/`aborted`（**无 `refusal`**） |
 | `usage` | `prompt_tokens`（= hit + miss）、`completion_tokens`、`total_tokens` |
 | 响应顶层 `id` | 服务端请求标识（`chatcmpl-…`）→ 同时进 `ChatResponse.raw_ref` 与 `UsageDelta.request_id`（抽取器据此写入账本，供逐笔对账/报障） |

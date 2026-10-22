@@ -308,7 +308,7 @@ DeepSeek 的线格式。**它只做外部调用与结果标准化**，不读环�
 | JSON 模式硬要求 | 提示词**必须**含 `"json"` 字样，否则可能"一直输出空白到 token 上限" | 映射前检查（大小写不敏感）；**没有就拒绝发送** |
 | 输出上限字段 | **只有** `max_tokens`（无 `max_completion_tokens`） | `max_output_tokens` → `max_tokens` |
 | `temperature` | 0–2，官方默认 **1** | 抽取器显式发 **0.7**（D2），覆盖官方默认 |
-| `thinking` | `{"type":"enabled"｜"disabled"}`，文档标默认 `enabled` | **显式**传 `{"type":"disabled"}`（D1） |
+| `thinking` | `{"type": "enabled"/"disabled"}`，文档标默认 `enabled` | **显式**传 `{"type":"disabled"}`（D1） |
 | `stream` | 默认非流式 | 显式传 `false`（不依赖默认） |
 | `finish_reason` | `stop`/`length`/`content_filter`/`tool_calls`/`insufficient_system_resource`/`aborted`，**无** `refusal` | 原样透传；`content_filter` 由 `claim_validation` 判为拒答 |
 | `usage` | `prompt_tokens`（= hit + miss）、`completion_tokens`、`total_tokens` | `tokens_in` / `tokens_out` 直取 |
