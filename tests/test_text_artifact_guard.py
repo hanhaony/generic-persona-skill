@@ -59,6 +59,14 @@ ALLOWED_LEGEND_PIPES = (
 
 PROBE_RELPATH = "docs/_artifact_guard_probe.md"
 
+# 报错里必须带这句提示：**想在文档里记录这些模式时，只描述、不写字面量**——
+# 否则本守卫会把"记录它"这件事本身当成"混进残留"，把自己绕死。
+# （上线当天就发生过：RUNNING.md 的变更历史行里写了三个字面量，被自己抓红。）
+_REPORT_HINT = (
+    "发现吐字残留（打码点才看得见，别用肉眼）：\n"
+    "⚠️ 若这一行是在**记录**这些模式，请改成描述（如「分词残片 / 尖括号紧跟全角竖线 / U+2581」），"
+    "**不要写字面量**——本守卫不区分「记录」与「混入」。\n")
+
 
 def _iter_files():
     for base, pattern in SCAN_SPECS:
@@ -102,11 +110,11 @@ class TestTextArtifactGuard(unittest.TestCase):
 
     def test_no_hard_artifacts(self):
         found = _find_hard_artifacts()
-        self.assertEqual([], found, "发现吐字残留（打码点才看得见，别用肉眼）：\n" + "\n".join(found))
+        self.assertEqual([], found, _REPORT_HINT + "\n".join(found))
 
     def test_no_pipe_adjacent_to_ascii_structural(self):
         found = _find_structural_pipe()
-        self.assertEqual([], found, "全角｜出现在了本该用 / 或逗号的位置：\n" + "\n".join(found))
+        self.assertEqual([], found, _REPORT_HINT + "\n".join(found))
 
     def test_allowlisted_legend_pipes_still_exist(self):
         """允许清单不许腐烂：锚点必须还在，且**恰好一份**（防重复粘贴）。"""
