@@ -3,10 +3,12 @@
 **职责**：解析命令、调用 `Orchestrator`、把状态讲成人话。
 **非职责**（D-059）：⛔ **不绕过 `Orchestrator`** 直接驱动业务模块；⛔ 不写业务数据。
 
-本阶段（P2.3）可用：`--help`、`--version`、`info`、`selftest`、`config`、**`task`（任务生命周期）**。
-`task run` 用的是 **Mock 执行器**：它推进的是抽象"工作单元"，
-**不是**真实的人物研究 / 证据提取 / 对话——那些业务尚未实现。
-其余业务命令**保留占位**，执行时明确提示"尚未实现"，**不会假装能用**。
+可用命令（另见 `docs/SKILL.md`）：`run` / `chat` / `show` / `show-relationship` /
+`evidence` / `export` / `status` / `task` / `info` / `selftest` / `config` /
+`model` / `business` / `usage`。
+其中 `run` 与 `chat` 会接真实外部服务（检索 / 正文抓取 / 模型），**先算账再问一次**；
+`task run` 用的是 Mock 执行器，推进抽象"工作单元"，不联网、不调模型。
+`new` / `sources` / `memory` / `eval` **仍是诚实的占位**，执行时明确提示"尚未实现"。
 
 输出约定：面向非技术用户——一句话原因 + 一句话建议 + `trace_ref`，不堆堆栈。
 """
@@ -335,14 +337,16 @@ def _print_info() -> None:
     print("  包结构      :")
     print("    persona.core         公共契约（枚举 / ID / 时间 / 错误码 / Result / 上下文）")
     print("    persona.storage      SQLite 最小读写（不做业务判断）")
-    print("    persona.providers    外部服务统一接口 + Mock（全程离线，不需要 API Key）")
+    print("    persona.providers    外部服务统一接口 + 离线 Mock（不需要 API Key）\n"
+          "                        + TavilyProvider（真实检索与正文抓取）\n"
+          "                        + DeepSeekProvider 等真实模型出口（需要 API Key）")
     print("    persona.orchestrator 六态状态机 + 任务服务 + 预算闸门 + Mock 执行器（P2.3）\n"
           "                        + BusinessOrchestrator（业务编排：Research→Evidence→\n"
           "                        Persona→Relationship→Dialogue，复用既有任务能力）\n"
           "                        + model_setup（P4.4-B：配置→模型抽取器装配、预算上限、\n"
           "                        gate 开关、dry-run；**不调真实模型**）")
     print("    persona.modules      业务模块端口协议；ResearchService（资料搜集：检索计划/检索/")
-    print("                        过滤排序/经 Evidence 登记来源；不写证据表）已实现、")
+    print("                        正文抓取/过滤排序/经 Evidence 登记来源；不写证据表）已实现、")
     print("                        EvidenceService（来源/事件/证据管理）、")
     print("                        PersonaService（人格档案：创建/版本/证据关联/闸门）、")
     print("                        RelationshipService（关系档案：双向视角/共同经历/群体互动）、")
@@ -356,17 +360,18 @@ def _print_info() -> None:
     print("  写入闸门    :")
     for kind, allowed in sorted(NAMESPACE_WRITE_GATE.items()):
         print(f"    {kind:<22} 仅允许 " + ", ".join(sorted(n.value for n in allowed)))
-    print("  说明        : **真实检索接入**与 AI 蒸馏尚未实现；`task run` 推进的是"
-          "抽象工作单元，不是真实业务；"
-          "`ResearchService` 只经 `Provider` 抽象检索（当前全是 Mock），不接真实搜索 API；"
-          "`BusinessOrchestrator` 已可一条命令跑完五阶段业务链，但**证据 claim 仍需调用方显式提供**"
-          "（源→证据自动抽取未实现），故 AC-1/AC-2 仅为部分满足；"
-          "对话/记忆只做本地基础能力，不调真实模型、不接入外网检索；"
-          "模型抽取（G-2）的服务商、单价、预算与 gate 开关已可按配置装配，"
-          "`persona model plan/dryrun` 可离线查看将要发出的请求，"
-          "但**尚未授权真实模型调用**，真实模型抽取质量未经验证；"
-          "对话与记忆已打通闭环，但**默认不把对话写入长期记忆**"
-          "（须显式授权 + 显式候选）。`EvaluationService` 提供只读不变式与依赖检查。")
+    print("  说明        : **真实检索（Tavily）与正文抓取已接入并通过受控真跑验证**；\n"
+          "                `persona run` 一条命令跑完 Research → Evidence → Persona →\n"
+          "                Relationship → Dialogue 五阶段，接真实检索与真实模型\n"
+          "                （第一次会先算账再问一次，直接回车 = 取消 = 零花费）；\n"
+          "                AI 只用在三处——检索、材料→候选证据抽取（G-2）、对话生成，\n"
+          "                人格 / 关系档案由证据**确定性装配**，不交给模型自由发挥；\n"
+          "                `persona chat` 可与档案对话。`--memory-write rule` 按确定性\n"
+          "                规则写模拟记忆（**默认一条都不写**），`--topic \"X\"` 才跨会话\n"
+          "                检索（不给 topic 就只读本会话）；\n"
+          "                `task run` 推进的是抽象工作单元，不联网、不调模型；\n"
+          "                仍是占位：`new` / `sources` / `memory` / `eval`。\n"
+          "                已知限制见 `docs/RUNNING.md` §5.44。")
 
 
 def _print_selftest() -> int:
