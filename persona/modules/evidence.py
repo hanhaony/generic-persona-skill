@@ -7,7 +7,7 @@
 **职责边界（INTERFACES §4.1）**：
     ✅ 来源登记与去重、来源事件、证据原子化与定级、去重归并、冲突记录、稳定性判定
     ⛔ **不自行启动研究循环**（F-2）：本文件没有 search / collect / query_plan，
-       不调用 `Provider.search`；检索是 `Research` 的事（尚未实现）。
+       不调用 `Provider.search`；检索是 `Research` 的事（已接入，P5 收口 + 二期真实运行验证）。
     ⛔ 不裁决冲突；不写记忆或档案。
 
 **三条评分互不等价**（DATA_MODEL §4.5，D-010）：

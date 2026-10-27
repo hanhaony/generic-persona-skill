@@ -248,15 +248,15 @@
 
 | 项 | 内容 |
 | --- | --- |
-| **职责** | 把某个人的证据集合蒸馏成结构化人物档案（背景/性格/习惯/对话风格/经历/关系） |
-| **调用** | ✅ `Storage`（读写档案） ✅ `Provider`（蒸馏需要模型时） 👁 `Evidence`（**只读**） |
-| **不做** | ⛔ 不修改证据；不做关系建模（那是 `Relationship`）；不写记忆 |
+| **职责** | 把某个人的证据集合**确定性装配**成结构化人物档案（背景/性格/习惯/对话风格/经历/关系）——**不调模型** |
+| **调用** | ✅ `Storage`（读写档案） 👁 `Evidence`（**只读**） |
+| **不做** | ⛔ 不修改证据；不做关系建模（那是 `Relationship`）；不写记忆；⛔ **不调模型做"蒸馏"**（见 §4.12） |
 
 > 完整签名与失败列表见 `INTERFACES.md` §6.2。
 
 | 操作 | 说明 |
 | --- | --- |
-| `distill(ctx, entity_id, options)` | 蒸馏档案，返回 `PersonaView` |
+| `create_profile(ctx, entity_id, ...)` | **确定性装配**档案（按证据维度搬运，**不调模型**），返回 `PersonaView` |
 | `get_persona(ctx, entity_id, version=None)` | 只读，默认最新版 |
 | `revise(ctx, entity_id, reason)` | 仅在有**新证据**时才允许重算，否则 `STATE_CONFLICT.no_new_evidence` |
 | `diff_versions(ctx, entity_id, from, to)` | 版本差异，供审查与评测 |
@@ -283,15 +283,15 @@ query_evidence → 按 dimension 分组 → Evidence.judge_stability【闸门】
 
 | 项 | 内容 |
 | --- | --- |
-| **职责** | 把多人的证据与人物档案蒸馏成关系档案：共同经历、互动模式、情绪与表达习惯、双方视角、时间变化、群体互动 |
-| **调用** | ✅ `Storage` ✅ `Provider` 👁 `Evidence`（只读） 👁 `Persona`（**只读**） |
-| **不做** | ⛔ 不改证据、不改人物档案；不合并双方视角 |
+| **职责** | 把多人的证据与人物档案**确定性装配**成关系档案：共同经历、互动模式、情绪与表达习惯、双方视角、时间变化、群体互动——**不调模型** |
+| **调用** | ✅ `Storage` 👁 `Evidence`（只读） 👁 `Persona`（**只读**） |
+| **不做** | ⛔ 不改证据、不改人物档案；不合并双方视角；⛔ **不调模型做"蒸馏"**（见 §4.12） |
 
 > 完整签名与失败列表见 `INTERFACES.md` §7.2。
 
 | 操作 | 说明 |
 | --- | --- |
-| `distill(ctx, participant_entity_ids, options)` | 蒸馏关系档案 |
+| `create_relationship(ctx, participant_ids, ...)` | **确定性装配**关系档案（**不调模型**） |
 | `get_relationship(ctx, relationship_id \| participant_ids, version=None)` | 只读 |
 | `revise(ctx, relationship_id, reason)` | 同 Persona 规则：无新证据不重算 |
 
@@ -452,6 +452,22 @@ PENDING ──start──► RUNNING ──► COMPLETED
 
 ---
 
+### 4.12 AI 使用边界（产品事实，P6 二期确认）
+
+**本项目的 AI（模型调用）只用在三处，绝不外溢**：
+
+| # | 用途 | 落在哪 | 调用方式 |
+| --- | --- | --- | --- |
+| 1 | **检索**（搜索 + 正文抓取） | `Research` 经 `Provider.search` / `Provider.extract` | 真实 Provider（Tavily），P5 收口 + 二期真实运行验证 |
+| 2 | **材料 → 候选证据抽取**（G-2） | `ProviderClaimExtractor`（产品路径） | 真实 Provider，二期交付 |
+| 3 | **对话生成** | `Dialogue` 经 `Provider.chat` | 真实 Provider，二期交付 |
+
+**⛔ 人格档案与关系档案不调模型**：`PersonaService` / `RelationshipService` **没有 `distill` 方法**（§4.6 / §4.7 表格里的 `distill` 是概念名，落地实现是确定性装配）。档案内容来自 `orchestrator/business.py::_build_persona_draft` 把证据**按维度确定性搬运**——不交给模型自由发挥，也不靠模型"补全"人物。
+
+> 这条是**卖点也是约束**：档案的每一非空字段都带 `evidence_refs`，没有证据支撑就留空 + `open_questions`，模型无法"想象"出人物。容易误写成「AI 人格/关系蒸馏已实现」——那是错的，会误导下一个 Agent 去"补"一个根本不该存在的模型调用。
+
+---
+
 ## 5. 依赖矩阵（谁可以调用谁）
 
 行 = 调用方，列 = 被调用方。✅ 允许｜👁 只读｜⛔ 禁止
@@ -530,7 +546,7 @@ PENDING ──start──► RUNNING ──► COMPLETED
                           ┌────────────────────────────┴─────────┐
                           ▼                                        ▼
                   ┌──────────────┐                        ┌────────────────┐
-                  │   Persona    │  ⑥ distill            │  Relationship  │ ⑦ distill
+                  │   Persona    │  ⑥ 装配(确定性)        │  Relationship  │ ⑦ 装配(确定性)
                   │  人物档案     │ ──────► persona_id    │  关系档案       │ ──► rel_id
                   └──────┬───────┘                        └────────┬───────┘
                          │  只读 Evidence                 只读 Evidence + Persona

@@ -33,7 +33,8 @@
     - 检索词只来自**确定性模板**（人名 + 话题），别名的语义扩展、多语言改写未实现；
     - 相关性排序是**确定性结构打分**（标题/URL/摘要/日期是否齐全），
       不是语义相关性模型；不假装能判断"哪条更可信"；
-    - 抓取正文、快照、正文切分都不做（`content_ref` / `snapshot_ref` 留空）。
+    - 页面**快照**（`snapshot_ref`）仍不落库，留空；正文抓取与正文切分**已实现**
+      （P4.8 经 `Provider.extract`，官方 `chunks_per_source` 分块），不再是本阶段边界。
 
 **与 INTERFACES 的差异（已报告，未擅自改契约）**：
     1. `INTERFACES §5.2` 把 `plan_queries` 的失败列为 `VALIDATION.empty_targets`，
@@ -743,7 +744,8 @@ class ResearchOutput:
     下游也就无从抽取 claim（这正是 G-2 的本体）。
 
     ⚠️ `materials` 是**材料**不是证据：未校验、未分级、未登记。
-    `snippet` 只是检索摘要，**不是正文全文**（正文抓取未实现，H-17）。
+    `snippet` 只是检索摘要，**不是正文全文**；完整正文经 `extracted` / `materials`
+    提供（P4.8 已实现抓取与分块，H-17 已交付）。
     """
 
     source_ids: list[str] = field(default_factory=list)
@@ -1269,8 +1271,9 @@ class ResearchService:
     def _to_source_draft(candidate: RankedCandidate) -> SourceDraft:
         """`SearchResult` + 对象边界 → `SourceDraft`（喂给 Evidence 的最小形状）。
 
-        只搬运**来源元数据**：不合成 claim、不做分级、不写 `content_ref`
-        （抓取正文尚未实现）。
+        只搬运**来源元数据**：不合成 claim、不做分级；`content_ref` 由正文抓取
+        路径（`extracted` / `materials`，P4.8 已实现）另行登记，本函数只负责
+        来源登记的最小形状。
         """
         result = candidate.result
         locator = _text(result.canonical_key) or _text(result.url)
