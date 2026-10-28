@@ -67,11 +67,16 @@ persona export 林黛玉 --format md        # 导出可直接贴进文档的 Mar
 persona run --names "林黛玉,贾宝玉" --work-title 红楼梦              # 1) 先建档案（只需一次）
 persona chat --names "林黛玉,贾宝玉" --message "你最近在读什么书？"      # 2) 单发一句
 persona chat --names "林黛玉,贾宝玉" --rounds 3                      # 3) 交互：逐行输入，/exit 结束
-persona chat --names "林黛玉,贾宝玉" --rounds 3 --memory-write rule --topic "西厢记"  # 4) 记 + 跨会话记得住
+persona chat --names "林黛玉,贾宝玉" --message "你们又在拌嘴？" --group 2   # 4) 群聊：说完角色自主互聊 2 轮
+persona chat --names "林黛玉,贾宝玉" --rounds 3 --memory-write rule --topic "西厢记"  # 5) 记 + 跨会话记得住
 ```
 
 - **轮数就是钱**：`--rounds N` = 恰好 N 次模型调用，实测 ≈0.0005 USD/次（3 轮约 0.0015 USD）。
+  `--responses N` / `--group N` 会按"N 个角色 = N 次调用"累加，计划里打印**调用总数**。
   会先打印清单再问一次「继续？[y/N]」，**回车 = 取消**；非交互 / CI 加 `--yes`。
+- **群聊（`--group N` / `--responses N`）**：多个角色同场互相接话（不是各自对访客说话）；
+  互聊内容**绝不进长期记忆**，只活在本会话里。想养成熟客感（老友形态、跨会话称呼）
+  需带 `--topic`——跨会话记忆只按话题取，防无关记忆污染。
 - `--memory-write rule`（默认 `off`，即**一条都不写**）：按**确定性规则**把你**原话**里值得记的
   片段写成**会话级模拟记忆**，0 额外调用。只记你说的话，**不记模型说过的话**；只写模拟命名空间，
   **永不进真实证据库**；寒暄 / 问句 / 纯情绪不记；同一句重复只留一条。

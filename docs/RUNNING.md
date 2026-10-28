@@ -2521,10 +2521,37 @@ P6.3 一次加了 3 个码（`VALIDATION_TOPIC_TOO_{BROAD,SHORT,LONG}`），**�
 
 ---
 
+### 5.46 P8.0/P8.1：一轮多响应 + 自主群聊（2026-10-28）
+
+**问题**：多人会话里每个角色只对访客说话——transcript 用 `pe_xxx` 标注说话人，
+模型连"刚才那句是谁说的"都分不清，角色之间形同陌路。
+
+**改动**：
+
+- **transcript 显示名标注**（`dialogue.py`）：`[pe_xxx]` → `[林黛玉]`，访客 → `[访客]`；
+- **【在场众人】块**（`_build_messages`，多人同场才注入）：在场者名单 + 最近一条
+  他人发言（"方才林黛玉说：「……」"）+ 互动许可（附和/反驳/无视，基于关系档案）
+  + 红线（**角色互聊的话不是档案事实**，可接话、不得当设定转述）；
+  prompt 版本 bump `p8-group-2026-10-28a`；
+- **CLI**：`chat` 新增 `--responses N`（P8.0：每句 N 个角色依次回应）与
+  `--group N`（P8.1：每句之后角色自主互聊 N 轮）；计划打印"模型调用总数：**最多
+  N 次**"（N 个角色 = N 次调用，预估与授权、max_calls/软限预检全部按总数）；
+- **渲染**：`【角色名】`加粗（TTY 才上 ANSI，重定向纯文本；不读 NO_COLOR——D-077
+  只有 config 包能碰环境变量）+ 回答缩进，多人同场一眼分清谁在说话；
+- **红线（回声室防线）**：`run_round` 只从**用户消息**派生记忆候选——纯互聊轮
+  （`None`）在 `rule` 策略下也**零写入**，测试钉死。
+
+**验证**：新增 `tests/test_p8_group_chat.py`（7 项）；全量 **1978 → 1985 项**通过；
+真跑验收（3 次调用 / 0.0018666 USD，授权内）：黛玉撇清 → 宝玉回敬"妹妹说话太刁钻"
+→ 黛玉"往后我一声不吭"——真·互相拌嘴，互聊 0 记忆写入。
+
+---
+
 ## 6. 变更历史
 
 | 日期 | 版本 | 变更 |
 | --- | --- | --- |
+| 2026-10-28 | v0.35 | **P8.0/P8.1：一轮多响应 + 自主群聊**（详见 §5.46）：transcript 显示名标注；多人同场注入【在场众人】块；`chat` 新增 `--responses N` / `--group N`（计划打印模型调用总数）；渲染【角色名】加粗+缩进；红线：角色互聊零记忆写入。新增 `tests/test_p8_group_chat.py` 7 项；全量 **1978 → 1985 项**通过；真跑 3 次调用验收通过 | 待确认 |
 | 2026-10-28 | v0.34 | **P0 预算体验修复：账单隔离 + 全局单任务「软硬双限」**（详见 §5.45）：模型预算线费用基线改 `session_occupied_cost()`（排除历史，新任务从 0.0000 起算）；新增 `PERSONA_BUDGET_SOFT_LIMIT=2.00` / `PERSONA_BUDGET_HARD_LIMIT=5.00`（旧键 `PERSONA_MODEL_MAX_COST`/`_PER_TASK` 降级遗留回退）；新错误码 `BUDGET_PAUSED`（已注册 `ERROR_SPEC`）+ `soft_limit_handler` 交互（y → 软限 +2.00 继续，n → 安全退出）；修 `--budget` 只改打印不改拦截的 Bug（现在正确覆盖软限）；抽取与对话共用同一份 `ModelCallLimits`；遗留「项目累计上限」仍含历史（G11 语义保留）。新增 `tests/test_budget_soft_hard.py` 11 项 + 离线验收脚本 `scripts/acceptance_p0_budget.py`（11 项全 PASS）；全量 **1942 → 1953 项**通过；真实外呼 0 | 待确认 |
 | 2026-10-21 | v0.26 | **P6.2-c：最小 `persona chat`**（第二个会花钱的命令）：`--names/--rounds/--message/--memory-write rule\|off`（默认 `off`）；`run` 与 `chat` 共用唯一实现 `_authorize_real_calls`（同一个 `.persona_consent.json`、同一套问法）；对话单价常量 `DIALOGUE_MEASURED_COST_PER_CALL_USD` 收进 `modules/dialogue.py`（评估脚本与 CLI 同一出处）；Ctrl-C 干净中止（记忆不回滚 / 会话必置 ENDED / 退出码 130）；为守 D-059，`SessionDraft` 与策略常量经 `orchestrator` 转发。新增 `tests/test_p6_2_chat_cli.py`（10 项，含 3 组变异验证）；全量 **1902 → 1912 项**通过；真实外呼 0 | 待确认 |
 | 2026-10-21 | v0.27 | **P6.2-d 真跑对账（6 次调用 / 0.0027285 USD）**：会话 A 四句逐条对账全部符合规则预期（R-EPI / R-REL 各 1 条，寒暄与问句不记）；verbatim 不变式成立（`content` 是用户原话完整子串）；账本 6 笔 CHAT = 会话 A 4 + 会话 B 2，检索 0 笔，与预期逐笔对上（`task_id` 全 null 是 D-C 的又一次印证）；**R1 本会话检索已在产品路径生效**（会话 A 第 3 轮起 `referenced_memory_ids` 非空），**R2 跨会话在产品路径永不触发**（`chat` 无 `--topic`，`topic` 恒 None）→分层结论：存储层/端口层能读到，prompt 注入层读不到，留给 P6.3；实际费用 0.91× 预估（未超 1.3 倍停止线）；`PERSONA_MODEL_MAX_CALLS=3` 会拦住 4 轮会话（用进程级环境变量覆盖，未改 `.env`）。真实库已备份 | 已验收 |

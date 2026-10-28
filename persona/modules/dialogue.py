@@ -176,7 +176,10 @@ DIALOGUE_MEASURED_COST_PER_CALL_USD = 0.0005
 #: 同日第二次 bump（`b`）：第二阶段「渐进式熟人社会」——新增【关系发展：称呼与
 #: 态度随熟识程度而变】三阶段法则（初识 / 熟识 / 老友），称呼与亲密度随
 #: 访客自述与既有记忆动态演进。
-DIALOGUE_PROMPT_VERSION = "p6-dialogue-2026-10-28b"
+#: 2026-10-28 第二次 bump（`p8-group-2026-10-28a`）：P8.1 群聊——多人同场时注入
+#: 【在场众人】块（在场者 + 最近一条他人发言 + 互动许可与红线）；transcript 从
+#: entity_id 改为显示名标注（访客标「访客」），模型这才分得清"刚才那句是谁说的"。
+DIALOGUE_PROMPT_VERSION = "p8-group-2026-10-28a"
 
 # ---- 证据级引用（P6.0 N1）----
 #
@@ -1370,20 +1373,57 @@ class DialogueService:
         ]
 
         turns = self._load_session_turns(ctx, str(session_row.get("id")))
+        # P8.1（2026-10-28）：transcript 从 entity_id（pe_xxx）改用**显示名**标注。
+        # 模型不知道 pe_xxx 是谁——多人会话里它连"刚才那句是谁说的"都分不清，
+        # 角色互聊就无从谈起。访客（USER_SPEAKER_ID）标为「访客」。
+        names = self._participant_display_names(ctx, session_row)
+        ordered_turns = sorted(turns, key=lambda x: int(x.get("index", 0)))
         transcript = "\n".join(
-            f"[{t.get('speaker_entity_id')}] {t.get('content')}"
-            for t in sorted(turns, key=lambda x: int(x.get("index", 0))))
+            f"[{self._speaker_label(str(t.get('speaker_entity_id')), names)}] "
+            f"{t.get('content')}" for t in ordered_turns)
+        # 群聊上下文：除本轮发言人外的在场角色 + 最近一条其他角色的发言
+        #（供【在场众人】块"方才谁说了什么"用）。
+        others = [names.get(p, p) for p in participants if p != speaker_entity_id]
+        last_other_line = ""
+        for t in ordered_turns:
+            sp = str(t.get("speaker_entity_id"))
+            content = _text(t.get("content"))
+            if sp not in (speaker_entity_id, USER_SPEAKER_ID) and content:
+                last_other_line = f"{names.get(sp, sp)}说：「{content}」"
         return Ok({
             "persona_briefs": persona_briefs,
             "rel_briefs": rel_briefs,
             "memory_briefs": memory_briefs,
             "transcript": transcript,
+            "multi_party": len(participants) > 1,
+            "others_in_room": others,
+            "last_other_line": last_other_line,
             "referenced_memory_ids": [v.id for v in memory_views],
             "referenced_persona_item_ids": referenced_persona,
             "referenced_relationship_item_ids": referenced_relationship,
             "safety_flags": safety_flags,
             "evidence_in_context": evidence_in_context,
         })
+
+    @staticmethod
+    def _speaker_label(speaker_entity_id: str, names: dict[str, str]) -> str:
+        """transcript 里一行的说话人标签：角色用显示名，访客用「访客」。"""
+        if speaker_entity_id == USER_SPEAKER_ID:
+            return "访客"
+        return names.get(speaker_entity_id, speaker_entity_id)
+
+    def _participant_display_names(
+        self, ctx: CallContext, session_row: dict
+    ) -> dict[str, str]:
+        """参与者 entity_id → 显示名（读不到的回退 entity_id，绝不炸轮次）。"""
+        names: dict[str, str] = {}
+        for pid in _str_list(session_row.get("participant_entity_ids")):
+            row = self.deps.storage.get(ctx, "PersonEntity", pid)
+            if not is_err(row) and row.value is not None:
+                name = _text(row.value.get("display_name"))
+                if name:
+                    names[pid] = name
+        return names
 
     # -------------------------------------------------- 上下文渲染（P6.0 N1/N2）
 
@@ -1483,7 +1523,26 @@ class DialogueService:
         # 紧跟模拟声明、先于一切档案内容——先立"你是谁"，再给"你知道什么"。
         # 第二阶段追加熟人社会三阶段（称呼随关系演进），紧随其后。
         system = (SIMULATION_NOTICE + "\n\n" + P0_IMMERSION_RULES + "\n\n"
-                  + P0_RELATIONSHIP_STAGES + "\n\n")
+                  + P0_RELATIONSHIP_STAGES)
+        # ---- P8.1（2026-10-28）：群聊模式·在场众人 ----
+        #
+        # 多人同场时，模型此前只知道"参与角色档案有好几份"，却不知道自己
+        # 与其他角色**此刻共处一室**、也不知道刚才那句是谁说的——于是每个
+        # 角色都只对着访客说话，彼此形同陌路。这里显式注入在场者与最近一条
+        # 他人发言（transcript 已带显示名标注），并给出互动许可与边界。
+        if context.get("multi_party"):
+            others = [o for o in (context.get("others_in_room") or []) if o]
+            lines = ["【在场众人】此刻屋内不止你与访客：还有" + "、".join(others) + "。"]
+            if context.get("last_other_line"):
+                lines.append(f"方才{context['last_other_line']}——他们的话"
+                             "都记在下面的对话记录里（每句开头标了说话人）。")
+            lines.append("这段对话是你们共同在场的：你可以附和、反驳或无视其他角色，"
+                         "但怎么对待，要基于你们的关系档案与各自性情；"
+                         "角色之间可以互相接话，不必每句都对访客说。")
+            lines.append("（红线：其他角色说过的话是**对话里的话**，不是档案事实——"
+                         "可以接话，不得把它当成既定设定转述。）")
+            system += "\n\n" + "\n".join(lines)
+        system += "\n\n"
         system += "参与角色档案（仅作为角色设定参考，不得编造档案外信息）：\n"
         system += "\n".join(context["persona_briefs"]) or "（无）"
         if context["rel_briefs"]:

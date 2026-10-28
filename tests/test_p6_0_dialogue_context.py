@@ -478,9 +478,15 @@ class TestAnswerFormat(CtxTestCase):
         self.assertIn("原样抄写", system)
 
     def test_prompt_version_bumped_so_idempotency_keys_do_not_collide(self):
-        """改了 prompt 内容必须 bump 版本，否则新旧调用共用幂等键 → 账本漏账。"""
-        self.assertTrue(DIALOGUE_PROMPT_VERSION.startswith("p6-"),
-                        f"prompt 改过了但版本没 bump：{DIALOGUE_PROMPT_VERSION}")
+        """改了 prompt 内容必须 bump 版本，否则新旧调用共用幂等键 → 账本漏账。
+
+        前缀带阶段号（p6 → p8…），日期后缀每次改动递增——只要求"是带日期的
+        阶段版本"，不钉死具体阶段号（阶段会升级）。
+        """
+        import re
+        self.assertRegex(
+            DIALOGUE_PROMPT_VERSION, r"^p\d+-[a-z]+-\d{4}-\d{2}-\d{2}",
+            f"prompt 改过了但版本没 bump：{DIALOGUE_PROMPT_VERSION}")
 
     def test_tier_two_three_cover_framings(self):
         """P1/P2（RUNNING §5.27）：档二要覆盖"有人说你X，你认吗"的转述句式、

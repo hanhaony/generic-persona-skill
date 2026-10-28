@@ -134,6 +134,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="只发这一句（给了就不进交互模式）。缺省时逐行读你的输入，"
              "空行忽略、/exit 或 Ctrl-D 结束、Ctrl-C 干净中止")
     p_chat.add_argument(
+        "--responses", type=int, default=1,
+        help="你每说一句，几个角色依次回应（默认 1 = 只有发言人一个；"
+             "N>1 即 P8.0 一轮多响应：后答角色能看见先答角色的话）。"
+             "每多一个回应 = 多 1 次模型调用")
+    p_chat.add_argument(
+        "--group", type=int, default=0,
+        help="你每说一句之后，角色自主群聊几轮（默认 0 = 不开群聊；"
+             "P8.1：角色互相接话，prompt 注入【在场众人】；"
+             "互聊内容**绝不进长期记忆**，只活在本会话里）。每轮 1 次模型调用")
+    p_chat.add_argument(
         "--memory-write", dest="memory_write", default="off",
         choices=CHAT_MEMORY_WRITE_CHOICES,
         help="off（默认）：一条记忆都不写。rule：把**你原话**里值得记的片段写成"
@@ -1718,14 +1728,25 @@ def _chat_memory_policy(raw: str) -> str:
 def _print_chat_plan(*, names: list[str], rounds: int, policy: str,
                      estimated_usd: float, budget: float | None,
                      currency: str, db_path: Any, occupied: float,
-                     topic: str | None = None) -> None:
-    """对话的调用清单。**轮数就是调用数**，不玩"预估 × 系数"的花招。"""
+                     topic: str | None = None,
+                     total_calls: int | None = None,
+                     responses: int = 1, group: int = 0) -> None:
+    """对话的调用清单。**调用数就是钱数**，不玩"预估 × 系数"的花招。"""
     from ..orchestrator import POLICY_MEMORY_WRITE_RULE
 
     print("本次将要发出的真实调用（钱从这里开始算）")
     print(f"  对话人物      : {'、'.join(names)}")
     print(f"  数据库        : {db_path}")
-    print(f"  对话轮次      : {rounds}（每轮 1 次模型调用，共 {rounds} 次）")
+    if total_calls is None:
+        print(f"  对话轮次      : {rounds}（每轮 1 次模型调用，共 {rounds} 次）")
+    else:
+        print(f"  对话轮次      : 最多 {rounds} 轮用户输入")
+        if responses > 1 or group > 0:
+            print(f"  互动模式      : 每句 {responses} 个角色依次回应"
+                  + (f" + {group} 轮自主群聊（角色互聊不进长期记忆）"
+                     if group > 0 else "") + "")
+        print(f"  模型调用总数  : **最多 {total_calls} 次**"
+              f"（P8.0/P8.1 下 N 个角色 = N 次调用，逐次数得清）")
     if topic:
         print(f"  跨会话话题    : {topic}（只取**同一批参与者**、内容命中该话题的"
               "会话级模拟记忆；**额外 0 次调用**：记忆检索走本地库，不花钱）")
@@ -1777,6 +1798,15 @@ def _read_user_line() -> str | None:
     return text
 
 
+def _use_bold() -> bool:
+    """只在 TTY 上上样式（重定向/CI 里输出纯文本）。
+
+    注意不读 NO_COLOR——D-077 守卫规定只有 persona/config 能碰环境变量。
+    """
+    import sys
+    return sys.stdout.isatty()
+
+
 def _print_chat_turn(index: int, message: str | None, view: Any,
                      display: dict[str, str]) -> None:
     from .render import strip_evidence_refs
@@ -1787,7 +1817,15 @@ def _print_chat_turn(index: int, message: str | None, view: Any,
     # P0 破壁修复（2026-10-28）：`[ev:...]` 引用标注只留在 TurnView 字段里供
     # 追溯/评估，**展示给用户的回答原文必须剥掉**（渲染层第 3 条规则：
     # 不展示内部 ID）。同样理由，不再向用户打印「依据：evd_xxx」一行。
-    print(f"{name}：{strip_evidence_refs(view.content)}")
+    # P8.0（2026-10-28）：多人同场必须一眼分清谁在说话——角色名【加粗】+ 全角
+    # 括号，回答整体缩进（多行回答逐行缩进）。
+    header = f"【{name}】"
+    if _use_bold():
+        header = f"\x1b[1m{header}\x1b[0m"
+    lines = str(strip_evidence_refs(view.content)).splitlines() or [""]
+    print(f"{header} {lines[0]}")
+    for extra in lines[1:]:
+        print(f"    {extra}")
     if view.generated_memory_ids:
         print(f"    记忆：{'、'.join(view.generated_memory_ids)}")
 
@@ -1837,6 +1875,25 @@ def _cmd_chat(args: Any) -> int:
     if rounds < 1:
         print(f"--rounds 必须是正整数（收到 {rounds}）：0 轮就是不调用，不用开会话。")
         return 1
+
+    # P8.0/P8.1（2026-10-28）：一轮多响应 + 自主群聊。
+    #   responses = 每条用户消息后几个角色依次回应（含主回答）；
+    #   group     = 每条用户消息后角色自主互聊几轮（互聊内容绝不进长期记忆）。
+    try:
+        responses = max(1, int(getattr(args, "responses", 1) or 1))
+        group = max(0, int(getattr(args, "group", 0) or 0))
+    except (TypeError, ValueError):
+        print("--responses / --group 必须是整数。")
+        return 1
+    first_message = str(getattr(args, "message", "") or "").strip()
+    # 调用总数（= 模型调用次数，不玩系数花招）：
+    #   交互模式：最多 rounds 条输入，每条触发 responses + group 次调用；
+    #   --message 模式：首句 1 次 + (rounds-1) 轮接话（旧行为）
+    #                  + (responses-1) 个额外回应 + group 轮群聊。
+    if first_message:
+        total_calls = rounds + (responses - 1) + group
+    else:
+        total_calls = rounds * (responses + group)
 
     policy = _chat_memory_policy(getattr(args, "memory_write", "off"))
     budget = getattr(args, "budget", DEFAULT_BUDGET_USD)
@@ -1925,33 +1982,37 @@ def _cmd_chat(args: Any) -> int:
             people.append((ref.entity_id, ref.display_name))
 
         currency = str(getattr(settings.model, "currency", "") or "USD").strip() or "USD"
-        estimated_usd = round(rounds * float(DIALOGUE_MEASURED_COST_PER_CALL_USD), 6)
+        estimated_usd = round(
+            total_calls * float(DIALOGUE_MEASURED_COST_PER_CALL_USD), 6)
         limits = model_limits_from_settings(settings)
         _print_chat_plan(
             names=[display for _, display in people], rounds=rounds, policy=policy,
             estimated_usd=estimated_usd, budget=limits.soft_limit,
             currency=currency,
             db_path=db_path, occupied=stack.ledger.session_occupied_cost(),
-            topic=topic)
+            topic=topic, total_calls=total_calls,
+            responses=responses, group=group)
 
-        if limits.max_calls is not None and rounds > int(limits.max_calls):
+        if limits.max_calls is not None and total_calls > int(limits.max_calls):
             print()
-            print(f"模型调用上限 {int(limits.max_calls)} 次 < 本次需要 {rounds} 次。"
-                  f"请设 PERSONA_MODEL_MAX_CALLS={rounds}（或更大）。")
+            print(f"模型调用上限 {int(limits.max_calls)} 次 < 本次最多需要 "
+                  f"{total_calls} 次。"
+                  f"请设 PERSONA_MODEL_MAX_CALLS={total_calls}（或更大）。")
             print("  说明：本次**没有发起任何请求**。")
             return 1
         if limits.soft_limit is not None and estimated_usd > float(limits.soft_limit):
             print()
-            print(f"预算不足：本次计划 {rounds} 次模型调用、预估 "
+            print(f"预算不足：本次最多 {total_calls} 次模型调用、预估 "
                   f"{estimated_usd:.4f} {currency}，预算软上限只给了 "
                   f"{float(limits.soft_limit):.3f}。")
-            print("  要么调大 --budget / PERSONA_BUDGET_SOFT_LIMIT，要么减少 --rounds。")
+            print("  要么调大 --budget / PERSONA_BUDGET_SOFT_LIMIT，"
+                  "要么减少 --rounds / --responses / --group。")
             print("  说明：本次**没有发起任何请求**。")
             return 1
 
         # 授权：与 `persona run` **同一个函数、同一份 `.persona_consent.json`**。
         if not _authorize_real_calls(
-            data_root=data_root, searches=0, model_calls=rounds,
+            data_root=data_root, searches=0, model_calls=total_calls,
             estimated_usd=estimated_usd, budget_usd=limits.soft_limit,
             currency=currency,
             yes=bool(getattr(args, "yes", False)),
@@ -1968,30 +2029,39 @@ def _cmd_chat(args: Any) -> int:
             return 1
         session = unwrap(started)
         display = dict(people)
-        first = str(getattr(args, "message", "") or "").strip()
 
         print()
         memory_ids: list[str] = []
         done = 0
         interrupted = False
+        # P8.0/P8.1：schedule 队列——一条用户输入展开成
+        # [输入] + [None]×(responses-1+group)；None = 角色自主接话（不写记忆，
+        # 见 run_round 的派生短路）。--message 模式把整段 schedule 一次排满。
+        queue: list[str | None] = []
+        if first_message:
+            queue = [first_message] + [None] * (
+                rounds - 1 + (responses - 1) + group)
+        inputs_left = 0 if first_message else rounds
         try:
-            for index in range(rounds):
-                if first:
-                    # `--message` 只发这一句；后续轮次没有新输入（角色接着说）。
-                    message = first if index == 0 else None
-                else:
-                    message = _read_user_line()
-                    if message is None:
+            while True:
+                if not queue:
+                    if inputs_left <= 0:
                         break
-                    if not message:
+                    line = _read_user_line()
+                    if line is None:
+                        break
+                    if not line:
                         continue
+                    inputs_left -= 1
+                    queue = [line] + [None] * ((responses - 1) + group)
+                message = queue.pop(0)
                 turn = stack.dialogue.run_round(ctx, session.id, message)
                 if is_err(turn):
                     err = error_of(turn)
                     if err.category == ErrorCategory.BUDGET_EXCEEDED:
                         print(f"[预算] {err.message}；已完成的轮次与记忆均保留。")
                         break
-                    print(f"第 {index + 1} 轮失败：{err}")
+                    print(f"第 {done + 1} 轮失败：{err}")
                     return 1
                 view = unwrap(turn)
                 done += 1
