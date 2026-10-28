@@ -1779,12 +1779,15 @@ def _read_user_line() -> str | None:
 
 def _print_chat_turn(index: int, message: str | None, view: Any,
                      display: dict[str, str]) -> None:
+    from .render import strip_evidence_refs
+
     if message:
         print(f"你：{message}")
     name = display.get(view.speaker_entity_id) or view.speaker_entity_id
-    print(f"{name}：{view.content}")
-    if view.referenced_evidence_ids:
-        print(f"    依据：{'、'.join(view.referenced_evidence_ids)}")
+    # P0 破壁修复（2026-10-28）：`[ev:...]` 引用标注只留在 TurnView 字段里供
+    # 追溯/评估，**展示给用户的回答原文必须剥掉**（渲染层第 3 条规则：
+    # 不展示内部 ID）。同样理由，不再向用户打印「依据：evd_xxx」一行。
+    print(f"{name}：{strip_evidence_refs(view.content)}")
     if view.generated_memory_ids:
         print(f"    记忆：{'、'.join(view.generated_memory_ids)}")
 

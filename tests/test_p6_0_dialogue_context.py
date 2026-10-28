@@ -323,13 +323,18 @@ class TestEvidenceRefs(CtxTestCase):
 
 class TestAnswerFormat(CtxTestCase):
 
-    def test_no_evidence_prefix_required_by_prompt(self):
-        """幻觉检测靠"回答含拒答词"做确定性断言 → prompt 必须规定这个格式。"""
+    def test_machine_words_banned_and_prefix_no_longer_instructed(self):
+        """P0 破壁修复：prompt 不再教模型说「资料没写」，反而**封杀**机器词汇。"""
         service, provider = self._service()
         sid = self._session(service)
         unwrap(service.run_round(self.ctx, sid, "你最喜欢什么颜色？"))
         system = self._system_prompt(provider)
-        self.assertIn(NO_EVIDENCE_PREFIX, system)
+        # 旧指令必须消失：不再要求以「资料没写：」开头回答
+        self.assertNotIn(f"必须以「{NO_EVIDENCE_PREFIX}：」开头", system)
+        # 第四面墙禁令在场：封杀清单 + 活人身份声明
+        self.assertIn("机器词汇或工程术语", system)
+        self.assertIn("活生生的人", system)
+        self.assertIn("用你所在时代的角色身份去表达", system)
 
     def test_refusal_rule_is_three_tiered(self):
         """拒答规则必须是**三档**（RUNNING §5.26）。
@@ -337,14 +342,15 @@ class TestAnswerFormat(CtxTestCase):
         第一代只有一条无条件规则"问到上面没有的就必须拒答"，真跑里被证明作用域
         过宽：观点题和对话内承接也一律拒答 → D/E 维度全灭。三档各管一段：
         档案事实缺（拒答）/ 观点态度（可答）/ 对话承接（可答）。
+        P0 破壁修复后档一仍拒答，只是改用**角色口吻**表达。
         """
         service, provider = self._service()
         sid = self._session(service)
         unwrap(service.run_round(self.ctx, sid, "旁人常拿你和别人比较，你怎么想？"))
         system = self._system_prompt(provider)
-        # 档一：档案事实缺失 → 固定拒答格式（幻觉红线继续成立）
+        # 档一：档案事实缺失 → 角色口吻承认不知（幻觉红线继续成立）
         self.assertIn("档案事实", system)
-        self.assertIn(NO_EVIDENCE_PREFIX, system)
+        self.assertIn("角色口吻承认不知", system)
         self.assertIn("不得编造", system)
         # 档二：观点态度 → 可以角色化回答
         self.assertIn("看法、态度、感受", system)
@@ -356,20 +362,68 @@ class TestAnswerFormat(CtxTestCase):
         self.assertIn("不得声称上面档案里记着", system)
 
     def test_no_tier_widening_of_fact_refusal(self):
-        """防回退：三档化之后，"档案事实缺必须拒答"这条措辞一个字不许弱化。
+        """防回退：三档化之后，"档案事实缺必须拒答"这条红线一个字不许弱化。
 
-        尺度放松只能加在观点/对话两档；第一档的"必须/不得编造"若被稀释，
-        幻觉红线（C 维度 100%）就丢了——那是拿红线换通过率。
+        P0 只准换表达外壳（角色口吻），"不得编造/不得猜测/蒙过去"若被稀释，
+        幻觉红线（C 维度 100%）就丢了——那是拿红线换通过率。同时档一必须
+        明令封杀机器词汇前缀。
         """
         service, provider = self._service()
         sid = self._session(service)
         unwrap(service.run_round(self.ctx, sid, "你母亲的闺名是什么？"))
         system = self._system_prompt(provider)
         tier1 = system.split("一、")[1].split("二、")[0]
-        self.assertIn(f"必须以「{NO_EVIDENCE_PREFIX}：」开头", tier1)
+        self.assertIn("角色口吻承认不知", tier1)
         self.assertIn("不得编造", tier1)
         self.assertIn("不得猜测", tier1)
         self.assertIn("蒙过去", tier1)
+        self.assertIn("严禁", tier1)
+        self.assertIn(NO_EVIDENCE_PREFIX, tier1)  # 作为**被禁词**出现在档一里
+
+    def test_p0_fourth_wall_block_comes_first(self):
+        """P0 四法则块必须在最高优先级位置（模拟声明之后、档案内容之前）。"""
+        service, provider = self._service()
+        sid = self._session(service)
+        unwrap(service.run_round(self.ctx, sid, "你好"))
+        system = self._system_prompt(provider)
+        self.assertLess(
+            system.index("第四面墙禁令"), system.index("参与角色档案"),
+            "破壁禁令必须先于档案内容出现（先立'你是谁'，再给'你知道什么'）")
+        self.assertLess(
+            system.index("第四面墙禁令"), system.index("没有依据时怎么答"))
+
+    def test_p0_dual_rules_present(self):
+        """P0 双法则：客观考据与日常闲聊都要在场，且闲聊档要放松证据包袱。"""
+        service, provider = self._service()
+        sid = self._session(service)
+        unwrap(service.run_round(self.ctx, sid, "今天天气不错"))
+        system = self._system_prompt(provider)
+        self.assertIn("客观考据", system)
+        self.assertIn("日常闲聊", system)
+        self.assertIn("放下考据的包袱", system)
+        self.assertIn("松弛感", system)
+
+    def test_p0_modern_things_rule_present(self):
+        """P0 现代未知事物法则：不装懂、时代逻辑推测、主动反问。"""
+        service, provider = self._service()
+        sid = self._session(service)
+        unwrap(service.run_round(self.ctx, sid, "你知道什么是快递吗？"))
+        system = self._system_prompt(provider)
+        self.assertIn("从未听过的新鲜事物", system)
+        self.assertIn("不要假装知道", system)
+        self.assertIn("推测", system)
+        self.assertIn("主动反问访客", system)
+
+    def test_p0_initial_identity_rule_present(self):
+        """P0 初始身份认知：不脑补性别年龄、中性称呼、合乎身份地探问。"""
+        service, provider = self._service()
+        sid = self._session(service)
+        unwrap(service.run_round(self.ctx, sid, "你好"))
+        system = self._system_prompt(provider)
+        self.assertIn("初次见面的礼数", system)
+        self.assertIn("严禁凭空脑补访客的性别、年龄", system)
+        self.assertIn("中性称呼", system)
+        self.assertIn("阁下", system)
 
     def test_citation_rule_required_by_prompt(self):
         service, provider = self._service()

@@ -24,6 +24,7 @@ from persona.cli.render import (
     render_persona,
     render_relationship,
     shorten_id,
+    strip_evidence_refs,
     unmerged_line,
 )
 from persona.orchestrator.readmodels import (
@@ -554,6 +555,39 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual(shorten_id("pe_1234"), "pe_1234")
         self.assertEqual(shorten_id("nodash"), "nodash")
         self.assertEqual(shorten_id(""), "")
+
+
+class TestStripEvidenceRefs(unittest.TestCase):
+    """P0 破壁修复：`[ev:...]` 引用标注只进 TurnView 字段，不进用户视野。"""
+
+    def test_trailing_ref_is_stripped(self):
+        self.assertEqual(
+            strip_evidence_refs("我素来如此 [ev:evd_abc123]。"),
+            "我素来如此。")
+
+    def test_ref_without_space_is_stripped(self):
+        self.assertEqual(
+            strip_evidence_refs("我素来如此[ev:evd_abc123]。"),
+            "我素来如此。")
+
+    def test_multiple_refs_all_stripped(self):
+        self.assertEqual(
+            strip_evidence_refs("其一如此 [ev:evd_a]，其二亦然 [ev:evd_b]。"),
+            "其一如此，其二亦然。")
+
+    def test_no_ref_returns_text_unchanged(self):
+        text = "寻常回答，一个标注也没有。"
+        self.assertEqual(strip_evidence_refs(text), text)
+
+    def test_malformed_ref_is_still_stripped(self):
+        """非标准 ID（打越界标记那种）同样不许出现在用户视野里。"""
+        self.assertEqual(strip_evidence_refs("我说 [ev:不存在] 而已。"),
+                         "我说 而已。")
+
+    def test_punctuation_spacing_is_tightened(self):
+        self.assertEqual(
+            strip_evidence_refs("其一如此[ev:evd_a] ，其二亦然[ev:evd_b] 。"),
+            "其一如此，其二亦然。")
 
 
 if __name__ == "__main__":  # pragma: no cover

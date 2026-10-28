@@ -501,3 +501,25 @@ def render_markdown(report: PersonaReport, *, generated_on: str = "") -> str:
 def render_lines(text: str) -> Iterable[str]:
     """便捷：按行迭代（CLI 打印 / 写文件共用）。"""
     return text.splitlines()
+
+
+#: 对话回答里的证据引用标注（P0 破壁修复，2026-10-28）。
+#:
+#: 模型按【引用规则】在句末标 `[ev:evd_xxx]`，模块层从回答里**解析**出
+#: `referenced_evidence_ids`（追溯链路成立）；但这两个字符不该给用户看——
+#: 渲染层第 3 条规则"不展示内部 ID"在对话场景的延伸。展示前剥掉，
+#: 追溯与评估不受影响（它们读的是 TurnView 字段，不是回答原文）。
+EVIDENCE_REF_DISPLAY_RE = re.compile(r"\s*\[ev:[^\]\s]+\]")
+
+
+def strip_evidence_refs(text: str) -> str:
+    """剥掉回答里的 `[ev:...]` 引用标注（**只影响展示**，不影响追溯）。
+
+    - 标注通常缀在句末：`……素来如此 [ev:evd_xxx]。` → `……素来如此。`
+    - 剥掉后若句尾出现孤立空格 / 标点前空格，一并收紧；
+    - 回答里没有标注时原样返回（不引入任何改动）。
+    """
+    if "[ev:" not in text:
+        return text
+    stripped = EVIDENCE_REF_DISPLAY_RE.sub("", text)
+    return re.sub(r"\s+([，。！？；：、」』）])", r"\1", stripped)
