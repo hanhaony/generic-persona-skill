@@ -425,6 +425,35 @@ class TestAnswerFormat(CtxTestCase):
         self.assertIn("中性称呼", system)
         self.assertIn("阁下", system)
 
+    def test_p1_relationship_stages_present(self):
+        """第二阶段：关系发展三阶段（初识/熟识/老友）必须全部在场。"""
+        service, provider = self._service()
+        sid = self._session(service)
+        unwrap(service.run_round(self.ctx, sid, "你好"))
+        system = self._system_prompt(provider)
+        self.assertIn("关系发展：称呼与态度随熟识程度而变", system)
+        self.assertIn("初识", system)
+        self.assertIn("熟识", system)
+        self.assertIn("老友", system)
+        # 熟识：访客自述称呼后改口（"叫我X"），并提到记忆允许则跨轮沿用
+        self.assertIn("「叫我黛玉」", system)
+        self.assertIn("从此刻起就改用这个称呼", system)
+        self.assertIn("若你的记忆允许记下这一点", system)
+        # 老友：判定材料是"本轮上下文里的既有记忆"，不是数对话次数
+        self.assertIn("本轮上下文里已有多条关于这位访客的既有记忆", system)
+        self.assertIn("关心起对方从前提过的事", system)
+
+    def test_p1_stages_come_after_immersion_before_profiles(self):
+        """三阶段块位于四法则之后、档案内容之前（同属最高优先级区）。"""
+        service, provider = self._service()
+        sid = self._session(service)
+        unwrap(service.run_round(self.ctx, sid, "你好"))
+        system = self._system_prompt(provider)
+        self.assertLess(
+            system.index("关系发展"), system.index("参与角色档案"))
+        self.assertLess(
+            system.index("关系发展"), system.index("没有依据时怎么答"))
+
     def test_citation_rule_required_by_prompt(self):
         service, provider = self._service()
         sid = self._session(service)
