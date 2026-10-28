@@ -106,7 +106,8 @@ def build_question(*, searches: int, model_calls: int, estimated_usd: float | No
     else:
         cost = f"预估 {float(estimated_usd):.3f} {currency}"
     if budget_usd is not None:
-        return f"{lead}，{cost}（单任务上限 {float(budget_usd):.2f} {currency}）。继续？[y/N]"
+        return (f"{lead}，{cost}（预算软上限 {float(budget_usd):.2f} {currency}，"
+                f"达此值暂停询问是否继续）。继续？[y/N]")
     return f"{lead}，{cost}。继续？[y/N]"
 
 

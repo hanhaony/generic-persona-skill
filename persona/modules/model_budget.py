@@ -63,6 +63,7 @@ from ..core.types import (
 from ..core.usage_ledger import (
     ExternalUsageLedger,
     ModelCallLimits,
+    SOFT_LIMIT_INCREMENT_USD,
     cost_from_model_usage,
     estimate_model_cost,
 )
@@ -105,9 +106,23 @@ def check_model_budget(
     calls_made: int,
     key: str,
 ) -> Err | None:
-    """**发送之前**的闸门。返回 `Err` 表示不许发（`BUDGET_EXCEEDED` 是暂停信号）。
+    """**发送之前**的闸门。返回 `Err` 表示不许发。
+
+    返回码含义（类别都是 `BUDGET_EXCEEDED`，`research.py` 的分支按类别接住）：
+        - `BUDGET_EXCEEDED`：**硬上限/次数上限/未知单价**这类不可继续的拦截；
+        - `BUDGET_PAUSED`：**软上限**——暂停等用户确认，用户可继续或安全退出。
 
     `limits is None` → 不设闸门（也不预留），保持"未配置限额就不拦"的既有语义。
+
+    # P0 修复：历史账单绝不污染本次任务
+
+    **软硬双限（①②）与单任务上限（③）一律用 `session_occupied_cost()`（本次任务
+    口径，排除历史）**——这是修复"新开任务/会话被历史账单累加"致命 Bug 的核心：
+    新开任务时 `used_cost` 必须从 0 起算。
+
+    **唯独遗留的"项目累计上限"（④）仍用 `ledger.occupied_cost()`（含历史）**——
+    "项目累计"存在的意义就是跨进程累计（G11），它本就设计成含 hydrate 读回的历史笔；
+    放错基线会让跨进程累计闸门失效。生产配置已改软硬双限，④ 仅作为兜底。
     """
     if limits is None:
         return None
@@ -117,7 +132,9 @@ def check_model_budget(
             f"模型调用次数已达上限 {limits.max_calls}：不再自动发起请求",
             trace_ref=ctx.trace_ref))
     estimate = estimate_model_cost(limits)
-    has_cost_cap = (limits.max_cost is not None
+    has_cost_cap = (limits.soft_limit is not None
+                    or limits.hard_limit is not None
+                    or limits.max_cost is not None
                     or limits.max_cost_total is not None)
     if has_cost_cap and estimate is None:
         return Err(new_error(
@@ -127,18 +144,52 @@ def check_model_budget(
             "（费用未知不等于零）",
             trace_ref=ctx.trace_ref))
     if ledger is not None and estimate is not None:
-        # ① 单任务上限：这个任务累计（含同任务历史）不能超
-        if limits.max_cost is not None:
-            task_cost = ledger.occupied_cost_for_task(task_id)
-            if task_cost + estimate > limits.max_cost:
+        session_cost = ledger.session_occupied_cost()
+
+        # ① 硬上限：瞬间/累计达硬限 → 强制熔断（防死循环烧钱）
+        if limits.hard_limit is not None:
+            if session_cost + estimate > limits.hard_limit:
                 return Err(new_error(
                     ErrorCode.BUDGET_EXCEEDED,
-                    f"单任务费用上限：该任务已占用 {task_cost:.4f}"
+                    f"预算硬上限：本次任务已占用 {session_cost:.4f}"
+                    f"{limits.currency} + 本次估算 {estimate:.4f}"
+                    f" 超过硬上限 {limits.hard_limit}",
+                    trace_ref=ctx.trace_ref))
+
+        # ② 软上限：达软限 → 暂停，询问用户是否继续；
+        #     handler 返回 True（用户回答 y）→ 软限抬升步进继续；
+        #     handler 缺失或返回 False（用户回答 n）→ 返回 BUDGET_PAUSED 暂停。
+        if limits.soft_limit is not None:
+            if session_cost + estimate > limits.soft_limit:
+                handler = limits.soft_limit_handler
+                if handler is not None and handler(session_cost):
+                    limits.soft_limit = float(limits.soft_limit) \
+                        + SOFT_LIMIT_INCREMENT_USD
+                else:
+                    return Err(new_error(
+                        ErrorCode.BUDGET_PAUSED,
+                        f"预算软上限：本次任务已占用 {session_cost:.4f}"
+                        f"{limits.currency} + 本次估算 {estimate:.4f}"
+                        f" 达到软上限 {limits.soft_limit:.2f}",
+                        trace_ref=ctx.trace_ref))
+
+        # ③ 遗留单任务上限（P4.6 / D-B）：仍以本次任务口径判断，不计入历史
+        if limits.max_cost is not None:
+            if session_cost + estimate > limits.max_cost:
+                return Err(new_error(
+                    ErrorCode.BUDGET_EXCEEDED,
+                    f"单任务费用上限：本次任务已占用 {session_cost:.4f}"
                     f"{limits.currency} + 本次估算 {estimate:.4f}"
                     f" 超过 {limits.max_cost}",
                     trace_ref=ctx.trace_ref))
-        # ② 项目累计上限：整本账（含历史）不能超
+
+        # ④ 遗留项目累计上限（含历史）：仅作为兜底，生产配置已改软硬双限。
+        # ⚠️ 这里必须用 `ledger.occupied_cost()`（含 hydrate 读回的历史笔），
+        #    不能用 `session_cost`（排除历史）——"项目累计"存在的意义就是跨进程
+        #    累计，放错基线会让 `test_second_process_sees_history_and_blocks_on_project_cap`
+        #    这类跨进程累计闸门失效（G11）。
         if limits.max_cost_total is not None:
+            project_cost = ledger.occupied_cost()
             if ledger.unpriced_unknown_requests() > 0:
                 return Err(new_error(
                     ErrorCode.BUDGET_EXCEEDED,
@@ -147,12 +198,11 @@ def check_model_budget(
                     "且没有任何估算可用——金额无法界定，不能保证不超累计上限 "
                     f"{limits.max_cost_total}（费用未知不等于零）",
                     trace_ref=ctx.trace_ref))
-            total = ledger.occupied_cost()
-            if total + estimate > limits.max_cost_total:
+            if project_cost + estimate > limits.max_cost_total:
                 return Err(new_error(
                     ErrorCode.BUDGET_EXCEEDED,
-                    f"项目累计费用上限：账本已占用 {total:.4f}"
-                    f"{limits.currency}（含历史）+ 本次估算 {estimate:.4f}"
+                    f"项目累计费用上限：累计已占用 {project_cost:.4f}"
+                    f"{limits.currency} + 本次估算 {estimate:.4f}"
                     f" 超过 {limits.max_cost_total}",
                     trace_ref=ctx.trace_ref))
     if ledger is not None:

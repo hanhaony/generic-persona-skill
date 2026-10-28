@@ -219,9 +219,11 @@ settings = test_settings(data_dir="/tmp/x")      # 覆盖单项
 | `PERSONA_MODEL_PRICE_OUT_PER_1M` | `model.price_out_per_1m` | 数字 | 空 | 输出单价（同上） |
 | `PERSONA_MODEL_PRICE_SOURCE` | `model.price_source` | 字符串 | 空 | 单价来源（官方价目表地址） |
 | `PERSONA_MODEL_PRICE_CHECKED_AT` | `model.price_checked_at` | 字符串 | 空 | 单价核对日期 |
-| `PERSONA_MODEL_MAX_COST` | `model.max_cost` | 数字 | 空 | **项目累计**上限（原币；含从库里 hydrate 的历史支出，P4.6 / D-B） |
-| `PERSONA_MODEL_MAX_COST_PER_TASK` | `model.max_cost_per_task` | 数字 | 空 | **单任务**上限（原币；按 `task_id` 累计，含同任务历史） |
-| `PERSONA_MODEL_MAX_CALLS` | `model.max_calls` | 整数 | 空 | 一条流程最多几次模型调用 |
+| `PERSONA_BUDGET_SOFT_LIMIT` | `model.soft_limit` | 数字 | 空 | **软上限**（原币）：本次任务花费达此值 → 暂停并询问「是否继续？(y/n)」；y → 软限抬升 2.00 继续，n → 安全退出（**P0 软硬双限**，以「本次任务口径」计算，历史账单不计入） |
+| `PERSONA_BUDGET_HARD_LIMIT` | `model.hard_limit` | 数字 | 空 | **硬上限**（原币）：瞬间或累计达到此值 → 强制中断（防死循环烧钱；同样以「本次任务口径」计算） |
+| `PERSONA_MODEL_MAX_COST` | `model.max_cost` | 数字 | 空 | **（遗留，已废弃）** 项目累计上限；仅当未配软硬双限时由 `model_setup` 回退近似，配了软硬双限后不再生效 |
+| `PERSONA_MODEL_MAX_COST_PER_TASK` | `model.max_cost_per_task` | 数字 | 空 | **（遗留，已废弃）** 单任务上限；同上，仅作回退 |
+| `PERSONA_MODEL_MAX_CALLS` | `model.max_calls` | 整数 | 空 | 一条流程最多几次模型调用（抽取 + 对话合并计入；独立于金额软硬限） |
 | `PERSONA_MODEL_EST_TOKENS_IN` | `model.est_tokens_in` | 整数 | `0` | 事前估算输入 token（只用于**预留**） |
 | `PERSONA_MODEL_EST_TOKENS_OUT` | `model.est_tokens_out` | 整数 | `0` | 事前估算输出 token |
 | `PERSONA_MODEL_REQUIRE_GATE_VERDICT` | `model.require_gate_verdict` | 布尔 | `true` | 材料必须亮出正文质量门禁结论才允许进抽取器 |

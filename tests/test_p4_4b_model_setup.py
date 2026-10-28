@@ -203,10 +203,14 @@ class TestModelConfig(unittest.TestCase):
         self.assertEqual(parsed.get("PERSONA_MODEL_CURRENCY"), "USD")
         self.assertEqual(parsed.get("PERSONA_MODEL_PRICE_SOURCE"), DEEPSEEK_PRICE_SOURCE)
         self.assertEqual(parsed.get("PERSONA_MODEL_PRICE_CHECKED_AT"), "2026-10-16")
-        # P4.4-C 拍板：单任务与总上限暂取同一个保守值；冒烟范围 max_calls=1
-        self.assertEqual(parsed.get("PERSONA_MODEL_MAX_COST"), "0.25")
-        self.assertEqual(parsed.get("PERSONA_MODEL_MAX_COST_PER_TASK"), "0.25")
-        self.assertEqual(parsed.get("PERSONA_MODEL_MAX_CALLS"), "1")
+        # P0 拍板（2026-10-28）：全局单任务「软硬双限」取代旧的两层金额上限；
+        # 次数上限放宽到产品默认 200（冒烟时代的 1 已不适用）
+        self.assertEqual(parsed.get("PERSONA_BUDGET_SOFT_LIMIT"), "2.00")
+        self.assertEqual(parsed.get("PERSONA_BUDGET_HARD_LIMIT"), "5.00")
+        self.assertEqual(parsed.get("PERSONA_MODEL_MAX_CALLS"), "200")
+        # 遗留金额键已废弃：模板里只允许以注释形式出现，不得可解析
+        self.assertNotIn("PERSONA_MODEL_MAX_COST", parsed)
+        self.assertNotIn("PERSONA_MODEL_MAX_COST_PER_TASK", parsed)
         self.assertEqual(parsed.get("PERSONA_MODEL_REQUIRE_GATE_VERDICT"), "true")
         # 币种统一 USD 且不做换算：折算字段已从模板中移除
         self.assertNotIn("PERSONA_MODEL_FX_USD_CNY", parsed)

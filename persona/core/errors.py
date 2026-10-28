@@ -129,6 +129,7 @@ class ErrorCode(_StrEnum):
 
     # —— 预算 / 取消 / 不变式 ——
     BUDGET_EXCEEDED = "BUDGET_EXCEEDED"
+    BUDGET_PAUSED = "BUDGET_PAUSED"  # 达软上限，暂停等用户确认（同属 BUDGET_EXCEEDED 类别）
     CANCELLED = "CANCELLED"
     INVARIANT_VIOLATION_ISOLATION = "INVARIANT_VIOLATION.isolation"
     INTERNAL = "INTERNAL"
@@ -224,7 +225,8 @@ for _code, _category, _hint in [
     (ErrorCode.STORAGE_READ_FAILED, ErrorCategory.STORAGE, "读取本地数据失败"),
     (ErrorCode.STORAGE_WRITE_FAILED, ErrorCategory.STORAGE, "写入本地数据失败"),
     (ErrorCode.STORAGE_CONFLICT, ErrorCategory.STORAGE, "并发写冲突"),
-    (ErrorCode.BUDGET_EXCEEDED, ErrorCategory.BUDGET_EXCEEDED, "已达预算上限，进度已保存，可之后继续"),
+    (ErrorCode.BUDGET_EXCEEDED, ErrorCategory.BUDGET_EXCEEDED, "已达预算硬上限，进度已保存，任务已中断"),
+    (ErrorCode.BUDGET_PAUSED, ErrorCategory.BUDGET_EXCEEDED, "已达预算软上限，已暂停等待确认，可继续或安全退出"),
     (ErrorCode.CANCELLED, ErrorCategory.CANCELLED, "任务已被取消"),
     (ErrorCode.INVARIANT_VIOLATION_ISOLATION, ErrorCategory.INVARIANT_VIOLATION, "违反数据隔离红线，任务已停止"),
     (ErrorCode.INTERNAL, ErrorCategory.INTERNAL, "程序内部错误"),

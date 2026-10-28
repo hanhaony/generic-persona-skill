@@ -225,6 +225,8 @@ class BusinessStack:
             },
             "model": {
                 "enabled": self.settings.model.enabled(),
+                "soft_limit": limits.soft_limit,
+                "hard_limit": limits.hard_limit,
                 "max_cost_per_task": limits.max_cost,
                 "max_cost_total": limits.max_cost_total,
                 "max_calls": limits.max_calls,
@@ -826,12 +828,23 @@ def build_business_stack(
                 chat_provider = built_chat.value
 
     extractor = claim_extractor
+    # P0：抽取与对话**共用同一份** `ModelCallLimits` 实例——软上限的「暂停询问后抬升」
+    # 是在运行期原地修改 `soft_limit` 的，若两侧各持一份独立对象，抽取阶段抬升了
+    # 软限、对话阶段却仍是旧阈值，会出现「重复弹窗」。共享同一份对象即可同步。
+    # ⚠️ 共享对象一律由 `model_limits_from_settings(settings)`（配置的唯一真相源）产出，
+    #    绝不读注入抽取器的 `.limits`——注入的桩（如测试里的 `_EchoExtractor`）可能没有
+    #    该属性，读它会 `AttributeError`。统一在这里把共享对象写回两侧即可覆盖。
+    shared_limits = model_limits_from_settings(settings)
+    if extractor is not None:
+        # 覆盖注入抽取器的 limits，使其与对话共用同一份（共享抬升语义）。
+        extractor.limits = shared_limits
     if extractor is None and chat_provider is not None:
         extractor = claim_extractor_from_settings(
             settings, chat_provider,
             ledger=ledger, usage_sink=storage, task_id=options.task_id,
             vocabulary=options.trait_vocabulary,
             temperature=options.extract_temperature)
+        extractor.limits = shared_limits
     if extractor is None:
         warnings.append(WarningNote(
             code=WARNING_STACK_EXTRACTOR_ABSENT,
@@ -861,7 +874,7 @@ def build_business_stack(
         # 次数上限与抽取器**共用**：`max_calls` 约束的是"本次运行几次模型调用"，
         # 不是"抽取几次"。
         ledger=ledger,
-        limits=model_limits_from_settings(settings),
+        limits=shared_limits,
         usage_sink=storage,
         task_id=options.task_id,
         model_hint=settings.model.model_id or DEFAULT_MODEL_ID))

@@ -36,7 +36,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 # 数据形状与状态常量放在 `core`：存储层（低层）与业务模块（L4）都要用它，
 # 下沉到 core 才不会形成循环依赖（与 `SourceMaterial` 同一处理口径）。
@@ -75,13 +75,16 @@ DEFAULT_UNKNOWN_HOLD_CREDITS = 1.0
 WARNING_USAGE_UNKNOWN = "USAGE_UNKNOWN"
 WARNING_USAGE_LEDGER_PAUSED = "USAGE_LEDGER_PAUSED"
 
+# 软上限步进：用户每次在暂停提示里回答 y，软上限抬升的幅度（USD）
+SOFT_LIMIT_INCREMENT_USD = 2.0
+
 
 # --------------------------------------------------------------------------
 # 数据模型
 # --------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
+@dataclass
 class ModelCallLimits:
     """模型调用的**量级与费用闸门**（P4.4-A 第五步）。
 
@@ -90,16 +93,19 @@ class ModelCallLimits:
 
     三个闸门各管一件事，互不替代：
         - `max_calls`：次数上限（防"无限重试把额度打光"）；
-        - `max_cost`：**单任务**金额上限（该任务累计估算值不得超过它）；
+        - `max_cost`：**单任务**金额上限（该任务累计估算值不得超过它，见 P4.6）；
         - `price_per_1k_*`：把 token 换成金额的唯一依据；缺它就**无法保证**不超上限。
 
-    P4.6（D-B）新增 `max_cost_total`：**项目累计封顶**。两层同时生效——
+    P0 体验修复新增**全局单任务软硬双限**（`soft_limit` / `hard_limit`）：
 
-    - `max_cost` 看的是"这个任务（`task_id`）累计花了多少"；
-    - `max_cost_total` 看的是"这本账（含 hydrate 读回的历史）累计花了多少"。
+    - 二者均以"本次任务口径"（`session_occupied_cost()`，排除历史）为基线；
+    - 达 `soft_limit` → 暂停，询问用户是否继续（`soft_limit_handler` 返回 True
+      则把 `soft_limit` 抬升 `SOFT_LIMIT_INCREMENT_USD` 继续）；
+    - 达 `hard_limit` → 强制熔断（防死循环烧钱）。
+    - 这两个字段在运行期会被原地修改（`soft_limit` 抬升），故本数据类**非冻结**。
 
-    修复前只有一个上限参数，装配层只能取两者中更严的那个来近似"两层"，
-    于是"项目累计 1.00 USD"从来没有真正独立生效过。
+    历史账单（hydrate 读回的笔）**绝不**计入本次任务的软硬限基线——这是修复
+    "新任务被历史账单污染"致命 Bug 的关键（见 `check_model_budget`）。
     """
 
     max_calls: int | None = None          # 一次流程最多几次模型调用（None = 不限制）
@@ -110,6 +116,15 @@ class ModelCallLimits:
     currency: str = CURRENCY_UNKNOWN      # 单价的计价单位（如 CNY / USD）
     est_tokens_in: int = 0                # 事前估算的输入 token（0 = 不估算 → 费用未知）
     est_tokens_out: int = 0
+
+    # —— P0 体验修复：全局单任务"软硬双限" ——
+    # 软限：单次完整任务（无论几个阶段）消耗达到此值 → 暂停，询问用户是否继续；
+    #        用户回答 y → `soft_limit` 抬升 `SOFT_LIMIT_INCREMENT_USD` 继续。
+    # 硬限：瞬间/累计达到此值 → 强制熔断（防死循环烧钱）。
+    # 二者均以"本次任务口径"（`session_occupied_cost()`，排除历史）为基线。
+    soft_limit: float | None = None       # 软上限（None = 不启用软暂停）
+    hard_limit: float | None = None       # 硬上限（None = 不启用硬熔断）
+    soft_limit_handler: Callable[..., bool] | None = None  # 达软限时回调，返回 True 表示继续
 
 
 # --------------------------------------------------------------------------

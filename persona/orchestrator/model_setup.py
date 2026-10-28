@@ -124,17 +124,42 @@ def effective_max_cost(model: ModelSettings) -> float | None:
 def model_limits_from_settings(settings: AppSettings) -> ModelCallLimits:
     """`AppSettings.model` → `ModelCallLimits`（账本认的形状）。
 
+    **P0 预算以「软硬双限」为准**：`soft_limit` 达值暂停询问、`hard_limit` 达值
+    强制中断，二者均以「本次任务口径（`session_occupied_cost()`，排除历史）」计算，
+    历史账单绝不污染新任务（见 `check_model_budget`）。
+
+    兼容回退：若 `.env` 只配了遗留的 `PERSONA_MODEL_MAX_COST` / `_PER_TASK` 而未配
+    新的软硬限键，则沿用旧的两层上限近似（不启用软暂停）。一旦配了新键，遗留上限
+    不再生效（避免双重封顶）。
+
     注意 `currency`：配置里没给币种时**不猜**，用 `CURRENCY_UNKNOWN`
     —— 币种未知的账本没法对账，但比"默认当成 USD"安全（那会把 CNY 当成 USD）。
     """
     model = settings.model
     currency = str(model.currency or "").strip() or CURRENCY_UNKNOWN
+
+    # 软硬双限：新键优先；两者都未设时才回退到遗留上限
+    soft_limit = model.soft_limit
+    hard_limit = model.hard_limit
+    if soft_limit is None and hard_limit is None:
+        legacy = effective_max_cost(model)
+        soft_limit = legacy                 # 回退：用遗留单任务上限近似软限
+        max_cost = legacy                   # 回退：保留遗留单任务层
+        max_cost_total = model.max_cost      # 回退：保留遗留累计层
+    else:
+        # 新机制生效：不设置遗留上限，避免与软硬限双重封顶
+        max_cost = None
+        max_cost_total = None
+
     return ModelCallLimits(
         max_calls=model.max_calls,
-        # 单任务层：更严的那个（见 effective_max_cost）
-        max_cost=effective_max_cost(model),
-        # 项目累计层：配置里的总上限，由账本累计口径（含 hydrate 的历史）执行
-        max_cost_total=model.max_cost,
+        # 单任务层（仅遗留回退时设置）
+        max_cost=max_cost,
+        # 项目累计层（仅遗留回退时设置）
+        max_cost_total=max_cost_total,
+        # P0 软硬双限
+        soft_limit=soft_limit,
+        hard_limit=hard_limit,
         price_per_1k_in=unit_price_per_1k(model.price_in_per_1m),
         price_per_1k_out=unit_price_per_1k(model.price_out_per_1m),
         currency=currency,
@@ -389,6 +414,8 @@ def model_plan(settings: AppSettings) -> dict[str, Any]:
         "max_cost_per_task": model.max_cost_per_task,
         "max_cost_effective": limits.max_cost,
         "max_cost_total_effective": limits.max_cost_total,
+        "soft_limit": limits.soft_limit,
+        "hard_limit": limits.hard_limit,
         "max_calls": limits.max_calls,
         "est_tokens_in": limits.est_tokens_in,
         "est_tokens_out": limits.est_tokens_out,
@@ -415,7 +442,14 @@ def _plan_notes(model: ModelSettings) -> list[str]:
         notes.append("**单价没有来源**：无法审计这个数字从哪来（配置校验本应拦住）。")
     if model.currency and str(model.currency).upper() != "USD":
         notes.append(f"币种为 {model.currency}，不是 P4.4-B 决策的 USD——请确认是否有意为之。")
-    if model.max_cost is not None and model.max_cost_per_task is not None:
+    if model.soft_limit is not None or model.hard_limit is not None:
+        notes.append(
+            "全局单任务「软硬双限」（P0 体验修复）：软上限 "
+            f"{limits.soft_limit}，硬上限 {limits.hard_limit}；"
+            "二者均以「本次任务口径（排除历史账单）」计算，新开任务从 0 起算；"
+            "达软限暂停询问是否继续（y 则软限抬升 2.00 继续，n 则安全退出），"
+            "达硬限强制中断以防烧钱。")
+    elif model.max_cost is not None and model.max_cost_per_task is not None:
         effective = effective_max_cost(model)
         if model.max_cost == model.max_cost_per_task:
             notes.append(
@@ -425,9 +459,10 @@ def _plan_notes(model: ModelSettings) -> list[str]:
                 f"PERSONA_MODEL_MAX_COST 调大即可。")
         else:
             notes.append(
-                f"两层上限同时生效（P4.6 / D-B）：单任务 {effective}（该 task_id 累计，"
+                f"两层上限同时生效（P4.6 / D-B，遗留回退）：单任务 {effective}（该 task_id 累计，"
                 f"含同任务历史）、项目累计 {model.max_cost}（整本账，含 hydrate 历史）；"
-                f"任一层超限即停，不需要取更严的那个来近似。")
+                f"任一层超限即停。建议迁移到新的 PERSONA_BUDGET_SOFT_LIMIT / "
+                f"PERSONA_BUDGET_HARD_LIMIT。")
     if str(model.provider or "").strip() in NETWORK_MODEL_PROVIDER_NAMES:
         notes.append(
             "Provider 内部重试已**强制为 0**（max_retries=0，D3）：对按 token 计费的聊天"

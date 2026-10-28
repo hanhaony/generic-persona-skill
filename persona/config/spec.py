@@ -251,8 +251,11 @@ class ModelSettings:
        `price_source` / `price_checked_at`。
        单价是**原币**（`currency`）每 100 万 token；`price_source` + `price_checked_at`
        是"这个数字从哪来、什么时候核对的"——没有来源的单价等于没有单价。
-    3. **闸门**：`max_cost`（本轮总上限）/ `max_cost_per_task`（单任务上限）/
+    3. **闸门**：`soft_limit`（单次完整任务的软上限）/ `hard_limit`（软限之上的硬熔断）/
+       `max_cost`（遗留总额上限）/ `max_cost_per_task`（遗留单任务上限）/
        `max_calls` / `est_tokens_in` / `est_tokens_out` / `require_gate_verdict`。
+       **P0 起预算以「软硬双限」为准**：`soft_limit` 达值暂停询问、`hard_limit`
+       达值强制中断，二者均以「本次任务口径（排除历史）」计算，历史账单不污染新任务。
 
     **币种固定 USD，不做汇率换算**（P4.4-C 拍板）：DeepSeek 官方计价即 USD，
     一本账里只会有一种币。原 P4.4-B 的 `fx_usd_cny` / `fx_source` 折算通道已
@@ -279,8 +282,11 @@ class ModelSettings:
     price_checked_at: str | None = None    # 核对日期（YYYY-MM-DD）
 
     # ---- 3. 闸门 ----
-    max_cost: float | None = None            # 本轮/本账本的总额上限（原币）
-    max_cost_per_task: float | None = None   # 单任务上限（原币）
+    max_cost: float | None = None            # （遗留）本轮/本账本的总额上限（原币）
+    max_cost_per_task: float | None = None   # （遗留）单任务上限（原币）
+    # —— P0 体验修复：全局单任务「软硬双限」（优先于上面的遗留上限）——
+    soft_limit: float | None = None          # 单次完整任务的软上限（原币）；达此值暂停询问
+    hard_limit: float | None = None          # 软上限之上的硬熔断值（原币）；达此值强制中断
     max_calls: int | None = None             # 一条流程最多几次模型调用
     est_tokens_in: int = 0                   # 事前估算输入 token（0 = 不估算）
     est_tokens_out: int = 0
@@ -495,10 +501,20 @@ CONFIG_FIELDS: tuple[FieldSpec, ...] = (
               "单价的核对日期（YYYY-MM-DD）", nullable=True),
     # ---- 闸门 ----
     FieldSpec("PERSONA_MODEL_MAX_COST", "model.max_cost", "float", None,
-              "本轮模型调用的总额上限（原币，如 USD）；留空表示不限制",
+              "（遗留）本轮模型调用的总额上限（原币，如 USD）；留空表示不限制",
               minimum=0, maximum=1_000_000, nullable=True),
     FieldSpec("PERSONA_MODEL_MAX_COST_PER_TASK", "model.max_cost_per_task", "float", None,
-              "单个任务的模型费用上限（原币）；留空表示不限制",
+              "（遗留）单个任务的模型费用上限（原币）；留空表示不限制",
+              minimum=0, maximum=1_000_000, nullable=True),
+    # —— P0 体验修复：全局单任务「软硬双限」——
+    FieldSpec("PERSONA_BUDGET_SOFT_LIMIT", "model.soft_limit", "float", None,
+              "单次完整任务（无论几个阶段）的模型费用软上限（原币）；"
+              "消耗达此值暂停并询问是否继续（y 则软限抬升 2.00 继续，n 则安全退出）；"
+              "留空表示不启用软暂停",
+              minimum=0, maximum=1_000_000, nullable=True),
+    FieldSpec("PERSONA_BUDGET_HARD_LIMIT", "model.hard_limit", "float", None,
+              "软上限之上的硬熔断值（原币）；单次任务消耗达此值强制中断以防烧钱；"
+              "留空表示不启用硬熔断",
               minimum=0, maximum=1_000_000, nullable=True),
     FieldSpec("PERSONA_MODEL_MAX_CALLS", "model.max_calls", "int", None,
               "一条流程最多几次模型调用；留空表示不限制", minimum=0, maximum=10_000,
@@ -707,8 +723,11 @@ def _validate_model(settings: AppSettings) -> list[AppError]:
     model = settings.model
     problems: list[AppError] = []
 
-    ceiling = model.max_cost if model.max_cost is not None else model.max_cost_per_task
-    if ceiling is not None:
+    # 任何一类费用上限被设置（软/硬/遗留总额/遗留单任务），都必须给出单价与 token 估算
+    cost_caps = [v for v in (model.soft_limit, model.hard_limit,
+                             model.max_cost, model.max_cost_per_task)
+                 if v is not None]
+    if cost_caps:
         if model.price_in_per_1m is None or model.price_out_per_1m is None:
             problems.append(config_error(
                 FIELD_BY_ENV_KEY["PERSONA_MODEL_PRICE_IN_PER_1M"],
@@ -722,6 +741,14 @@ def _validate_model(settings: AppSettings) -> list[AppError]:
                 "设了模型费用上限，但事前 token 估算全是 0（est_tokens_in/out）。"
                 "闸门要按『本次可能产生的最大费用』预留，没有 token 估算就算不出"
                 "这个数——未知不等于 0。请给出保守估算或清空上限。"))
+        # 软上限不得大于硬上限（两者都设时）
+        if (model.soft_limit is not None and model.hard_limit is not None
+                and model.soft_limit > model.hard_limit):
+            problems.append(config_error(
+                FIELD_BY_ENV_KEY["PERSONA_BUDGET_SOFT_LIMIT"],
+                f"软上限 {model.soft_limit} 不能大于硬上限 {model.hard_limit}："
+                "软上限是『暂停询问』的阈值，硬上限是『强制中断』的阈值，"
+                "软限必须 ≤ 硬限。"))
 
     if (model.price_in_per_1m is not None or model.price_out_per_1m is not None) \
             and not str(model.price_source or "").strip():

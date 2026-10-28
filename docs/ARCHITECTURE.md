@@ -655,6 +655,7 @@ Dialogue.run_round()
 | 未知用量 | token 未知则 `None`，**绝不估算**；至少记 `requests` 与 `latency_ms` |
 | 探测调用 | `Provider.health()` 不计入预算 |
 | 重试 | 重试的调用同样计费，**不得无限重试烧钱** |
+| 模型费用线（P0 软硬双限） | 每次模型调用前另过 `modules/model_budget.py`：**软限** `PERSONA_BUDGET_SOFT_LIMIT` 达值 → 暂停询问（y → 软限 +2.00 继续 / n → `BUDGET_PAUSED` 安全退出）；**硬限** `PERSONA_BUDGET_HARD_LIMIT` 达值 → 强制中断。按**本次任务**口径计算，历史账单不计入；遗留 `PERSONA_MODEL_MAX_COST`/`_PER_TASK` 仅作回退且按含历史口径 |
 
 **超预算 ⇒ 暂停，不是失败**（D-043）：已完成的产出保留，用户提高额度后可 `resume` 续跑。
 

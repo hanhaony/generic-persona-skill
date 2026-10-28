@@ -208,10 +208,16 @@ class HelpTextTest(unittest.TestCase):
         return buf.getvalue()
 
     def test_run_help_keeps_the_two_sentences(self):
-        """⑧ 号断言：这两句一被"精简"，用户就会开始乱调旋钮。"""
+        """⑧ 号断言：这两句一被"精简"，用户就会开始乱调旋钮。
+
+        P0 预算改为「软硬双限」后，旧的「两者取严」措辞已不准确——现在是
+        「达软限暂停、达硬限才强制中断」，这句话同样承担着「旋钮很安全、别乱调」
+        的产品承诺，故守卫改为断言新的预算说明句。
+        """
         text = self._help("run")
         self.assertIn("99% 的用户不需要改这个", text)
-        self.assertIn("两者取严", text)
+        self.assertIn("达软限暂停", text)
+        self.assertIn("达硬限才强制中断", text)
 
     def test_run_help_explains_adaptation_default(self):
         text = self._help("run")

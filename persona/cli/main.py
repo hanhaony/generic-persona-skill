@@ -18,7 +18,7 @@ from __future__ import annotations
 import argparse
 import platform
 import sys
-from typing import Sequence
+from typing import Callable, Sequence
 
 from .. import STAGE, __version__
 from ..core.enums import NAMESPACE_WRITE_GATE, ProvenanceNamespace, TaskStatus
@@ -33,7 +33,8 @@ EXIT_INTERRUPTED = 130
 #: 清单里必须标注"（未指定，默认）"（P5.1 §3.1.2）。
 DEFAULT_ADAPTATION = "原著"
 
-#: 单任务预算默认值（USD）。与 `.env.example` 的 `PERSONA_MODEL_MAX_COST_PER_TASK` 一致。
+#: 历史遗留常量：曾作为 `--budget` 的默认值（0.25）。P0 起 `--budget` 默认 `None`
+#: （即取 .env 的 `PERSONA_BUDGET_SOFT_LIMIT`，默认 2.00），此处仅作 getattr 兜底。
 DEFAULT_BUDGET_USD = 0.25
 
 #: `persona chat --memory-write` 的可选值。**产品面只暴露两个**：
@@ -102,8 +103,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--vocabulary", default="l1",
         help="特征词表：l1（默认）/ l2（= l2-zh-classical，中文古典层 42 个标签）")
     p_run.add_argument(
-        "--budget", type=float, default=0.25,
-        help="单次任务最多花多少美元（默认 0.25）。项目累计上限由配置控制，两者取严。")
+        "--budget", type=float, default=None,
+        help="单次任务的预算软上限（美元）。省略时取 .env 的 PERSONA_BUDGET_SOFT_LIMIT"
+             "（默认 2.00）；给出则覆盖它。达软限暂停询问是否继续，达硬限才强制中断。")
     p_run.add_argument(
         "--extract-temperature", dest="extract_temperature", type=float, default=None,
         help="抽取温度（默认 0.7 = 生产值）。99%% 的用户不需要改这个。"
@@ -143,8 +145,9 @@ def build_parser() -> argparse.ArgumentParser:
              "会话级模拟记忆并注入上下文；至少 2 个字、不能全是停用词"
              "（「我」「这个」这类会被拦——一个字就能命中库里每条记忆）")
     p_chat.add_argument(
-        "--budget", type=float, default=DEFAULT_BUDGET_USD,
-        help=f"本次最多花多少美元（默认 {DEFAULT_BUDGET_USD}）")
+        "--budget", type=float, default=None,
+        help="本次对话的预算软上限（美元）。省略时取 .env 的 PERSONA_BUDGET_SOFT_LIMIT"
+             "（默认 2.00）；给出则覆盖它。达软限暂停询问是否继续，达硬限才强制中断。")
     p_chat.add_argument("--db", default="", help="数据库路径（默认取配置）")
     p_chat.add_argument("--project", default="prj_local", help="项目 ID（默认 prj_local）")
     p_chat.add_argument(
@@ -1350,15 +1353,23 @@ def _print_run_plan(plan: Any, stack: Any, *, names: list[str], work_title: str,
           f"--vocabulary l2 启用 42 个中文古典标签）")
 
     currency = plan.currency
-    if budget is None:
-        print(f"  模型费用上限  : 未设置（单任务）")
+    model_info = (stack.describe().get("model") or {})
+    soft = model_info.get("soft_limit")
+    hard = model_info.get("hard_limit")
+    if soft is not None:
+        print(f"  预算（软上限）: {soft:.2f} {currency}（达此值暂停询问；"
+              f"y 则软限抬升 2.00 继续，n 则安全退出）")
     else:
-        print(f"  模型费用上限  : {budget:.2f} {currency}（单任务，按 task_id 累计）")
+        print("  预算（软上限）: 未启用（不暂停）")
+    if hard is not None:
+        print(f"  预算（硬上限）: {hard:.2f} {currency}（达此值强制中断，防烧钱）")
+    else:
+        print("  预算（硬上限）: 未启用")
 
+    # 遗留累计上限（PERSONA_MODEL_MAX_COST）：新配置已改软硬双限，仅作兼容展示
     total_cap = getattr(getattr(settings, "model", None), "max_cost", None)
-    if budget is not None and total_cap is not None and total_cap <= budget:
-        print(f"  累计上限      : {total_cap:.2f} {currency}"
-              f"（配置值，与 --budget 取严 → 本次实际生效 {min(total_cap, budget):.2f}）")
+    if total_cap is not None:
+        print(f"  累计上限（遗留）: {total_cap:.2f} {currency}")
 
     if plan.est_model_cost is None:
         print("  预估模型费用  : 估不出来（缺单价或 token 估算）")
@@ -1371,14 +1382,18 @@ def _print_run_plan(plan: Any, stack: Any, *, names: list[str], work_title: str,
               f" EST_TOKENS 常量；见 docs/P5_1_REAL_RUN.md §9.5）")
 
     ledger = stack.describe().get("ledger") or {}
+    # P0：展示**本次任务**口径（排除历史），新开任务恒为 0.0000 ——
+    # 历史账单绝不污染新任务（验收标准①）。
+    occupied_session = ledger.get("occupied_session", 0.0)
+    print(f"  账本已占用（本次任务）: {occupied_session:.6f} {currency}"
+          "（新开任务从 0 起算，历史账单不计入）")
     if ledger.get("hydrated"):
-        print(f"  账本已占用    : {ledger.get('occupied_total', 0.0):.6f} {currency}"
-              "（本库历史，含此前运行）")
+        print(f"  历史账单（不计入本次）: {ledger.get('occupied_total', 0.0):.6f} {currency}"
+              "（本库此前运行的历史支出）")
     elif dry:
         # `--dry` 不碰数据库（不建表、不读历史）。既然读不到，就不能假装算出
         # "本次实际生效 0.25"——累计上限是**减去已用额之后**才生效的。
-        print("  账本已占用    : 未读取（--dry 不碰数据库，累计已用额未知；"
-              "上面的\"实际生效\"未扣除历史支出）")
+        print("  历史账单      : 未读取（--dry 不碰数据库）")
     print("  边界          : 清单之外不会有任何调用；出现清单外的调用即为缺陷")
 
 
@@ -1386,6 +1401,7 @@ def _cmd_run(args: Any) -> int:
     """`persona run`：真实检索 + 模型抽取 + 档案（**要过一次确认**）。"""
     from ..config import load_settings
     from ..core.context import new_call_context
+    from ..core.errors import ErrorCategory, ErrorCode
     from ..core.result import error_of, is_err, unwrap
     from ..orchestrator import (
         BusinessRequest,
@@ -1441,7 +1457,7 @@ def _cmd_run(args: Any) -> int:
     if out_dir_arg:
         overrides["PERSONA_DATA_DIR"] = out_dir_arg
     if budget is not None:
-        overrides["PERSONA_MODEL_MAX_COST_PER_TASK"] = str(float(budget))
+        overrides["PERSONA_BUDGET_SOFT_LIMIT"] = str(float(budget))
 
     loaded = load_settings(use_dotenv=not getattr(args, "no_dotenv", False),
                            overrides=overrides)
@@ -1483,6 +1499,9 @@ def _cmd_run(args: Any) -> int:
             _explain_missing_extractor(stack)
             return 1
 
+        # P0：注入软上限暂停回调（抽取与对话共用同一份 limits，注入一次即可）
+        _inject_soft_limit_handler(stack)
+
         specs = [
             TargetSpec(display_name=name, entity_type=entity_type,
                        work_title=work_title, adaptation_version=adaptation)
@@ -1511,13 +1530,13 @@ def _cmd_run(args: Any) -> int:
                   f"请设 PERSONA_MODEL_MAX_CALLS={model_calls}（或更大）。")
             print("  说明：本次**没有发起任何请求**。")
             return 1
-        if (budget is not None and plan.est_model_cost is not None
-                and plan.est_model_cost > float(budget)):
+        if (limits.soft_limit is not None and plan.est_model_cost is not None
+                and plan.est_model_cost > float(limits.soft_limit)):
             print()
             print(f"预算不足：本次计划 {model_calls} 次模型调用、"
                   f"预估 {plan.est_model_cost:.4f} {plan.currency}，"
-                  f"--budget 只给了 {float(budget):.3f}。")
-            print("  要么调大 --budget，要么少传几个名字。")
+                  f"预算软上限只给了 {float(limits.soft_limit):.3f}。")
+            print("  要么调大 --budget / PERSONA_BUDGET_SOFT_LIMIT，要么少传几个名字。")
             print("  说明：本次**没有发起任何请求**。")
             return 1
 
@@ -1553,7 +1572,15 @@ def _cmd_run(args: Any) -> int:
         result = stack.orchestrator.run(
             ctx, BusinessRequest(targets=targets, materials=[], max_rounds=1))
         if is_err(result):
-            print(f"运行失败：{error_of(result)}")
+            err = error_of(result)
+            if err.category == ErrorCategory.BUDGET_EXCEEDED:
+                if err.code == ErrorCode.BUDGET_PAUSED:
+                    print(f"[预算暂停] {err.message}；已生成的档案与记忆均已保存，"
+                          f"可稍后继续。")
+                    return EXIT_OK
+                print(f"[预算上限] {err.message}；已生成的档案与记忆均已保存。")
+                return EXIT_OK
+            print(f"运行失败：{err}")
             return 1
         run = unwrap(result)
 
@@ -1628,6 +1655,44 @@ def _authorize_real_calls(
     return True
 
 
+def _make_soft_limit_handler() -> Callable[..., bool]:
+    """达软上限时的回调：TTY 下交互询问 y/n；非 TTY 下按已授权自动继续。
+
+    返回 `True` = 用户确认继续（CLI 会把软限抬升 `SOFT_LIMIT_INCREMENT_USD` 继续）；
+    返回 `False` = 用户选择暂停（CLI 收到 `BUDGET_PAUSED` 后安全保存并退出）。
+    """
+    def handler(session_cost: float = 0.0) -> bool:
+        if not _stdin_is_tty():
+            print(f"[预算提醒] 当前任务已消耗 {session_cost:.2f} USD"
+                  f"（非交互模式，按已授权自动继续；硬上限仍兜底）。")
+            return True
+        try:
+            ans = input(
+                f"[预算提醒] 当前任务已消耗 {session_cost:.2f} USD，是否继续？(y/n) "
+            ).strip().lower()
+        except EOFError:
+            print()
+            return False
+        return ans in ("y", "yes")
+    return handler
+
+
+def _inject_soft_limit_handler(stack: Any) -> None:
+    """把软上限暂停回调注入抽取与对话**共用的** `ModelCallLimits`（共享同一份对象）。
+
+    只注入一次即可：装配层已让两侧引用同一份 limits，任一侧抬升软限、另一侧同步。
+    若抽取器缺失（如纯对话场景），只注入对话侧也能覆盖。
+    """
+    handler = _make_soft_limit_handler()
+    deps_limits = getattr(getattr(getattr(stack, "dialogue", None), "deps", None),
+                          "limits", None)
+    if deps_limits is not None:
+        deps_limits.soft_limit_handler = handler
+    extractor = getattr(stack, "claim_extractor", None)
+    if extractor is not None and getattr(extractor, "limits", None) is not None:
+        extractor.limits.soft_limit_handler = handler
+
+
 # ---------------------------------------------------------------------------
 # chat（P6.2-c：第二个会花钱的命令）
 #
@@ -1672,13 +1737,14 @@ def _print_chat_plan(*, names: list[str], rounds: int, policy: str,
     else:
         print("  记忆写入      : off（默认。**一条都不写**：对话内容不会进长期记忆）")
     if budget is None:
-        print("  模型费用上限  : 未设置（单任务）")
+        print("  预算（软上限）: 未设置（达软限不暂停）")
     else:
-        print(f"  模型费用上限  : {float(budget):.2f} {currency}（单任务）")
+        print(f"  预算（软上限）: {float(budget):.2f} {currency}（达此值暂停询问；"
+              f"y 则抬升 2.00 继续，n 则安全退出）")
     print(f"  预估模型费用  : {estimated_usd:.6f} {currency}"
           "（按对话实测单价 0.0005/次，不是抽取用的 EST 常量）")
-    if occupied:
-        print(f"  账本已占用    : {occupied:.6f} {currency}（本库历史，含此前运行）")
+    print(f"  账本已占用（本次任务）: {float(occupied):.6f} {currency}"
+          "（新开任务从 0 起算，历史账单不计入）")
     print("  边界          : 清单之外不会有任何调用；出现清单外的调用即为缺陷")
 
 
@@ -1735,6 +1801,7 @@ def _cmd_chat(args: Any) -> int:
 
     from ..config import load_settings
     from ..core.context import new_call_context
+    from ..core.errors import ErrorCategory
     from ..core.result import error_of, is_err, unwrap
     # 全部经协调层：CLI 不许直连 `persona.modules`（D-059 / F-7）。
     from ..orchestrator import (
@@ -1788,6 +1855,8 @@ def _cmd_chat(args: Any) -> int:
         # 对话要调模型，`offline_only=true` 下装配层根本不会构造真实 Provider。
         "PERSONA_OFFLINE_ONLY": "false",
     }
+    if budget is not None:
+        overrides["PERSONA_BUDGET_SOFT_LIMIT"] = str(float(budget))
     explicit_db = str(getattr(args, "db", "") or "").strip()
     if explicit_db:
         # 确认文件放在**数据库旁边**：换库 = 重新问一次，符合"记住的是这个库"。
@@ -1831,6 +1900,9 @@ def _cmd_chat(args: Any) -> int:
             _explain_missing_chat_provider(stack)
             return 1
 
+        # P0：注入软上限暂停回调（抽取与对话共用同一份 limits，注入一次即可）
+        _inject_soft_limit_handler(stack)
+
         services = ReadServices(
             storage=stack.storage, ctx=ctx, evidence=stack.evidence,
             persona=stack.persona, relationship=stack.relationship,
@@ -1854,8 +1926,10 @@ def _cmd_chat(args: Any) -> int:
         limits = model_limits_from_settings(settings)
         _print_chat_plan(
             names=[display for _, display in people], rounds=rounds, policy=policy,
-            estimated_usd=estimated_usd, budget=budget, currency=currency,
-            db_path=db_path, occupied=stack.ledger.occupied_cost(), topic=topic)
+            estimated_usd=estimated_usd, budget=limits.soft_limit,
+            currency=currency,
+            db_path=db_path, occupied=stack.ledger.session_occupied_cost(),
+            topic=topic)
 
         if limits.max_calls is not None and rounds > int(limits.max_calls):
             print()
@@ -1863,18 +1937,20 @@ def _cmd_chat(args: Any) -> int:
                   f"请设 PERSONA_MODEL_MAX_CALLS={rounds}（或更大）。")
             print("  说明：本次**没有发起任何请求**。")
             return 1
-        if budget is not None and estimated_usd > float(budget):
+        if limits.soft_limit is not None and estimated_usd > float(limits.soft_limit):
             print()
             print(f"预算不足：本次计划 {rounds} 次模型调用、预估 "
-                  f"{estimated_usd:.4f} {currency}，--budget 只给了 {float(budget):.3f}。")
-            print("  要么调大 --budget，要么减少 --rounds。")
+                  f"{estimated_usd:.4f} {currency}，预算软上限只给了 "
+                  f"{float(limits.soft_limit):.3f}。")
+            print("  要么调大 --budget / PERSONA_BUDGET_SOFT_LIMIT，要么减少 --rounds。")
             print("  说明：本次**没有发起任何请求**。")
             return 1
 
         # 授权：与 `persona run` **同一个函数、同一份 `.persona_consent.json`**。
         if not _authorize_real_calls(
             data_root=data_root, searches=0, model_calls=rounds,
-            estimated_usd=estimated_usd, budget_usd=budget, currency=currency,
+            estimated_usd=estimated_usd, budget_usd=limits.soft_limit,
+            currency=currency,
             yes=bool(getattr(args, "yes", False)),
         ):
             return 1
@@ -1908,7 +1984,11 @@ def _cmd_chat(args: Any) -> int:
                         continue
                 turn = stack.dialogue.run_round(ctx, session.id, message)
                 if is_err(turn):
-                    print(f"第 {index + 1} 轮失败：{error_of(turn)}")
+                    err = error_of(turn)
+                    if err.category == ErrorCategory.BUDGET_EXCEEDED:
+                        print(f"[预算] {err.message}；已完成的轮次与记忆均保留。")
+                        break
+                    print(f"第 {index + 1} 轮失败：{err}")
                     return 1
                 view = unwrap(turn)
                 done += 1

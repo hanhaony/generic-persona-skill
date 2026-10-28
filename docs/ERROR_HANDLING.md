@@ -39,6 +39,7 @@
 | `EXTERNAL_QUOTA` | 供应商配额耗尽 | ⛔ | ⛔ | 配置 / 财务 |
 | `STORAGE` | 数据库读写失败、锁冲突 | ✅（读失败与锁冲突） | ✅ | Storage |
 | `BUDGET_EXCEEDED` | 预算耗尽 | ⛔ | ✅（续跑） | Orchestrator |
+| `BUDGET_PAUSED` | 达模型费用**软上限**，暂停等待用户确认（P0：y → 软限抬升继续 / n → 安全退出；类别同 `BUDGET_EXCEEDED`） | ⛔ | ✅（续跑） | Orchestrator |
 | `CANCELLED` | 任务被用户取消 | ⛔ | ⛔ | Orchestrator |
 | `INVARIANT_VIOLATION` | 违反 INV-1~INV-4 等硬约束 | ⛔ | ⛔ | 实现缺陷（严重） |
 | `INTERNAL` | 未预期的程序缺陷 | ⛔ | ⛔ | 实现缺陷 |

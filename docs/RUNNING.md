@@ -2490,10 +2490,42 @@ P6.3 一次加了 3 个码（`VALIDATION_TOPIC_TOO_{BROAD,SHORT,LONG}`），**�
 
 ---
 
+## 5.45 P0 预算体验修复：账单隔离 + 全局单任务「软硬双限」（2026-10-28）
+
+**拍板**：放弃「分阶段独立预算」的复杂方案，改为**全局单任务软硬双限**——一次完整任务
+（`run` 五阶段或任意轮 `chat`）共享一套总额度，历史账单绝不污染本次任务。
+
+### 5.45.1 改了什么
+
+| # | 改动 | 说明 |
+| --- | --- | --- |
+| 1 | **账单隔离（致命 Bug 修复）** | 模型预算线的费用基线从 `occupied_cost()`（含 hydrate 历史笔）改为 `session_occupied_cost()`（**本次任务/进程口径，排除历史**）；新开任务/会话时终端「账本已占用」从 **0.0000** 起算，历史花费只影响遗留的「项目累计上限」 |
+| 2 | **新配置键** | `PERSONA_BUDGET_SOFT_LIMIT`（软上限，默认建议 2.00）/ `PERSONA_BUDGET_HARD_LIMIT`（硬上限，建议 5.00）；旧键 `PERSONA_MODEL_MAX_COST` / `_PER_TASK` 降级为**遗留回退**（仅当软硬限都未配时近似生效），配了软硬限后不再叠加封顶 |
+| 3 | **软限暂停机制** | 新错误码 `BUDGET_PAUSED`（类别仍归 `BUDGET_EXCEEDED`，`research.py` 既有分支可直接接住）：本次任务花费达软限 → 经 `ModelCallLimits.soft_limit_handler` 询问「是否继续？(y/n)」；**y → 软限原地抬升 `SOFT_LIMIT_INCREMENT_USD`（2.00）继续**，n / 非交互拒绝 → `BUDGET_PAUSED` 安全保存退出；硬限达值 → 照旧 `BUDGET_EXCEEDED` 强制中断（防死循环烧钱） |
+| 4 | **`--budget` 透传修复** | 此前 `--budget` 只改打印、不改实际拦截阈值；现在 `run` / `chat` 的 `--budget` 正确覆盖 `PERSONA_BUDGET_SOFT_LIMIT`（默认 `None` = 跟随 `.env`） |
+| 5 | **装配层共享 limits** | `assembly.py` 里抽取器与对话**共用同一份 `ModelCallLimits` 实例**（`shared_limits`）——软限抬升是运行期原地改 `soft_limit`，两侧各持一份会「重复弹窗」；且**只从 `model_limits_from_settings(settings)` 派生**，不再读注入的 `claim_extractor.limits`（假抽取器没有该属性会装配失败） |
+| 6 | **CLI 友好提示** | `run` / `chat` 计划打印「账本已占用（本次任务）」与软/硬上限；预算类错误按 `BUDGET_PAUSED`（提示已保存可继续）/ `BUDGET_EXCEEDED`（提示达硬上限）分别给出文案，不再当失败报错；`chat` 循环遇预算错误 `break` 保留已完成轮次；授权确认文案「单任务上限」→「预算软上限」 |
+
+### 5.45.2 口径边界（容易搞混的三件事）
+
+- **软硬双限 / 单任务上限**：按 `session_occupied_cost()`（排除历史）——这是本次修复的核心诉求；
+- **遗留「项目累计上限」`max_cost_total`**：仍按 `occupied_cost()`（**含历史**）——它的存在意义就是跨进程累计闸门（G11 闭合时的语义），**不是**回归；
+- **`ModelCallLimits` 从 `frozen` 改为可变**：只为支持软限运行期抬升；`max_calls`（本次进程次数上限）语义未变。
+
+### 5.45.3 验证
+
+- 新增 `tests/test_budget_soft_hard.py`（**11 项**）：新任务 0 起算 / 历史不污染 / 软限暂停（n）与继续（y，抬升 2.00）/ 硬限熔断 / 硬优先于软 / 次数上限 / 未知单价拦截 / CLI override / 遗留回退 / 真实 `.env` 加载；
+- 离线验收脚本 `scripts/acceptance_p0_budget.py`（**11 项全 PASS**）：用真实 `.env`（软 2.00 / 硬 5.00 / 单价 0.0003/1k）走真闸门 + 真 handler，含 ③ 的「软限弹 y/n、y 抬升、n 退出、硬限强制中断」全分支（软硬限机制验证时临时关 `max_calls`——默认 `max_calls=200` 对应 ≈0.66 USD，正常用不到 2.00 软限）；
+- `--dry` 实测：`run` / `chat` 计划打印「账本已占用（本次任务）: 0.000000 USD」与软 2.00 / 硬 5.00；
+- 全量 **1942 → 1953 项**通过（真实外呼 0）；`var/` 残留按 §v0.32 口径清理（非缺陷）。
+
+---
+
 ## 6. 变更历史
 
 | 日期 | 版本 | 变更 |
 | --- | --- | --- |
+| 2026-10-28 | v0.34 | **P0 预算体验修复：账单隔离 + 全局单任务「软硬双限」**（详见 §5.45）：模型预算线费用基线改 `session_occupied_cost()`（排除历史，新任务从 0.0000 起算）；新增 `PERSONA_BUDGET_SOFT_LIMIT=2.00` / `PERSONA_BUDGET_HARD_LIMIT=5.00`（旧键 `PERSONA_MODEL_MAX_COST`/`_PER_TASK` 降级遗留回退）；新错误码 `BUDGET_PAUSED`（已注册 `ERROR_SPEC`）+ `soft_limit_handler` 交互（y → 软限 +2.00 继续，n → 安全退出）；修 `--budget` 只改打印不改拦截的 Bug（现在正确覆盖软限）；抽取与对话共用同一份 `ModelCallLimits`；遗留「项目累计上限」仍含历史（G11 语义保留）。新增 `tests/test_budget_soft_hard.py` 11 项 + 离线验收脚本 `scripts/acceptance_p0_budget.py`（11 项全 PASS）；全量 **1942 → 1953 项**通过；真实外呼 0 | 待确认 |
 | 2026-10-21 | v0.26 | **P6.2-c：最小 `persona chat`**（第二个会花钱的命令）：`--names/--rounds/--message/--memory-write rule\|off`（默认 `off`）；`run` 与 `chat` 共用唯一实现 `_authorize_real_calls`（同一个 `.persona_consent.json`、同一套问法）；对话单价常量 `DIALOGUE_MEASURED_COST_PER_CALL_USD` 收进 `modules/dialogue.py`（评估脚本与 CLI 同一出处）；Ctrl-C 干净中止（记忆不回滚 / 会话必置 ENDED / 退出码 130）；为守 D-059，`SessionDraft` 与策略常量经 `orchestrator` 转发。新增 `tests/test_p6_2_chat_cli.py`（10 项，含 3 组变异验证）；全量 **1902 → 1912 项**通过；真实外呼 0 | 待确认 |
 | 2026-10-21 | v0.27 | **P6.2-d 真跑对账（6 次调用 / 0.0027285 USD）**：会话 A 四句逐条对账全部符合规则预期（R-EPI / R-REL 各 1 条，寒暄与问句不记）；verbatim 不变式成立（`content` 是用户原话完整子串）；账本 6 笔 CHAT = 会话 A 4 + 会话 B 2，检索 0 笔，与预期逐笔对上（`task_id` 全 null 是 D-C 的又一次印证）；**R1 本会话检索已在产品路径生效**（会话 A 第 3 轮起 `referenced_memory_ids` 非空），**R2 跨会话在产品路径永不触发**（`chat` 无 `--topic`，`topic` 恒 None）→分层结论：存储层/端口层能读到，prompt 注入层读不到，留给 P6.3；实际费用 0.91× 预估（未超 1.3 倍停止线）；`PERSONA_MODEL_MAX_CALLS=3` 会拦住 4 轮会话（用进程级环境变量覆盖，未改 `.env`）。真实库已备份 | 已验收 |
 | 2026-10-22 | v0.28 | **P6.3：`--topic` 跨会话检索入口**（补齐 R2 缺失的那一环）：显式 `--topic`（本期不做自动提取）；门禁 `topic_is_retrievable()` **一个纯函数、两处用法**（`start_session` Err / `_retrieve_memories` 跳过 R2 / CLI 花钱前拦）；停用词按**长度降序剥离**后判空（`我们的西厢记` 放行、`我` 拒），检索用原值不改写；新增 3 个错误码 `VALIDATION_TOPIC_TOO_{BROAD,SHORT,LONG}`（必须注册进 `ERROR_SPEC`）。真跑 A′→B′→C′ **6 次调用 / 0.0025677 USD（0.86× 预估）**：B′ 两层全过（`ref` 非空 + 答出"西厢记/崔莺莺"且无"资料没写"），C′ 全空仍拒答（不污染）；账本 6 笔 CHAT + 0 笔 SEARCH，`task_id` 全 null（D-C）。新增 `tests/test_p6_3_topic.py` 23 条 + **5 组变异验证**；全量 **1912 → 1935 项**通过；真实外呼 6 次（授权内） | 已验收 |

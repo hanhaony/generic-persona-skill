@@ -161,12 +161,13 @@ class ConsentQuestionTest(unittest.TestCase):
                                       budget_usd=0.05)
         self.assertIn("将要发生 2 次检索 + 2 次模型调用", text)
         self.assertIn("预估 0.007 USD", text)
-        self.assertIn("单任务上限 0.05 USD", text)
+        self.assertIn("预算软上限 0.05 USD", text)
         self.assertIn("[y/N]", text)
 
     def test_question_without_budget_omits_the_cap(self):
         text = consent.build_question(searches=1, model_calls=1, estimated_usd=0.0033,
                                       budget_usd=None)
+        self.assertNotIn("预算软上限", text)
         self.assertNotIn("单任务上限", text)
         self.assertIn("预估 0.003 USD", text)
 
