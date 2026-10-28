@@ -42,13 +42,18 @@ from persona.core.types import MAX_QUERY_LIMIT, Query
 from persona.modules.dialogue import (
     POLICY_MEMORY_WRITE_EXPLICIT,
     POLICY_MEMORY_WRITE_NONE,
+    POLICY_MEMORY_WRITE_RULE,
     DialogueDeps,
     DialogueService,
     SessionDraft,
 )
 from persona.modules.evidence import EvidenceDraft, EvidenceService, SourceDraft
 from persona.modules.memory import MemoryQuery, MemoryService
-from persona.modules.memory_writeback import derive_candidates, derive_report
+from persona.modules.memory_writeback import (
+    RULE_VERSION,
+    derive_candidates,
+    derive_report,
+)
 from persona.modules.persona import PersonaProfileDraft, PersonaService, ProfileSection
 from persona.modules.relationship import RelationshipService
 from persona.providers.base import (
@@ -80,6 +85,9 @@ class ScriptedProvider:
 
     def chat(self, ctx, req: ChatRequest):
         self.chat_calls += 1
+        # 记下本轮 system 消息，供跨会话 R2 注入断言用（只留最近一轮）。
+        self.last_system = "\n".join(
+            m.content for m in req.messages if m.role == "system")
         return Ok(ChatResponse(
             text="（脚本化回答）我记下了。",
             finish_reason="stop", model_id="scripted",
@@ -232,7 +240,7 @@ class TestPipelineAcceptsDerivedCandidates(WritebackIntegrationTest):
         self.assertEqual(row["scope_id"], sid)
         self.assertEqual(row["source_turn_id"], turn.id)
         self.assertEqual(self.fx.memory_kind(row), MemoryKind.EPISODIC.value)
-        self.assertIn("规则 v1", row["confidence_means"])
+        self.assertIn(RULE_VERSION, row["confidence_means"])
 
     def test_turn_row_persists_generated_memory_ids(self):
         """不只信返回值：库里那条轮次也必须记着"我生成了哪些记忆"。"""
@@ -337,6 +345,50 @@ class TestNoExternalCallsAndRetrievable(WritebackIntegrationTest):
         self.assertGreaterEqual(len(page.items), 1)
         self.assertTrue(all(i.namespace == ProvenanceNamespace.SIMULATED.value
                             for i in page.items))
+
+
+class TestSelfNameCrossSession(WritebackIntegrationTest):
+    """P0 第二阶段「渐进式熟人社会」：自述称呼跨会话持久化。
+
+    会话 A（`rule` 策略、产品路径：run_round 内部自动派生）说「你可以叫我小明」
+    → 记忆落库；会话 B（**同库新会话**、带可命中 topic）从记忆库检索到这条
+    记忆并在 R2 注入后出现在 system prompt 里——熟识称呼从此跨会话延续。
+    """
+
+    def test_self_name_written_by_rule_policy_and_read_back(self):
+        # 会话 A：rule 策略 + 不传候选（走 run_round 内部的 derive_report 自动派生）
+        sid_a = self.fx.start([self.a, self.b], policy=POLICY_MEMORY_WRITE_RULE,
+                              topic=None)
+        unwrap(self._round(sid_a, "你可以叫我小明，这样亲近些",
+                           pass_candidates=False))
+        rows = self.fx.memory_rows()
+        self.assertEqual(len(rows), 1, "rule 策略应自动派生并写入 1 条")
+        self.assertIn("叫我小明", str(rows[0]["payload"]))
+        self.assertEqual(self.fx.memory_kind(rows[0]),
+                         MemoryKind.SEMANTIC.value)
+
+        # 会话 B：同库新会话（同一 SQLite 文件、不同 session 行 = 跨会话），
+        # topic 用称呼本体（2 字以上、非停用词 → 门禁放行）
+        sid_b = self.fx.start([self.a, self.b], topic="小明")
+        self.assertNotEqual(sid_a, sid_b)
+        page = unwrap(self.fx.memory.search(
+            self.fx.ctx, MemoryQuery(text="小明", namespaces_include=None)))
+        self.assertGreaterEqual(len(page.items), 1, "会话 B 检索不到称呼记忆")
+        self.assertTrue(all(i.namespace == ProvenanceNamespace.SIMULATED.value
+                            for i in page.items))
+
+    def test_self_name_memory_is_injected_into_next_session_prompt(self):
+        """端到端：会话 B 跑一轮，R2 注入后称呼记忆真的进了 system prompt。"""
+        sid_a = self.fx.start([self.a, self.b], policy=POLICY_MEMORY_WRITE_RULE,
+                              topic=None)
+        unwrap(self._round(sid_a, "你可以叫我小明，这样亲近些",
+                           pass_candidates=False))
+        sid_b = self.fx.start([self.a, self.b], topic="小明")
+        unwrap(self._round(sid_b, "今日来访，想与你叙叙旧",
+                           pass_candidates=False))
+        system = getattr(self.fx.provider, "last_system", "")
+        self.assertIn("叫我小明", system,
+                      "R2 注入后称呼记忆必须出现在会话 B 的 system prompt 里")
 
 
 # ==========================================================================

@@ -26,7 +26,7 @@
 
 | 代码 | 条件 | kind |
 |---|---|---|
-| R-EXPL | 显式指令：记住/记着/别忘了/你记得 | SEMANTIC（salience 高） |
+| R-EXPL | 显式指令：记住/记着/别忘了/你记得；自述称呼：叫我X/称我X/喊我X（过 `_self_name_ok` 形状校验） | SEMANTIC（salience 高） |
 | R-REL | 态度变化 + 参与者指称：我现在觉得/我改主意了/我不再/我从前以为 | RELATION_DELTA |
 | R-EPI | 第一人称 + 时间/动作：昨天/今天/那天/后来/我去了/我读了/我梦见 | EPISODIC |
 | R-SEM | 第一人称 + 稳定语气：我一向/我素来/我最喜欢/我最讨厌/我从不 | SEMANTIC |
@@ -56,7 +56,9 @@ from dataclasses import dataclass
 from typing import Sequence
 
 #: 规则版本。写进 `confidence_means`，将来要回溯"这条记忆是哪版规则派生的"靠它。
-RULE_VERSION = "memory-rule-v1"
+#: v2（2026-10-28）：R-EXPL 追加自述称呼 cue「叫我/称我/喊我」，命中后过
+#: `_self_name_ok` 形状校验（第三者转述 / 祈使短语不放行）。
+RULE_VERSION = "memory-rule-v2"
 
 #: 单轮最多派生几条候选（防一句话命中三个 cue 就写三条）。
 MAX_CANDIDATES_PER_TURN = 2
@@ -142,10 +144,47 @@ RELATION_CUES: tuple[str, ...] = (
     "我现在倒觉得", "我改主意", "我改变了看法",
 )
 
+#: 自述称呼 cue（R-EXPL 追加，2026-10-28）：「叫我小明」族。
+#: 单列一份是为了 `_matches` 里能区分"传统指令命中"与"self-name 命中"——
+#: 后者必须再过 `_self_name_ok` 形状校验，前者照旧放行。
+SELF_NAME_CUES: tuple[str, ...] = ("叫我", "称我", "喊我")
+
 #: 显式指令 cue（R-EXPL）。
 EXPLICIT_CUES: tuple[str, ...] = (
     "记住", "记着", "别忘了", "你记得", "要记得", "别忘记",
+) + SELF_NAME_CUES
+
+#: 自述称呼的正则：cue 后紧跟 2-10 字称呼（中文/字母/数字，不含标点空白）。
+#: 不足 2 字（"叫我啊"）或超长都不是称呼。
+SELF_NAME_RE: re.Pattern[str] = re.compile(r"(?:叫|称|喊)我([\w一-龥]{2,10})")
+
+#: 第三者转述主语（出现即认定不是用户在自我介绍）。
+#: 只收**明确第三者**；"大家叫我小明"仍是用户在下指令，不拦。
+SELF_NAME_THIRD_SUBJECTS: tuple[str, ...] = (
+    "他们", "她们", "它们", "别人", "人家",
 )
+
+#: 称呼段首字若是这些祈使/否定字，视为动词短语而非称呼
+#: （"叫我别去""叫我走吧"）。真名首字撞上它们的概率可忽略。
+SELF_NAME_IMPERATIVE_HEADS: frozenset[str] = frozenset(
+    "别不莫勿少快去来做说想看听走站坐住等跟按照帮替管理放拿打骂催让使逼"
+)
+
+
+def _self_name_ok(sentence: str) -> bool:
+    """「叫我X」族命中后的形状校验：只放行**第一人称自述称呼**。
+
+    三道检查（全部确定性、无自然语言判断）：
+    1. 句中不含第三者转述主语（"他们叫我别去"）；
+    2. cue 后紧跟的 2-10 字段真实存在（正则形状）；
+    3. 该字段首字不是祈使/否定字（"别去"的"别"）。
+    """
+    if any(s in sentence for s in SELF_NAME_THIRD_SUBJECTS):
+        return False
+    m = SELF_NAME_RE.search(sentence)
+    if m is None:
+        return False
+    return m.group(1)[0] not in SELF_NAME_IMPERATIVE_HEADS
 
 #: 第一人称（R-EPI / R-SEM / R-REL 必须有）。
 FIRST_PERSON: tuple[str, ...] = ("我", "俺", "吾", "咱")
@@ -314,7 +353,20 @@ def _matches(rule: _Rule, sentence: str, participants: Sequence[tuple[str, str]]
             p in sentence for p in SECOND_PERSON
         ):
             return False
-    return any(cue in sentence for cue in rule.cues)
+    hit = any(cue in sentence for cue in rule.cues)
+    if not hit:
+        return False
+    if rule.code == "R-EXPL":
+        # 「叫我X」族必须过形状校验（防"他们叫我别去"混入）；但只要句中
+        # 还命中了传统显式指令（"记住"族），就按原样放行——不回退既有行为
+        # （"记住，他们叫我大哥"本来就是用户在下指令，照旧可记）。
+        strong_hits = [c for c in rule.cues
+                       if c in sentence and c not in SELF_NAME_CUES]
+        if strong_hits:
+            return True
+        if any(c in sentence for c in SELF_NAME_CUES):
+            return _self_name_ok(sentence)
+    return True
 
 
 def _salience(sentence: str, rule: _Rule) -> float:
@@ -333,7 +385,7 @@ def _candidate(sentence: str, rule: _Rule) -> dict:
         "kind": rule.kind,
         "content": sentence,
         "confidence": RULE_CONFIDENCE,
-        "confidence_means": f"用户单轮自述，未经核实（规则 v1：{rule.code}）",
+        "confidence_means": f"用户单轮自述，未经核实（{RULE_VERSION}：{rule.code}）",
         "salience": _salience(sentence, rule),
     }
 

@@ -152,6 +152,71 @@ class TestExplicitRule(unittest.TestCase):
         self.assertIn("R-EXPL", cands[0]["confidence_means"])
 
 
+class TestSelfNameRule(unittest.TestCase):
+    """R-EXPL 的「叫我X」族（P0 第二阶段「渐进式熟人社会」）。
+
+    自述称呼要能进长期记忆，跨会话的熟识称呼才有着落；但"他们叫我别去"
+    这类第三者转述绝不能记——所以 cue 命中后还要过 `_self_name_ok` 形状校验。
+    """
+
+    # ---- 正向：第一人称自述称呼 → 写入一条 SEMANTIC ----
+
+    def test_you_can_call_me_yields_semantic(self):
+        cands = derive_candidates("你可以叫我小明，这样亲近些")
+        self.assertEqual(len(cands), 1)
+        self.assertEqual(cands[0]["kind"], MemoryKind.SEMANTIC.value)
+        self.assertIn("R-EXPL", cands[0]["confidence_means"])
+        # verbatim：内容是原话切片
+        self.assertIn(cands[0]["content"], "你可以叫我小明，这样亲近些")
+
+    def test_call_me_variant_cheng_wo(self):
+        cands = derive_candidates("以后称我小昭便可，不必客气")
+        self.assertEqual(len(cands), 1)
+        self.assertIn("R-EXPL", cands[0]["confidence_means"])
+
+    def test_call_me_variant_han_wo(self):
+        cands = derive_candidates("以后就喊我灯哥好了")
+        self.assertEqual(len(cands), 1)
+
+    def test_ascii_name_is_accepted(self):
+        cands = derive_candidates("叫我Tony就行")
+        self.assertEqual(len(cands), 1)
+
+    def test_two_char_name_is_accepted(self):
+        cands = derive_candidates("你可以叫我阿雾，别这么见外")
+        self.assertEqual(len(cands), 1)
+
+    # ---- 反向：第三者转述 / 祈使短语 → 不写 ----
+
+    def test_third_person_relaying_is_rejected(self):
+        """"他们叫我别去"是转述他人指令，不是自我介绍。"""
+        self.assertEqual(derive_candidates("他们叫我别去"), [])
+
+    def test_other_people_relaying_is_rejected(self):
+        self.assertEqual(derive_candidates("别人叫我做事，我从来不听"), [])
+
+    def test_imperative_tail_is_rejected(self):
+        """「叫我」后跟祈使短语（别去/快走）不是称呼。"""
+        self.assertEqual(derive_candidates("你以后叫我别再提这事"), [])
+        self.assertEqual(derive_candidates("船家叫我快走，莫要回头"), [])
+
+    def test_question_form_is_vetoed_by_n1(self):
+        """问句优先否决（N1 在 R-EXPL 之前）。"""
+        self.assertEqual(derive_candidates("你可以叫我小明？"), [])
+
+    def test_bare_call_me_too_short_is_vetoed_by_n2(self):
+        """"叫我小明"整句 4 字 < 6 → N2 短句否决（既有防线，不为其开口子）。"""
+        self.assertEqual(derive_candidates("叫我小明"), [])
+
+    # ---- 不回退：传统显式指令照旧放行 ----
+
+    def test_strong_explicit_cue_still_wins_even_with_call_me(self):
+        """句中命中"记住"族时按原样放行，形状校验不回退既有行为。"""
+        cands = derive_candidates("记住，他们叫我大哥")
+        self.assertEqual(len(cands), 1)
+        self.assertIn("R-EXPL", cands[0]["confidence_means"])
+
+
 # ==========================================================================
 # 2. 七条否决
 # ==========================================================================
