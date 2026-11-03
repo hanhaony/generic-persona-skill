@@ -743,7 +743,7 @@ class TestDryRun(unittest.TestCase):
         self.assertIn("WEB_CONTENT_BEGIN", system)
         self.assertIn("本次允许使用的主体", system)
         self.assertIn("pe_dryrun_awu", system)        # 白名单主体
-        self.assertIn("不得自造 ID", system)
+        self.assertIn("绝不要填名字本身", system)      # 白名单约束（灰度修正文案）
         self.assertIn("verbatim_quote", system)       # 输出 schema 嵌在规则里
 
     def test_user_message_carries_only_data_in_marked_blocks(self):

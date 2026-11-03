@@ -133,6 +133,10 @@ ISSUE_FORGED_METADATA_IGNORED = "FORGED_METADATA_IGNORED"      # 自报元数据
 ISSUE_MATERIAL_KEY_CORRECTED = "MATERIAL_KEY_CORRECTED"
 #: D-291：引文在多份材料里都逐字出现，只能按第一份归属（如实记录，不假装确定）
 ISSUE_MATERIAL_KEY_AMBIGUOUS = "MATERIAL_KEY_AMBIGUOUS"
+#: 灰度实测（Ben Affleck / Matt Damon）：模型没填白名单里的 `pe_xxx`，而是把
+#: 目标的**显示名**原样填进了 `subject_entity_ids`。显示名能对上 ⇒ 自动换算成
+#: 规范 ID 放行——但**必须留痕**：这不是模型的正确行为，只是被兜住了。
+ISSUE_SUBJECT_ALIAS_REMAPPED = "SUBJECT_ALIAS_REMAPPED"
 #: 两个**已启用** trait_tag 的维度之间族不一致（如 `dimension=TRAIT` 却贴了
 #: `music`）。按 D-283 **采纳标签族、保留原 dimension、如实记录**——不拒收：
 #: R4.3 实测同一个事实在不同来源被抽成不同维度（小提琴在 baike 是 HABIT、
@@ -417,6 +421,45 @@ def allowed_subject_ids(materials: Sequence[Any],
     return allowed
 
 
+def _alias_key(value: str) -> str:
+    """别名归一化：**忽略大小写与全部空白**（灰度实测 `Ben Affleck` /
+    `ben  affleck` / `benaffleck` 必须看成同一个人）。"""
+    return "".join(str(value).split()).casefold()
+
+
+def subject_alias_map(materials: Sequence[Any],
+                      targets: Sequence[Any] | None) -> dict[str, str]:
+    """实体别名容错映射：归一化显示名 → 规范主体 ID。**纯函数**。
+
+    为什么要有它（灰度实测）：模型偶尔无视"subject_entity_ids 只能从白名单选"
+    的指令，把目标的**显示名**（`Ben Affleck`）原样填进 `subject_entity_ids`。
+    严格白名单这时会把整条证据拒收（`UNKNOWN_SUBJECT`），英文人物实测因此
+    0 证据、整个 run 白花钱。显示名能唯一对上一个目标时，换算成规范 ID
+    放行并留痕（`ISSUE_SUBJECT_ALIAS_REMAPPED`）——证据是真的，只是写法错。
+
+    纪律（与 trait_tag"不自造标签"同源）：**归一化后发生碰撞（两个目标
+    折叠成同一个键）就不猜**——键直接丢弃，宁可拒收也不瞎改写。
+    材料侧只声明 ID（无显示名），而 ID 本身走精确白名单，不进本映射。
+    """
+    alias: dict[str, str] = {}
+    for target in targets or []:
+        entity_id = _text(_get(target, "entity_id")) or _text(
+            (target or {}).get("entity_id") if isinstance(target, dict) else "")
+        name = _text(_get(target, "display_name"))
+        if isinstance(target, dict):
+            name = name or _text(target.get("display_name") or target.get("name"))
+        if not entity_id or not name:
+            continue
+        key = _alias_key(name)
+        if not key:
+            continue
+        if key in alias and alias[key] != entity_id:
+            del alias[key]          # 碰撞：两个目标折叠成同一个键 ⇒ 不猜
+            continue
+        alias[key] = entity_id
+    return alias
+
+
 # --------------------------------------------------------------------------
 # 逐条校验
 # --------------------------------------------------------------------------
@@ -555,6 +598,7 @@ def _validate_item(
     dimension_values: tuple[str, ...],
     result: ClaimValidationResult,
     vocabulary: "TraitVocabulary | None" = None,
+    alias_map: dict[str, str] | None = None,
 ) -> None:
     """校验**一条**候选（顺序即文档里的检查顺序）。"""
     from ..core.enums import EvidenceTier
@@ -649,11 +693,32 @@ def _validate_item(
     if subject_checkable:
         unknown = [s for s in subjects if s not in allowed_subjects]
         if unknown:
-            _reject(result, item, REJECT_UNKNOWN_SUBJECT,
-                    f"第 {index} 条候选指出主体 {unknown}，"
-                    f"它们既不在材料声明的对象里、也不在本次目标里：疑似编造引用",
-                    key=key)
-            return
+            #: 别名容错（灰度实测）：模型把**显示名**填进 subject 时，只要显示名
+            #: 能唯一对上目标，就换算成规范 ID 放行并留痕——证据是真的，只是
+            #: 写法错。对不上的**一个都不少地照旧拒收**：防编造的闸门没有放松，
+            #: 这里救的只是"显示名 vs ID"这一种已实测的写法偏差。
+            remapped: list[str] = []
+            unrescued: list[str] = []
+            for s in subjects:
+                if s in allowed_subjects:
+                    remapped.append(s)
+                    continue
+                canonical = (alias_map or {}).get(_alias_key(s))
+                if canonical:
+                    remapped.append(canonical)
+                else:
+                    unrescued.append(s)
+            if unrescued:
+                _reject(result, item, REJECT_UNKNOWN_SUBJECT,
+                        f"第 {index} 条候选指出主体 {unrescued}，"
+                        f"它们既不在材料声明的对象里、也不在本次目标里：疑似编造引用",
+                        key=key)
+                return
+            issues.append(ISSUE_SUBJECT_ALIAS_REMAPPED)
+            result.issues.append(
+                f"item#{index}: 模型把显示名 {unknown} 填进了主体，"
+                f"已按别名映射换算为 {remapped}（留痕，不静默）")
+            subjects = remapped
 
     # —— confidence（缺省允许；给了就必须是 0~1 的数）——
     # `issues` 在这里声明是因为上面几段只 append 不改写；trait_tag 校验
@@ -969,6 +1034,7 @@ def validate_model_payload(
     views = build_material_views(materials)
     by_key = {v.key: v for v in views if v.key}
     allowed = allowed_subject_ids(materials, targets)
+    alias_map = subject_alias_map(materials, targets)
     tier_values = _enum_values(EvidenceTier)
     dimension_values = _enum_values(EvidenceDimension)
 
@@ -980,7 +1046,7 @@ def validate_model_payload(
             subject_checkable=bool(allowed), limits=limits,
             accepted_keys=accepted_keys, tier_values=tier_values,
             dimension_values=dimension_values, result=result,
-            vocabulary=vocabulary)
+            vocabulary=vocabulary, alias_map=alias_map)
 
     if not allowed:
         result.issues.append(ISSUE_SUBJECT_ALLOWLIST_EMPTY)

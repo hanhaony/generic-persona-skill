@@ -139,7 +139,7 @@ TAG_FROM_SUMMARY = "from-summary"
 #: **「名字 = ID」映射**，并明确"材料讲谁就填谁、不要按列表顺序或检索目标填"。
 #: R4.5 实测：只给裸 ID 时模型无从判断，26 条证据 25 条主体错绑，
 #: 两份档案的 traits 互相张冠李戴而条目数完全对得上。规则文本变了 ⇒ +1。
-PROMPT_VERSION = "g2-extract-2026-10-18c"
+PROMPT_VERSION = "g2-extract-2026-11-03a"
 
 # 拒收原因（**不静默丢弃**：每条都进 `ExtractionOutcome.rejected`）
 REJECT_EMPTY_MATERIAL = "EMPTY_MATERIAL"              # 材料无正文可抽取
@@ -1409,7 +1409,12 @@ class ProviderClaimExtractor:
             lines.append("本次允许使用的主体（名字 = 主体 ID）：")
             for name, entity_id in labels:
                 lines.append(f"- {name or '（名称未提供）'} = {entity_id}")
-            lines.append("subject_entity_ids 只能从上面这个列表里选，不得自造 ID。")
+            lines.append(
+                "subject_entity_ids 只能填上面等号**右边**的主体 ID"
+                "（形如 pe_xxx 的那串），**绝不要填名字本身**。")
+            lines.append(
+                "材料或你的表述里出现的是名字时，请先换算成对应 ID 再填："
+                f"例如看到「{labels[0][0] or '目标'}」就填 {labels[0][1]}。")
             lines.append(
                 "**每条 claim 的 subject_entity_ids 填的是「这条说法在讲的那个人」**："
                 "材料讲谁就填谁。同一份材料可能同时讲好几个人，也可能通篇讲的是"

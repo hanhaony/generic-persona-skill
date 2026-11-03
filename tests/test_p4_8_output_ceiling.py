@@ -168,9 +168,10 @@ class PerMaterialCapTest(unittest.TestCase):
         `g2-extract-2026-10-18b`：D-287 把规则 9/10 的**优先级**写进提示词
         （事实多于 N 时宁可少写、不要合并），规则文本变了 ⇒ 版本 +1。
         """
-        self.assertEqual(PROMPT_VERSION, "g2-extract-2026-10-18c")
+        self.assertEqual(PROMPT_VERSION, "g2-extract-2026-11-03a")
         #: 钉死"不是旧版本"——旧值回来说明有人改了提示词却没动版本。
-        for old in ("g2-extract-2026-10-17", "g2-extract-2026-10-18"):
+        for old in ("g2-extract-2026-10-17", "g2-extract-2026-10-18",
+                    "g2-extract-2026-10-18c"):
             self.assertNotEqual(PROMPT_VERSION, old)
 
     def test_cap_is_configurable_and_drives_both_prompt_and_ceiling(self):

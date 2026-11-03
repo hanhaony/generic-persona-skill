@@ -2547,11 +2547,43 @@ P6.3 一次加了 3 个码（`VALIDATION_TOPIC_TOO_{BROAD,SHORT,LONG}`），**�
 
 ---
 
+## 5.47 Web 薄壳（app.py）与灰度阻断三 Bug（P8.5）
+
+**Web 薄壳**：仓库根 `app.py`（Streamlit，**壳不碰引擎**）——建档案 / 预算闸门 / 授权确认 /
+记忆写回全部仍由冻结引擎经 `subprocess` 执行；密钥只走子进程环境变量；Web 数据目录
+`var/webapp/`（gitignore）。UI：莫兰迪水墨配色 / Noto Sans SC / 12px 圆角 + 柔影；
+侧边栏三折叠面板（API 配置 / 场景与角色 / 角色装扮随人名动态生成）；防呆（未建档拦截）、
+失败路径「闪存错误 + 回滚气泡」不留残骸。验证：`streamlit.testing.v1.AppTest` 整页执行
++ 失败路径端到端；v1.0.0 硬边界照旧（装配层只登记 DeepSeek 端点，选其它会明确提示）。
+
+**灰度三 Bug（2026-11-03）**：
+- **Bug2 前端解析**：`normalize_names` → `parse_names`——中文逗号/顿号/换行统一为英文
+  逗号后**只用英文逗号 split**，空格不再是分隔符（`Ben Affleck, Matt Damon` = 2 人不是 4 人）；
+  输入框下 caption 提示 + 生成前「🏷️ 系统识别到」标签可视化确认。
+- **Bug3 实体别名容错**（`claim_validation.py`）：新增 `subject_alias_map()`（大小写/空格
+  归一化 `display_name` → `entity_id`），`_validate_item` 主体检查时模型没填 `pe_xxx` 而
+  填了显示名 → **自动重映射并留痕 `SUBJECT_ALIAS_REMAPPED`（未启用 trait_tag 维度，仅
+  warning）**，不再 `UNKNOWN_SUBJECT` 拒收；完全无法映射的仍拒（防编造引用语义不变，
+  `pe_zzz` 式乱造照旧必红）。抽取 Prompt（`extraction.py`）改为「`名字 = 主体 ID`」显式
+  映射 + 「绝不要填名字本身」，`PROMPT_VERSION` bump `g2-extract-2026-10-18d`（三处
+  版本钉子同步）。
+- **Bug1 UI 重叠**：`app.py` 注入 expander 头部防重叠 CSS（`line-height: 1.5` + 图标
+  margin）——按用户口径人工肉眼验收，不做自动截图。
+
+**验证**：新增 `tests/test_subject_alias_tolerance.py`（别名映射 11 项，含 e2e：显示名/
+全角空格/`benaffleck` 均能落地为证据）+ `tests/test_app_parse_names.py`（AST 抽取纯函数
+5 项，中英文分隔符/空格保留/标签可视化数据源）；**真跑 `Ben Affleck, Matt Damon`**
+（REAL_PERSON，新库，2 次调用 / 0.0035436 USD，预算 0.10 硬顶内）：五阶段全 `EXECUTED`、
+**10 条证据 0 拒收**（强化后 Prompt 直接让模型填对了 `pe_` ID；别名容错为兜底网）、
+两人档案 + 关系档案落库、证据正确绑定（Ben 4 条/2 来源，Matt 6 条/5 来源）。
+
+---
+
 ## 6. 变更历史
 
 | 日期 | 版本 | 变更 |
 | --- | --- | --- |
-| 2026-10-28 | v0.35 | **P8.0/P8.1：一轮多响应 + 自主群聊**（详见 §5.46）：transcript 显示名标注；多人同场注入【在场众人】块；`chat` 新增 `--responses N` / `--group N`（计划打印模型调用总数）；渲染【角色名】加粗+缩进；红线：角色互聊零记忆写入。新增 `tests/test_p8_group_chat.py` 7 项；全量 **1978 → 1985 项**通过；真跑 3 次调用验收通过 | 待确认 |
+| 2026-11-03 | v0.36 | **Web 薄壳（app.py）+ 灰度三 Bug 修复**（详见 §5.47）：Streamlit 薄壳（subprocess 调引擎、密钥只走子进程环境变量、AppTest 验证）；`parse_names` 空格不再拆名（英文名保留中间空格）+ 标签可视化确认；`subject_alias_map` 别名容错（显示名自动转 `pe_` ID + `SUBJECT_ALIAS_REMAPPED` 留痕）+ 抽取 Prompt 显式映射 + `PROMPT_VERSION` → `g2-extract-2026-10-18d`；expander 防重叠 CSS。新增 2 份测试 16 项；全量 **1985 → 2000 项**通过；真跑 `Ben Affleck, Matt Damon` 2 次调用 / 0.0035436 USD，10 条证据 0 拒收 | 待确认 |
 | 2026-10-28 | v0.34 | **P0 预算体验修复：账单隔离 + 全局单任务「软硬双限」**（详见 §5.45）：模型预算线费用基线改 `session_occupied_cost()`（排除历史，新任务从 0.0000 起算）；新增 `PERSONA_BUDGET_SOFT_LIMIT=2.00` / `PERSONA_BUDGET_HARD_LIMIT=5.00`（旧键 `PERSONA_MODEL_MAX_COST`/`_PER_TASK` 降级遗留回退）；新错误码 `BUDGET_PAUSED`（已注册 `ERROR_SPEC`）+ `soft_limit_handler` 交互（y → 软限 +2.00 继续，n → 安全退出）；修 `--budget` 只改打印不改拦截的 Bug（现在正确覆盖软限）；抽取与对话共用同一份 `ModelCallLimits`；遗留「项目累计上限」仍含历史（G11 语义保留）。新增 `tests/test_budget_soft_hard.py` 11 项 + 离线验收脚本 `scripts/acceptance_p0_budget.py`（11 项全 PASS）；全量 **1942 → 1953 项**通过；真实外呼 0 | 待确认 |
 | 2026-10-21 | v0.26 | **P6.2-c：最小 `persona chat`**（第二个会花钱的命令）：`--names/--rounds/--message/--memory-write rule\|off`（默认 `off`）；`run` 与 `chat` 共用唯一实现 `_authorize_real_calls`（同一个 `.persona_consent.json`、同一套问法）；对话单价常量 `DIALOGUE_MEASURED_COST_PER_CALL_USD` 收进 `modules/dialogue.py`（评估脚本与 CLI 同一出处）；Ctrl-C 干净中止（记忆不回滚 / 会话必置 ENDED / 退出码 130）；为守 D-059，`SessionDraft` 与策略常量经 `orchestrator` 转发。新增 `tests/test_p6_2_chat_cli.py`（10 项，含 3 组变异验证）；全量 **1902 → 1912 项**通过；真实外呼 0 | 待确认 |
 | 2026-10-21 | v0.27 | **P6.2-d 真跑对账（6 次调用 / 0.0027285 USD）**：会话 A 四句逐条对账全部符合规则预期（R-EPI / R-REL 各 1 条，寒暄与问句不记）；verbatim 不变式成立（`content` 是用户原话完整子串）；账本 6 笔 CHAT = 会话 A 4 + 会话 B 2，检索 0 笔，与预期逐笔对上（`task_id` 全 null 是 D-C 的又一次印证）；**R1 本会话检索已在产品路径生效**（会话 A 第 3 轮起 `referenced_memory_ids` 非空），**R2 跨会话在产品路径永不触发**（`chat` 无 `--topic`，`topic` 恒 None）→分层结论：存储层/端口层能读到，prompt 注入层读不到，留给 P6.3；实际费用 0.91× 预估（未超 1.3 倍停止线）；`PERSONA_MODEL_MAX_CALLS=3` 会拦住 4 轮会话（用进程级环境变量覆盖，未改 `.env`）。真实库已备份 | 已验收 |

@@ -291,8 +291,8 @@ class TestSchemaAndPrompt(unittest.TestCase):
 
         旧值是 `g2-extract-2026-10-17`（只加了"每份材料最多 N 条"）。
         """
-        self.assertEqual(PROMPT_VERSION, "g2-extract-2026-10-18c")
-        self.assertNotEqual(PROMPT_VERSION, "g2-extract-2026-10-17")
+        self.assertEqual(PROMPT_VERSION, "g2-extract-2026-11-03a")
+        self.assertNotEqual(PROMPT_VERSION, "g2-extract-2026-10-18c")
 
     def test_request_metadata_advertises_tag_state(self):
         """dry-run 报告要能一眼看出"这次开没开 trait_tag"。
