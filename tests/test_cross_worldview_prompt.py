@@ -17,7 +17,7 @@
 
 身份块（build_identity_block）同时承担表达 DNA 注入：
 expression_style 非空时必须进 prompt，且带"不要像 AI 助手一样礼貌刻板"。
-对应 prompt 版本 `p8-era-2026-11-03a`（幂等键，改 prompt 必须 bump）。
+对应 prompt 版本 `p8-crossuniverse-2026-11-04a`（幂等键，改 prompt 必须 bump）。
 """
 
 from __future__ import annotations
@@ -308,7 +308,7 @@ class CrossWorldviewPromptTest(unittest.TestCase):
 
     def test_prompt_version_bumped_for_era_block(self):
         """身份块改了 prompt 文本 ⇒ 版本必须 +1（幂等键由它参与生成）。"""
-        self.assertEqual(DIALOGUE_PROMPT_VERSION, "p8-era-2026-11-03a")
+        self.assertEqual(DIALOGUE_PROMPT_VERSION, "p8-crossuniverse-2026-11-04a")
 
 
 if __name__ == "__main__":  # pragma: no cover

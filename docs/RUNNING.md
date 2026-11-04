@@ -2615,10 +2615,55 @@ P6.3 一次加了 3 个码（`VALIDATION_TOPIC_TOO_{BROAD,SHORT,LONG}`），**�
 
 ---
 
+## 5.49 P0 群聊体验升级：跨宇宙认知 + 群像法则（2026-11-04 P0）
+
+**问题**：用户 5 人跨阵营实测（小罗伯特·唐尼 = 现实人物，托尼/史蒂夫/皮特 =
+漫威，布鲁斯 = DC）暴露"复读机群聊"——① 所有人用差不多长的句子互相问
+「你是谁/怎么称呼」，内容高度重叠；② 同阵营战友（托尼×史蒂夫）互相客套
+自我介绍，比陌生人还生分；③ 现实演员面对自己演过的角色毫无反应。
+
+**根因**：`_assemble_context` 只注入"有哪些人在场"，从没告诉模型**谁认识
+谁**（而这恰好是登记数据里的确定性事实）；prompt 也从没说过"要说得跟别人
+不一样"。调度层 `select_speaker`（least_recently_spoken）只决定"谁说话"
+不管"怎么说"，**不是根因，本轮未动**。
+
+**修复（引擎 dialogue.py）**：
+- **静态块 `P0_GROUP_DYNAMICS_RULES`**（对所有人可见，措辞中性：无时代词、
+  无「一、」式编号、无具体人名——守卫测试钉住）：① 群像法则——回复长度与
+  方式由角色自身性格决定（内敛深沉者一两句甚至只做动作；活泼年轻者可长篇
+  大论、抢话、挑新话题），严禁所有人用相近字数与句式；② 防复读——别人
+  问过的问题绝不再问，改为直接回应/评价反驳/沉默只做动作。
+- **跨宇宙认知**：`_participant_worlds` 读 `PersonEntity` 的 `entity_type` +
+  `fictional_character_meta.works`；纯函数 `build_awareness_block` 四种判定，
+  多人时注入【在场认知】块：同作品（`normalize_work_title` 归一化后相交）
+  =旧识免客套、跨作品=陌生人不得装熟、REAL×FICTIONAL=素不相识但**允许一次**
+  「我演过TA」式吐槽、REAL×REAL=按档案。**认知许可与事实分离**：引擎只注入
+  认识/不认识/可以吐槽的许可，具体关系（战友/师徒）与"是否真演过"仍以档案
+  与模型世界知识为准，档案没写的不编（防幻觉红线不变）。
+- `DIALOGUE_PROMPT_VERSION` → `p8-crossuniverse-2026-11-04a`（钉子同步）。
+
+**修复（Web 壳 app.py）**：混合世界观建档——旧壳全局单一作品名（一次 run
+整批统一 `--type` + `--work-title`），混合阵营无法一次建档。现在：
+- 面板 2 逐名配置行（名字 / 类型下拉 / 作品输入，真实人物显示"现实世界"）；
+- `group_build_specs()`：真实人物合一批、虚构角色按**归一化作品名**分批
+  （与引擎 `normalize_work_title` 同款规则——分批错 = 认知错）；虚构角色
+  未填作品 → 警告 + 按钮禁用；`build_profiles()` 分批调用 `run`，某批失败
+  立即停止不烧后面几批的钱；混合阵营 caption 显示分批数。
+
+**验证**：新增 `tests/test_group_awareness_prompt.py`（19 项：纯函数四组合 +
+作品名归一化 + 端到端 prompt 逐字断言 + 静态守卫）与
+`tests/test_app_group_build_specs.py`（AST 抽取 6 项：三批分组 / 归一化合并 /
+真人合批 / 缺作品跳过）；AppTest 冒烟（逐名渲染 / 缺作品警告 / 分批提示）；
+全量回归 **2011 → 2036 项**（2035 绿 + 1 红 = 用户本地 `var/webapp` 数据目录
+守卫，非代码）。真跑验收待用户网页端实测。
+
+---
+
 ## 6. 变更历史
 
 | 日期 | 版本 | 变更 |
 | --- | --- | --- |
+| 2026-11-04 | v0.38 | **P0 群聊体验升级：跨宇宙认知 + 群像法则 + Web 混合世界观建档**（详见 §5.49）：dialogue 静态块 `P0_GROUP_DYNAMICS_RULES`（性格决定话多话少 + 防复读，中性措辞有守卫）+ 纯函数 `build_awareness_block`（读 `PersonEntity` 的 `entity_type`+`works`：同作品=旧识免客套、跨作品=陌生人、REAL×FICTIONAL=允许一次「我演过TA」吐槽、REAL×REAL=按档案；认知许可与事实分离），`DIALOGUE_PROMPT_VERSION` → `p8-crossuniverse-2026-11-04a`；app.py 逐名类型/作品配置 + `group_build_specs` 分批建档（归一化对齐引擎，分批错=认知错）。新增 2 份测试 25 项 + AppTest 冒烟；全量 **2011 → 2036 项**（2035 绿 + 1 红为用户本地 `var/webapp` 守卫） | 待确认 |
 | 2026-11-03 | v0.37 | **全链路泛用性：跨世界观自适应**（详见 §5.48）：抽取 Prompt 新增 dimension 语义表（SPEECH_STYLE 强制捕获说话方式），`PROMPT_VERSION` → `g2-extract-2026-11-03b`；dialogue 静态块去世界观 + 动态身份块（`era_hint` 时代分支互斥、表达 DNA 注入），`DIALOGUE_PROMPT_VERSION` → `p8-era-2026-11-03a`；新增 `tests/test_cross_worldview_prompt.py` 11 项；全量 **2000 → 2011 项**通过 | 待确认 |
 | 2026-11-03 | v0.36 | **Web 薄壳（app.py）+ 灰度三 Bug 修复**（详见 §5.47）：Streamlit 薄壳（subprocess 调引擎、密钥只走子进程环境变量、AppTest 验证）；`parse_names` 空格不再拆名（英文名保留中间空格）+ 标签可视化确认；`subject_alias_map` 别名容错（显示名自动转 `pe_` ID + `SUBJECT_ALIAS_REMAPPED` 留痕）+ 抽取 Prompt 显式映射 + `PROMPT_VERSION` → `g2-extract-2026-10-18d`；expander 防重叠 CSS。新增 2 份测试 16 项；全量 **1985 → 2000 项**通过；真跑 `Ben Affleck, Matt Damon` 2 次调用 / 0.0035436 USD，10 条证据 0 拒收 | 待确认 |
 | 2026-10-28 | v0.34 | **P0 预算体验修复：账单隔离 + 全局单任务「软硬双限」**（详见 §5.45）：模型预算线费用基线改 `session_occupied_cost()`（排除历史，新任务从 0.0000 起算）；新增 `PERSONA_BUDGET_SOFT_LIMIT=2.00` / `PERSONA_BUDGET_HARD_LIMIT=5.00`（旧键 `PERSONA_MODEL_MAX_COST`/`_PER_TASK` 降级遗留回退）；新错误码 `BUDGET_PAUSED`（已注册 `ERROR_SPEC`）+ `soft_limit_handler` 交互（y → 软限 +2.00 继续，n → 安全退出）；修 `--budget` 只改打印不改拦截的 Bug（现在正确覆盖软限）；抽取与对话共用同一份 `ModelCallLimits`；遗留「项目累计上限」仍含历史（G11 语义保留）。新增 `tests/test_budget_soft_hard.py` 11 项 + 离线验收脚本 `scripts/acceptance_p0_budget.py`（11 项全 PASS）；全量 **1942 → 1953 项**通过；真实外呼 0 | 待确认 |

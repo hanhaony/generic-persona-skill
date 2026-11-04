@@ -70,6 +70,53 @@ def parse_names(raw: str) -> list[str]:
     return [p.strip() for p in text.split(",") if p.strip()]
 
 
+def normalize_work_title(title: str) -> str:
+    """作品名归一化——与引擎 `dialogue.normalize_work_title` 同款规则。
+
+    为什么壳里也要归一化：引擎的跨宇宙认知按作品名判定"谁认识谁"。
+    用户给托尼填「漫威」、给皮特填「《漫威》 」，如果壳里按原文分组，
+    就会生成**两个**作品标签 → 引擎把同阵营战友判成陌生人。归一化
+    （去空白/书名号、小写）后同键同组，一个宇宙就是一个宇宙。
+    """
+    return re.sub(r"[\s《》〈〉「」]+", "", str(title or "")).casefold()
+
+
+def group_build_specs(role_types: dict[str, str],
+                      role_works: dict[str, str]) -> list[dict]:
+    """把逐名 (类型, 作品) 配置折叠成**最少批次**的建档分组。
+
+    引擎 `run` 的类型与作品是**整批统一**的（一次 run 只能带一个
+    `--type` + `--work-title`），所以混合阵营必须分组多次跑：
+    - 真实人物：全部合成一批（`--type REAL_PERSON`，无作品）；
+    - 虚构角色：按**归一化作品名**分组（同键 = 同一次 run = 同一宇宙）。
+
+    返回项形状 `{"entity_type": str, "work_title": str, "names": list[str]}`，
+    顺序稳定（真实组在前，作品组按首次出现排序）。类型/作品缺失的人名
+    直接跳过——调用方负责前置校验，这里绝不编造分组。
+    """
+    specs: list[dict] = []
+    real_names = [n for n, t in role_types.items()
+                  if t == "真实人物" and n]
+    if real_names:
+        specs.append({"entity_type": "REAL_PERSON",
+                      "work_title": "", "names": real_names})
+    grouped: dict[str, dict] = {}
+    for name, work in role_works.items():
+        if role_types.get(name) != "虚构角色" or not name:
+            continue
+        title = str(work or "").strip()
+        if not title:
+            continue
+        key = normalize_work_title(title)
+        if key in grouped:
+            grouped[key]["names"].append(name)
+        else:
+            grouped[key] = {"entity_type": "FICTIONAL_CHARACTER",
+                            "work_title": title, "names": [name]}
+    specs.extend(grouped.values())
+    return specs
+
+
 def pick_emoji(name: str) -> str:
     for key, emoji in CHAR_EMOJI.items():
         if key in name:
@@ -361,7 +408,6 @@ with st.sidebar:
     with st.expander("🏮 场景与角色配置", expanded=True):
         st.session_state.setdefault("group_name", DEFAULT_GROUP_NAME)
         st.session_state.setdefault("names_raw", "林黛玉,贾宝玉,薛宝钗")
-        st.session_state.setdefault("work_title", "")
         st.session_state.setdefault("user_name", "访客")
         st.session_state.setdefault("memory_topic", DEFAULT_GROUP_NAME)
         group_name = st.text_input("群名", key="group_name")
@@ -369,8 +415,6 @@ with st.sidebar:
             "人物名字（必填）", key="names_raw",
             placeholder="用逗号分隔，如：林黛玉,贾宝玉,薛宝钗")
         st.caption("💡 多个名字请用逗号分隔；英文名请保留中间空格。")
-        work_title = st.text_input("作品名称（选填）", key="work_title",
-                                   placeholder="如：红楼梦（现实人物可留空）")
         user_name = st.text_input("你的昵称", key="user_name")
         user_avatar_file = st.file_uploader(
             "你的头像", type=["png", "jpg", "jpeg", "webp"], key="user_avatar")
@@ -390,6 +434,42 @@ with st.sidebar:
         st.warning("人名没解析出来，检查一下分隔符。")
     if len(names) == 1:
         st.info("群聊至少要两位角色——再加一位吧，一个人开不了会话。")
+
+    # ---------- 混合世界观：每位人物独立的类型与作品（2026-11-04 P0）----------
+    #
+    # 为什么必须逐名配置：引擎的跨宇宙认知判定读 PersonEntity 的
+    # entity_type + fictional_character_meta.works——"谁认识谁"全靠它。
+    # 旧壳只有全局一个作品名，混合阵营（现实演员 + 两个作品的角色同场）
+    # 没法一次建档。真实人物一律归"现实世界"；虚构角色必须给作品名。
+    st.caption("🏷️ 每位人物的类型与作品（引擎判定「谁认识谁」的依据）：")
+    role_types: dict[str, str] = {}
+    role_works: dict[str, str] = {}
+    for name in names:
+        c1, c2, c3 = st.columns([1.6, 1.1, 2])
+        with c1:
+            st.markdown(
+                f"<div class='name-tag' style='width:96%;text-align:center'>"
+                f"{pick_emoji(name)} {name}</div>", unsafe_allow_html=True)
+        with c2:
+            role_types[name] = st.selectbox(
+                "类型", ("真实人物", "虚构角色"),
+                key=f"rtype_{name}", label_visibility="collapsed")
+        with c3:
+            if role_types[name] == "虚构角色":
+                role_works[name] = st.text_input(
+                    "作品", key=f"rwork_{name}", label_visibility="collapsed",
+                    placeholder="作品名，如：漫威 / 红楼梦")
+            else:
+                role_works[name] = ""
+                st.markdown("<div style='padding:.55rem 0;color:#8c8478;"
+                            "font-size:.88rem'>现实世界</div>",
+                            unsafe_allow_html=True)
+    missing_work = [n for n in names
+                    if role_types.get(n) == "虚构角色"
+                    and not str(role_works.get(n) or "").strip()]
+    if missing_work:
+        st.warning("这几位虚构角色还没填作品名：" + "、".join(missing_work)
+                   + "。不填的话引擎不知道TA属于哪个世界。")
 
     # ---------- 面板 3：角色装扮（随人名动态生成） ----------
     with st.expander("🎎 角色装扮", expanded=True):
@@ -426,12 +506,12 @@ with st.sidebar:
                    f"约 {per_msg_calls * CHAT_COST_PER_CALL_USD:.4f} USD）。")
 
         can_build = (len(names) >= 2 and bool(api_key)
-                     and provider == "DeepSeek" and bool(model_id))
-        if names:
-            st.caption("系统识别到以下人物（生成档案前请确认）：")
-            st.markdown(
-                " ".join(f"<span class='name-tag'>🏷️ {n}</span>" for n in names),
-                unsafe_allow_html=True)
+                     and provider == "DeepSeek" and bool(model_id)
+                     and not missing_work)
+        build_specs = group_build_specs(role_types, role_works)
+        if build_specs and len(build_specs) > 1:
+            st.caption(f"🧩 混合阵营：将分 {len(build_specs)} 批建档"
+                       "（真实人物一批、每个作品一批）。")
         build_btn = st.button("🚀 生成人物档案", use_container_width=True,
                               disabled=not can_build)
         if not api_key:
@@ -447,19 +527,34 @@ with st.sidebar:
 
 
 def build_profiles() -> None:
-    """触发引擎 `run`：检索公开资料 → 证据 → 人物/关系档案。约 0.008 USD。"""
-    if work_title.strip():
-        type_args = ["--work-title", work_title.strip()]
-    else:
-        type_args = ["--type", "REAL_PERSON"]
-    cli_args = (["run", "--names", ",".join(names), *type_args,
-                 "--out", str(DATA_DIR), "--budget", str(budget), "--yes"])
-    env = build_env(api_key, model_id, max_calls=200)
-    code, out, err = run_cli(cli_args, env, timeout=900.0)
-    if code != 0:
-        st.error("😤 档案没能生成：" + friendly_error(code, out, err))
-        show_debug(out, err)
+    """触发引擎 `run`：按 (类型, 作品) **分批**建档（混合世界观 2026-11-04 P0）。
+
+    引擎 `run` 的类型与作品整批统一，所以真实人物合一批、虚构角色按作品
+    各一批（分组逻辑见 `group_build_specs`）。每批 = 一次检索 + 抽取
+    （约 0.008 USD/批）；某批失败立即停止，不烧后面几批的钱。
+    """
+    specs = group_build_specs(role_types, role_works)
+    if not specs:
+        st.error("没有可建档的人物配置。")
         return
+    env = build_env(api_key, model_id, max_calls=200)
+    for i, spec in enumerate(specs, start=1):
+        label = (f"第 {i}/{len(specs)} 批："
+                 + "、".join(spec["names"])
+                 + (f"（{spec['work_title']}）" if spec["work_title"]
+                    else "（真实人物）"))
+        with st.spinner(f"📖 {label}——正在搜集资料..."):
+            cli_args = ["run", "--names", ",".join(spec["names"]),
+                        "--type", spec["entity_type"],
+                        "--out", str(DATA_DIR), "--budget", str(budget),
+                        "--yes"]
+            if spec["work_title"]:
+                cli_args += ["--work-title", spec["work_title"]]
+            code, out, err = run_cli(cli_args, env, timeout=900.0)
+        if code != 0:
+            st.error(f"😤 {label} 没能建档：" + friendly_error(code, out, err))
+            show_debug(out, err)
+            return
     # 逐个验证档案真的在库里（只读命令，不花钱）
     missing = []
     for name in names:
@@ -478,7 +573,7 @@ def build_profiles() -> None:
 
 
 if build_btn:
-    with st.spinner("📖 正在翻阅古籍获取档案..."):
+    with st.spinner("📖 正在搜集资料生成档案..."):
         build_profiles()
 
 # --------------------------------------------------------------------------

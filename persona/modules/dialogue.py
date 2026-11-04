@@ -179,7 +179,11 @@ DIALOGUE_MEASURED_COST_PER_CALL_USD = 0.0005
 #: 2026-10-28 第二次 bump（`p8-group-2026-10-28a`）：P8.1 群聊——多人同场时注入
 #: 【在场众人】块（在场者 + 最近一条他人发言 + 互动许可与红线）；transcript 从
 #: entity_id 改为显示名标注（访客标「访客」），模型这才分得清"刚才那句是谁说的"。
-DIALOGUE_PROMPT_VERSION = "p8-era-2026-11-03a"
+#: 2026-11-04 bump（`p8-crossuniverse-2026-11-04a`）：P0 群聊体验升级——
+#: 新增静态【群像法则】（性格决定话多话少 + 严禁复读他人问题）；多人会话
+#: 注入动态【在场认知】块（同作品=旧识免客套、跨作品/现实=陌生人、
+#: 现实演员遇自己演过的角色允许"我演过你"式吐槽）。
+DIALOGUE_PROMPT_VERSION = "p8-crossuniverse-2026-11-04a"
 
 # ---- 证据级引用（P6.0 N1）----
 #
@@ -280,6 +284,39 @@ P0_RELATIONSHIP_STAGES = (
     "不轻浮、不逾矩。"
 )
 
+# ---- P0 群聊体验升级：性格与长度控制 + 防复读（2026-11-04）----
+#
+# 为什么必须有这一块：用户跨世界观阵营实测（现实演员 + 两个作品的角色同场）
+# 暴露"复读机群聊"——所有人用差不多的长度互相问"你是谁/怎么称呼"，
+# 内容高度重叠。根因：prompt 只说了"可以互相接话"，从没说过**怎么说得
+# 不一样**；模型对每个角色都给出安全、等长、客套的回答。
+#
+# 两条法则（用户 P0 拍板文案，转写成对**所有世界观**都成立的中性表述）：
+#   1. 性格与长度控制：回复长度与方式由角色自身性格决定——内敛深沉者
+#      惜字如金（可只有动作），活泼年轻者可以长篇大论、抢话、挑新话题；
+#      严禁所有人用相近的字数与结构说话。
+#   2. 防复读：别人（访客或在场角色）刚问过的问题绝不再问一遍；
+#      想问的话改成直接回应、评价反驳、或沉默只做动作。
+#
+# ⚠️ 措辞纪律（同 P0_IMMERSION_RULES）：
+#   - **不得使用「一、二、三、」式编号**；
+#   - **不得出现任何时代的示例词、任何具体人名**（如某位寡言的漫画英雄）——
+#     本块对所有人可见，写死任何一方都是污染（跨世界观红线测试钉住）。
+P0_GROUP_DYNAMICS_RULES = (
+    "【群像法则：你的话多话少由你的性格决定】\n"
+    "· 你必须根据自身的性格决定回复的长度与方式：性格内敛、深沉、寡言的人，"
+    "一两句话甚至只一个动作、一个眼神就够了；性格活泼、年轻、话多的人，"
+    "可以长篇大论、碎碎念、主动挑起新话题，甚至抢话打断别人。\n"
+    "· 严禁所有人用相近的字数与句式说话：看看上一句有多长，"
+    "你的回应要么明显更短、要么明显更长，形态必须与在场者不同。\n"
+    "\n"
+    "【不要复读：别人说过的话，绝不再说一遍】\n"
+    "· 对话记录里已经有人问过的问题（比如问过名字、来历、来意），"
+    "你绝不可以再问一遍。\n"
+    "· 如果那个问题你本来也想问，改为：直接回应对方刚说的话、"
+    "对它评价或反驳、或者保持沉默只做一个动作。"
+)
+
 # ---- 全链路泛用性：身份与时代认知（2026-11-03 P0）----
 #
 # 为什么必须动态注入：此前 system prompt 的所有"口吻示例"都写死成古典腔
@@ -373,6 +410,87 @@ def build_identity_block(display_name: str, background: str,
             f"你的说话方式（你最核心的表达 DNA）：{expression_style}\n"
             "——这是你说话的灵魂：口头禅、幽默方式、脾气、句式长短都必须"
             "展现出来，不要像个 AI 助手一样礼貌刻板。")
+    return "\n".join(lines)
+
+
+# ---- P0 群聊体验升级：跨宇宙认知与阵营判定（2026-11-04）----
+#
+# 为什么必须有这一块：用户实测把不同阵营的角色拉进同一间屋（现实演员 +
+# 两个不同作品的角色），所有角色对所有人都走"初识客套"——同作品的
+# 战友互相自我介绍，比陌生人还生分；现实演员面对自己演过的角色也毫无
+# 反应。根因：`_assemble_context` 只注入了"有哪些人在场"，从没告诉模型
+# **谁认识谁**——而这恰好是登记数据里就有的确定性事实
+# （`PersonEntity.entity_type` + `fictional_character_meta.works`）。
+#
+# 判定（纯函数 `build_awareness_block`，全部确定性、零模型参与）：
+#   同作品（作品名归一化后相交）  → 旧识：免自我介绍、免初识礼数；
+#   跨作品（都是虚构、作品不相交）→ 陌生人：好奇/防备，不得假装认识；
+#   现实人物 × 虚构角色           → 素不相识，但**允许一次**「我演过你」
+#                                   式的破次元吐槽（是否真演过交给模型
+#                                   的世界知识，引擎不编造事实）；
+#   现实人物 × 现实人物           → 是否相识以档案为准，没写就按陌生人。
+#
+# ⚠️ 防幻觉红线的边界：本块注入的是**认知许可与认知边界**（认识/不认识/
+# 可以吐槽），不是关系事实——"战友/师徒/恋人"这类具体关系仍只能来自
+# 档案与关系档案，档案没写的不编（措辞已按此校准）。
+P0_AWARENESS_HEADER = "【在场认知：你与在场者的世界关系】"
+
+
+def normalize_work_title(title: str) -> str:
+    """作品名归一化：去空白与书名号、小写——同宇宙判定的键（纯函数）。"""
+    return re.sub(r"[\s《》〈〉「」]+", "", str(title or "")).casefold()
+
+
+def build_awareness_block(speaker: dict, others: list[dict]) -> str:
+    """构造【在场认知】块（纯函数，供测试直测）。
+
+    `speaker` / `others` 的形状：`{"name": str, "entity_type": str,
+    "works": list[str]}`——由 `_participant_worlds` 从 PersonEntity 读出。
+    `others` 为空时返回空串（单人不注入，省 token）。
+    """
+    if not others:
+        return ""
+    speaker_works: dict[str, str] = {}
+    for title in (speaker.get("works") or []):
+        if str(title):
+            speaker_works.setdefault(normalize_work_title(str(title)),
+                                     str(title))
+    speaker_real = str(speaker.get("entity_type") or "") == "REAL_PERSON"
+    lines = [P0_AWARENESS_HEADER]
+    for other in others:
+        name = str(other.get("name") or "")
+        if not name:
+            continue
+        other_real = str(other.get("entity_type") or "") == "REAL_PERSON"
+        other_keys = {normalize_work_title(str(t))
+                      for t in (other.get("works") or []) if str(t)}
+        shared = [speaker_works[k] for k in other_keys if k in speaker_works]
+        if speaker_real and not other_real:
+            lines.append(
+                f"· {name}：TA是虚构角色，而你是现实中的真人——你们素不相识。"
+                "但若TA恰好是你（曾）扮演或再熟悉不过的角色，你可以流露出"
+                "「我演过TA」式的震惊与幽默（仅此允许打破次元的吐槽）；"
+                "除此之外，不得声称与TA有任何真实交集。")
+        elif not speaker_real and other_real:
+            lines.append(
+                f"· {name}：TA来自现实世界，不是你故事里的人——"
+                "你完全不认识TA。请依据你的性格，对这位跨世界而来的访客"
+                "表现出好奇、防备或探究；不得把TA当成你世界里的人。")
+        elif shared:
+            lines.append(
+                f"· {name}：你们同属《{shared[0]}》，彼此本就相识——"
+                "不必对TA自我介绍、也不必行初识礼数，直接以旧识的方式相处；"
+                "你们之间的具体关系以档案与关系档案为准，档案没写的不编。")
+        elif speaker_real and other_real:
+            lines.append(
+                f"· {name}：你们同为现实人物，是否相识须以档案与关系档案为准；"
+                "档案没写就按素未谋面对待，可以试探性打招呼，"
+                "不得虚构共同经历。")
+        else:
+            lines.append(
+                f"· {name}：TA来自另一部作品，与你的世界没有交集——"
+                "你完全不认识TA。请依据你的性格，对这位陌生人表现出好奇、"
+                "防备或探究；不得假装认识TA，也不得把TA当成你世界里的人。")
     return "\n".join(lines)
 
 # ---- 各分区注入时的标签（P6.0 N2）----
@@ -1396,6 +1514,15 @@ class DialogueService:
         # 2026-11-03 P0：显示名映射前移（原在函数后段）——身份块需要
         # 发言人的显示名 / 背景 / 说话方式，供 `_build_messages` 顶端注入。
         names = self._participant_display_names(ctx, session_row)
+        # 2026-11-04 P0：跨宇宙认知——同作品=旧识、跨作品/现实=陌生人、
+        # 现实演员遇自己演过的角色允许吐槽（判定数据源：PersonEntity）。
+        worlds = self._participant_worlds(ctx, participants)
+        awareness_block = ""
+        if len(participants) > 1:
+            awareness_block = build_awareness_block(
+                worlds.get(speaker_entity_id, {}),
+                [worlds[p] for p in participants
+                 if p != speaker_entity_id and p in worlds])
         speaker_identity: dict[str, str] = {}
         for pid in participants:
             view = self.deps.profiles.get_persona(ctx, pid)
@@ -1501,6 +1628,7 @@ class DialogueService:
             "others_in_room": others,
             "last_other_line": last_other_line,
             "speaker_identity": speaker_identity,
+            "awareness_block": awareness_block,
             "referenced_memory_ids": [v.id for v in memory_views],
             "referenced_persona_item_ids": referenced_persona,
             "referenced_relationship_item_ids": referenced_relationship,
@@ -1527,6 +1655,33 @@ class DialogueService:
                 if name:
                     names[pid] = name
         return names
+
+    def _participant_worlds(
+        self, ctx: CallContext, participants: list[str]
+    ) -> dict[str, dict]:
+        """参与者 entity_id → 世界观三元组（读不到的给空值，绝不炸轮次）。
+
+        跨宇宙认知判定的数据源：`entity_type`（REAL_PERSON / FICTIONAL_
+        CHARACTER）与 `fictional_character_meta.works` 的作品名——登记时由
+        `--work-title` 确定性写入，不做任何推断。
+        """
+        meta: dict[str, dict] = {}
+        for pid in participants:
+            row = self.deps.storage.get(ctx, "PersonEntity", pid)
+            if not is_err(row) and row.value is not None:
+                payload = row.value
+                works = [
+                    str(w.get("title") or "")
+                    for w in ((payload.get("fictional_character_meta") or {})
+                              .get("works") or [])
+                    if isinstance(w, dict) and str(w.get("title") or "")
+                ]
+                meta[pid] = {
+                    "name": _text(payload.get("display_name")) or pid,
+                    "entity_type": _text(payload.get("entity_type")),
+                    "works": works,
+                }
+        return meta
 
     # -------------------------------------------------- 上下文渲染（P6.0 N1/N2）
 
@@ -1636,7 +1791,8 @@ class DialogueService:
                 identity.get("name", ""), identity.get("background", ""),
                 identity.get("expression_style", ""))
         system += ("\n\n" + P0_IMMERSION_RULES + "\n\n"
-                   + P0_RELATIONSHIP_STAGES)
+                   + P0_RELATIONSHIP_STAGES + "\n\n"
+                   + P0_GROUP_DYNAMICS_RULES)
         # ---- P8.1（2026-10-28）：群聊模式·在场众人 ----
         #
         # 多人同场时，模型此前只知道"参与角色档案有好几份"，却不知道自己
@@ -1655,6 +1811,14 @@ class DialogueService:
             lines.append("（红线：其他角色说过的话是**对话里的话**，不是档案事实——"
                          "可以接话，不得把它当成既定设定转述。）")
             system += "\n\n" + "\n".join(lines)
+        # ---- P0（2026-11-04）：跨宇宙认知与阵营判定 ----
+        #
+        # 紧随【在场众人】：在场者名单告诉模型"有谁"，这一块告诉模型
+        # "谁认识谁"——同作品的旧识不必客套，跨作品的陌生人不得装熟，
+        # 现实演员面对自己演过的角色允许一次破次元吐槽。
+        awareness = context.get("awareness_block") or ""
+        if awareness:
+            system += "\n\n" + awareness
         system += "\n\n"
         system += "参与角色档案（仅作为角色设定参考，不得编造档案外信息）：\n"
         system += "\n".join(context["persona_briefs"]) or "（无）"
