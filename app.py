@@ -15,11 +15,13 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import urllib.request
 from pathlib import Path
 
 import streamlit as st
@@ -159,6 +161,102 @@ def pick_emoji(name: str) -> str:
         if key in name:
             return emoji
     return EMOJI_POOL[sum(ord(c) for c in name) % len(EMOJI_POOL)]
+
+
+# --------------------------------------------------------------------------
+# 实体分类推断（2026-11-04 P0 前端瘦身：用户只输名字，真实/虚构自动判）
+# --------------------------------------------------------------------------
+
+_CLASSIFY_PROMPT = (
+    "你是人物资料助手。对下面每个人名，判断TA是真实存在的公众人物"
+    "（real）还是文艺作品中的虚构角色（fictional）。虚构角色给出TA最著名的"
+    "作品/世界观名（如：林黛玉→红楼梦，皮特帕克→漫威，布鲁斯韦恩→DC）；"
+    "真实人物 work 留空。拿不准一律算 real。\n"
+    "只输出 JSON 数组，格式："
+    '[{"name":"人名原样","kind":"real|fictional","work":"作品名或空串"}]，'
+    "不要输出任何其它文字。")
+
+
+def parse_classifications(raw: str, names: list[str]) -> dict[str, dict[str, str]]:
+    """解析分类模型的输出 → {name: {"kind": REAL_PERSON|FICTIONAL_CHARACTER, "work": str}}。
+
+    宽松解析：优先 json.loads，失败再用正则抠 JSON 片段；再失败就全部兜底
+    REAL_PERSON（引擎会按真实人物去搜索——宁可多搜一次，不可错标虚构）。
+    虚构但作品名为空的一律降级为 REAL_PERSON（虚构没作品 = 引擎无法判宇宙，
+    不如按真人搜索）。名字匹配做大小写/空格归一化。
+    """
+    default = {"kind": "REAL_PERSON", "work": ""}
+    result = {name: dict(default) for name in names}
+    if not raw or not names:
+        return result
+
+    entries: list[dict] = []
+    try:
+        loaded = json.loads(raw)
+        if isinstance(loaded, dict):        # 允许 {"people": [...]} 之类的包裹
+            for value in loaded.values():
+                if isinstance(value, list):
+                    entries = [e for e in value if isinstance(e, dict)]
+                    break
+        elif isinstance(loaded, list):
+            entries = [e for e in loaded if isinstance(e, dict)]
+    except (json.JSONDecodeError, ValueError):
+        match = re.search(r"\[.*\]", raw, re.S)
+        if match:
+            try:
+                entries = [e for e in json.loads(match.group(0))
+                           if isinstance(e, dict)]
+            except (json.JSONDecodeError, ValueError):
+                entries = []
+
+    def _norm(s: str) -> str:
+        return re.sub(r"\s+", "", str(s or "")).lower()
+
+    by_norm = {_norm(n): n for n in names}
+    for entry in entries:
+        name = by_norm.get(_norm(str(entry.get("name", ""))))
+        if name is None:
+            continue
+        kind_raw = str(entry.get("kind", "")).lower()
+        work = str(entry.get("work", "") or "").strip()
+        is_fictional = ("fiction" in kind_raw or "虚构" in kind_raw
+                        or "fake" in kind_raw)
+        if is_fictional and work:
+            result[name] = {"kind": "FICTIONAL_CHARACTER", "work": work}
+        # fictional 但没作品 / kind 含糊 → 保持 REAL_PERSON 兜底
+    return result
+
+
+def classify_names(names: list[str], api_key: str, base_url: str,
+                   model_id: str) -> dict[str, dict[str, str]]:
+    """一次极低成本（≈0.0001 USD）的模型调用，推断人名的真实/虚构与作品名。
+
+    任何失败（网络/密钥/超时/输出不可解析）都返回全部 REAL_PERSON 兜底，
+    绝不让这个辅助步骤挡住建档主流程。
+    """
+    default = {name: {"kind": "REAL_PERSON", "work": ""} for name in names}
+    if not names or not api_key:
+        return default
+    url = (base_url or DEFAULT_API_BASE).rstrip("/") + "/chat/completions"
+    payload = json.dumps({
+        "model": model_id or "deepseek-chat",
+        "messages": [{"role": "user",
+                      "content": _CLASSIFY_PROMPT + "\n人名：" +
+                                 json.dumps(names, ensure_ascii=False)}],
+        "temperature": 0.0,
+        "max_tokens": 500,
+    }).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, method="POST", headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        text = body["choices"][0]["message"]["content"]
+    except Exception:  # noqa: BLE001 —— 推断是锦上添花，失败就走真人兜底
+        return default
+    return parse_classifications(text, names)
 
 
 def save_avatar(upload, role_key: str) -> str | None:
@@ -340,13 +438,21 @@ st.markdown(
         border: 1px solid #eee4d8;
         border-radius: 12px;
       }
-      /* —— expander 头部防重叠（灰度实测：标题与图标挤在一起）——
-         方案升级：直接隐藏默认箭头图标（用户要求），文字独占头部；
-         保留 padding 与 line-height 重置，排版干净 */
+      /* —— expander 图标兜底隐藏（前两轮温和方案公网实测仍重叠 → 暴力方案）——
+         选择器不依赖 Streamlit 内部 testid 结构：details 原生标记 + svg 一网打尽 */
+      details summary::-webkit-details-marker {
+        display: none !important;
+      }
+      details summary svg,
+      [data-testid="stExpander"] summary svg,
+      [data-testid="stExpander"] summary .material-icons,
+      [data-testid="stExpander"] summary [data-testid="stExpanderToggleIcon"] {
+        display: none !important;
+      }
+      details summary,
       [data-testid="stExpander"] summary {
-        padding: 0.65rem 1rem 0.65rem 12px;
+        padding-left: 0 !important;
         line-height: 1.5;
-        min-height: 2.2rem;
         font-weight: 600 !important;
         font-size: 16px !important;
         color: #5c4f46 !important;
@@ -356,15 +462,6 @@ st.markdown(
       [data-testid="stExpander"] summary span {
         margin: 0;
         line-height: 1.5;
-      }
-      /* 隐藏折叠面板默认的箭头图标（svg / material 图标 / 原生 details 标记） */
-      [data-testid="stExpander"] summary svg,
-      [data-testid="stExpander"] summary .material-icons,
-      details summary::-webkit-details-marker {
-        display: none !important;
-      }
-      [data-testid="stExpander"] summary [data-testid="stExpanderToggleIcon"] {
-        display: none !important;
       }
       .name-tag {
         display: inline-block;
@@ -399,6 +496,15 @@ DEFAULTS = {
     "profiles_ready": False,
     "built_names": [],         # 已确认有档案的人名
     "provider": "DeepSeek",
+    # widget 键的默认值统一在此落 session_state（首次渲染前初始化，
+    # 避免条件渲染与重挂载时的键缺失——AppTest 实测过这条坑）。
+    "base_url": PROVIDER_PRESETS["DeepSeek"]["base_url"],
+    "model_id": PROVIDER_PRESETS["DeepSeek"]["model_id"],
+    "budget": 2.0,
+    "group_name": DEFAULT_GROUP_NAME,
+    "names_raw": "林黛玉,贾宝玉,薛宝钗",
+    "user_name": "访客",
+    "memory_topic": DEFAULT_GROUP_NAME,
 }
 for key, value in DEFAULTS.items():
     st.session_state.setdefault(key, value)
@@ -410,6 +516,13 @@ def reset_chat_history() -> None:
     st.session_state.built_names = []
 
 
+def _sync_provider() -> None:
+    """切换服务商即带出预设（模块层定义：widget ID 哈希需要稳定标识）。"""
+    preset = PROVIDER_PRESETS.get(st.session_state.provider, {})
+    st.session_state.base_url = preset.get("base_url", DEFAULT_API_BASE)
+    st.session_state.model_id = preset.get("model_id", "")
+
+
 # --------------------------------------------------------------------------
 # 左侧边栏
 # --------------------------------------------------------------------------
@@ -417,62 +530,53 @@ def reset_chat_history() -> None:
 with st.sidebar:
     st.markdown("## 🏮 设置")
 
-    # ---------- 面板 1：模型 API 配置 ----------
-    with st.expander("📡 模型 API 配置", expanded=True):
-        # 标准模式：key + on_change 回调自动填充——切换服务商即带出预设，
-        # 用户仍可手改（带 value 参数的 key 会互相打架，这是 Streamlit 的坑）。
-        st.session_state.setdefault("base_url", PROVIDER_PRESETS["DeepSeek"]["base_url"])
-        st.session_state.setdefault("model_id", PROVIDER_PRESETS["DeepSeek"]["model_id"])
-
-        def _sync_provider() -> None:
-            preset = PROVIDER_PRESETS.get(st.session_state.provider, {})
-            st.session_state.base_url = preset.get("base_url", DEFAULT_API_BASE)
-            st.session_state.model_id = preset.get("model_id", "")
-
-        provider = st.selectbox("服务商", list(PROVIDER_PRESETS.keys()),
-                                key="provider", on_change=_sync_provider,
-                                help="v1.0.0 引擎目前仅登记 DeepSeek；"
-                                     "其它网关待核心装配层开放。")
-        base_url = st.text_input("Base URL", key="base_url",
-                                 help="当前版本仅 DeepSeek 官方端点生效；"
-                                      "自定义网关属于核心装配层的后续需求。")
-        model_id = st.text_input("Model ID", key="model_id",
-                                 placeholder="如 deepseek-chat")
-        api_key = st.text_input("API Key", type="password", key="api_key",
-                                placeholder="只存在本机内存里，绝不落盘")
-        budget = st.number_input("单次预算上限（美元）", min_value=0.05,
-                                 max_value=10.0, value=2.0, step=0.05,
-                                 help="引擎软上限：花到这个数会暂停询问。")
-        st.caption("🔐 密钥只经内存传给引擎子进程，不写盘、不进记录、不回显。")
+    # ---------- 面板 1：模型 API 配置（常驻） ----------
+    # 2026-11-04 P0：st.expander 的箭头图标与文字重叠（两轮 CSS 均被云端版本
+    # 脱靶）→ 侧边栏弃用 expander，改分区标题 + 常驻布局。API 与场景两块
+    # 是必填的第一步，常驻比折叠更好；只有纯可选的角色装扮用 toggle 门控
+    # （带 session 绑定的 widget 条件卸载有状态清扫风险，AppTest 实测过）。
+    st.markdown("**📡 模型 API 配置**")
+    provider = st.selectbox("服务商", list(PROVIDER_PRESETS.keys()),
+                            key="provider", on_change=_sync_provider,
+                            help="v1.0.0 引擎目前仅登记 DeepSeek；"
+                                 "其它网关待核心装配层开放。")
+    base_url = st.text_input("Base URL", key="base_url",
+                             help="当前版本仅 DeepSeek 官方端点生效；"
+                                  "自定义网关属于核心装配层的后续需求。")
+    model_id = st.text_input("Model ID", key="model_id",
+                             placeholder="如 deepseek-chat")
+    api_key = st.text_input("API Key", type="password", key="api_key",
+                            placeholder="只存在本机内存里，绝不落盘")
+    budget = st.number_input("单次预算上限（美元）", min_value=0.05,
+                             max_value=10.0, value=2.0, step=0.05,
+                             help="引擎软上限：花到这个数会暂停询问。")
+    st.caption("🔐 密钥只经内存传给引擎子进程，不写盘、不进记录、不回显。")
 
     if provider != "DeepSeek":
         st.warning("v1.0.0 的引擎只登记了 DeepSeek 端点；选其它服务商暂时跑不了，"
                    "等核心装配层开放后这里会自动生效。")
 
-    # ---------- 面板 2：场景与角色配置 ----------
-    with st.expander("🏮 场景与角色配置", expanded=True):
-        st.session_state.setdefault("group_name", DEFAULT_GROUP_NAME)
-        st.session_state.setdefault("names_raw", "林黛玉,贾宝玉,薛宝钗")
-        st.session_state.setdefault("user_name", "访客")
-        st.session_state.setdefault("memory_topic", DEFAULT_GROUP_NAME)
-        group_name = st.text_input("群名", key="group_name")
-        names_raw = st.text_input(
-            "人物名字（必填）", key="names_raw",
-            placeholder="用逗号分隔，如：林黛玉,贾宝玉,薛宝钗")
-        st.caption("💡 多个名字请用逗号分隔；英文名请保留中间空格。")
-        user_name = st.text_input("你的昵称", key="user_name")
-        user_avatar_file = st.file_uploader(
-            "你的头像", type=["png", "jpg", "jpeg", "webp"], key="user_avatar")
-        st.caption("不上传就默认 🙎‍♂️。")
+    # ---------- 面板 2：场景与角色配置（常驻） ----------
+    st.markdown("**🏮 场景与角色配置**")
+    group_name = st.text_input("群名", key="group_name")
+    names_raw = st.text_input(
+        "人物名字（必填）", key="names_raw",
+        placeholder="用逗号分隔，如：林黛玉,马斯克")
+    st.caption("💡 多个名字请用逗号分隔；英文名请保留中间空格。"
+               "真实/虚构身份会自动识别，不用你操心。")
+    user_name = st.text_input("你的昵称", key="user_name")
+    user_avatar_file = st.file_uploader(
+        "你的头像", type=["png", "jpg", "jpeg", "webp"], key="user_avatar")
+    st.caption("不上传就默认 🙎‍♂️。")
 
-        memory_on = st.toggle("跨会话记忆（记得住你说的话）", value=True,
-                              key="memory_on",
-                              help="引擎的确定性规则：只记**你的原话**，"
-                                   "角色互聊内容绝不入档。")
-        memory_topic = st.text_input(
-            "记忆锚点（--topic）", key="memory_topic",
-            help="角色只会召回**内容里包含这个词**的往事——建议用你聊天时"
-                 "会反复出现的词（作品名、常用称呼、地名）。至少 2 个字。")
+    memory_on = st.toggle("跨会话记忆（记得住你说的话）", value=True,
+                          key="memory_on",
+                          help="引擎的确定性规则：只记**你的原话**，"
+                               "角色互聊内容绝不入档。")
+    memory_topic = st.text_input(
+        "记忆锚点（--topic）", key="memory_topic",
+        help="角色只会召回**内容里包含这个词**的往事——建议用你聊天时"
+             "会反复出现的词（作品名、常用称呼、地名）。至少 2 个字。")
 
     names = parse_names(names_raw)
     if names_raw and not names:
@@ -480,46 +584,20 @@ with st.sidebar:
     if len(names) == 1:
         st.info("群聊至少要两位角色——再加一位吧，一个人开不了会话。")
 
-    # ---------- 混合世界观：每位人物独立的类型与作品（2026-11-04 P0）----------
+    # ---------- 混合世界观：自动推断（2026-11-04 P0 大瘦身）----------
     #
-    # 为什么必须逐名配置：引擎的跨宇宙认知判定读 PersonEntity 的
-    # entity_type + fictional_character_meta.works——"谁认识谁"全靠它。
-    # 旧壳只有全局一个作品名，混合阵营（现实演员 + 两个作品的角色同场）
-    # 没法一次建档。真实人物一律归"现实世界"；虚构角色必须给作品名。
-    st.caption("🏷️ 每位人物的类型与作品（引擎判定「谁认识谁」的依据）：")
-    role_types: dict[str, str] = {}
-    role_works: dict[str, str] = {}
-    for name in names:
-        c1, c2, c3 = st.columns([1.6, 1.1, 2])
-        with c1:
-            st.markdown(
-                f"<div class='name-tag' style='width:96%;text-align:center'>"
-                f"{pick_emoji(name)} {name}</div>", unsafe_allow_html=True)
-        with c2:
-            role_types[name] = st.selectbox(
-                "类型", ("真实人物", "虚构角色"),
-                key=f"rtype_{name}", label_visibility="collapsed")
-        with c3:
-            if role_types[name] == "虚构角色":
-                role_works[name] = st.text_input(
-                    "作品", key=f"rwork_{name}", label_visibility="collapsed",
-                    placeholder="作品名，如：漫威 / 红楼梦")
-            else:
-                role_works[name] = ""
-                st.markdown("<div style='padding:.55rem 0;color:#8c8478;"
-                            "font-size:.88rem'>现实世界</div>",
-                            unsafe_allow_html=True)
-    missing_work = [n for n in names
-                    if role_types.get(n) == "虚构角色"
-                    and not str(role_works.get(n) or "").strip()]
-    if missing_work:
-        st.warning("这几位虚构角色还没填作品名：" + "、".join(missing_work)
-                   + "。不填的话引擎不知道TA属于哪个世界。")
+    # 旧壳要求每位人物手动选「真实/虚构」+ 填作品名——对只想输名字就开聊的
+    # 用户极其反人类。现在点击「生成档案」时由 classify_names() 一次性推断
+    # （真实/虚构 + 虚构的最著名作品名），失败一律按真实人物兜底（引擎会去
+    # 搜索）。类型与作品是引擎「谁认识谁」的判定依据（跨宇宙认知），推断
+    # 结果经 group_build_specs() 分批传入建档。
 
-    # ---------- 面板 3：角色装扮（随人名动态生成） ----------
-    with st.expander("🎎 角色装扮", expanded=True):
-        nicknames: dict[str, str] = {}
-        char_avatars: dict[str, str | None] = {}
+    # ---------- 面板 3：角色装扮（可选） ----------
+    show_dress = st.toggle("🎎 角色装扮（可选）", value=False, key="show_dress",
+                           help="换昵称、传头像；不展开就直接用默认。")
+    nicknames: dict[str, str] = {}
+    char_avatars: dict[str, str | None] = {}
+    if show_dress:
         for name in names:
             c1, c2 = st.columns([1, 3])
             with c1:
@@ -537,34 +615,30 @@ with st.sidebar:
                                  key=f"avatar_{name}"),
                 role_key=f"char_{re.sub(r'\\W+', '_', name)}")
 
-        max_resp = max(1, len(names))
-        responses = st.slider("每条消息后，几位角色依次回应", 1, max_resp,
-                              value=min(2, max_resp), key="responses",
-                              help="后答的角色看得见先答角色的话。")
-        group_turns = st.slider("群聊互动轮数（角色自主互聊）", 0, 6, 3,
-                                key="group_turns",
-                                help="你说完之后角色自己接话的轮数；"
-                                     "互聊内容绝不进长期记忆。")
-        per_msg_calls = responses + group_turns
-        st.caption(f"💰 每条消息 ≈ 最多 {per_msg_calls} 次模型调用"
-                   f"（实测 ≈{CHAT_COST_PER_CALL_USD:.4f} USD/次，"
-                   f"约 {per_msg_calls * CHAT_COST_PER_CALL_USD:.4f} USD）。")
+    # ---------- 群聊节奏与建档按钮（常驻，不进装扮门控） ----------
+    max_resp = max(1, len(names))
+    responses = st.slider("每条消息后，几位角色依次回应", 1, max_resp,
+                          value=min(2, max_resp), key="responses",
+                          help="后答的角色看得见先答角色的话。")
+    group_turns = st.slider("群聊互动轮数（角色自主互聊）", 0, 6, 3,
+                            key="group_turns",
+                            help="你说完之后角色自己接话的轮数；"
+                                 "互聊内容绝不进长期记忆。")
+    per_msg_calls = responses + group_turns
+    st.caption(f"💰 每条消息 ≈ 最多 {per_msg_calls} 次模型调用"
+               f"（实测 ≈{CHAT_COST_PER_CALL_USD:.4f} USD/次，"
+               f"约 {per_msg_calls * CHAT_COST_PER_CALL_USD:.4f} USD）。")
 
-        can_build = (len(names) >= 2 and bool(api_key)
-                     and provider == "DeepSeek" and bool(model_id)
-                     and not missing_work)
-        build_specs = group_build_specs(role_types, role_works)
-        if build_specs and len(build_specs) > 1:
-            st.caption(f"🧩 混合阵营：将分 {len(build_specs)} 批建档"
-                       "（真实人物一批、每个作品一批）。")
-        build_btn = st.button("🚀 生成人物档案", use_container_width=True,
-                              disabled=not can_build)
-        if not api_key:
-            st.caption("⬆️ 先填 API Key 才能生成档案。")
-        if st.session_state.profiles_ready:
-            st.success(f"✅ 档案已加载：{'、'.join(st.session_state.built_names)}")
-            if parse_names(names_raw) != st.session_state.built_names:
-                st.caption("人名改过了——重新生成档案即可生效。")
+    can_build = (len(names) >= 2 and bool(api_key)
+                 and provider == "DeepSeek" and bool(model_id))
+    build_btn = st.button("🚀 生成人物档案", use_container_width=True,
+                          disabled=not can_build)
+    if not api_key:
+        st.caption("⬆️ 先填 API Key 才能生成档案。")
+    if st.session_state.profiles_ready:
+        st.success(f"✅ 档案已加载：{'、'.join(st.session_state.built_names)}")
+        if parse_names(names_raw) != st.session_state.built_names:
+            st.caption("人名改过了——重新生成档案即可生效。")
 
 # --------------------------------------------------------------------------
 # 生成档案（run）
@@ -572,16 +646,40 @@ with st.sidebar:
 
 
 def build_profiles() -> None:
-    """触发引擎 `run`：按 (类型, 作品) **分批**建档（混合世界观 2026-11-04 P0）。
+    """触发引擎 `run`：先自动推断真实/虚构，再按 (类型, 作品) **分批**建档。
 
-    引擎 `run` 的类型与作品整批统一，所以真实人物合一批、虚构角色按作品
-    各一批（分组逻辑见 `group_build_specs`）。每批 = 一次检索 + 抽取
+    推断（classify_names）失败一律按真实人物兜底——宁可多搜一次，不可错标
+    虚构。引擎 `run` 的类型与作品整批统一，所以真实人物合一批、虚构角色按
+    作品各一批（分组逻辑见 `group_build_specs`）。每批 = 一次检索 + 抽取
     （约 0.008 USD/批）；某批失败立即停止，不烧后面几批的钱。
     """
+    # 1) 实体分类推断（≈0.0001 USD，一次调用；结果按人名缓存防重复花钱）
+    cache_key = ",".join(names)
+    cached = st.session_state.get("classifications") or {}
+    if cached.get("_names") == cache_key:
+        classifications = {k: v for k, v in cached.items() if k != "_names"}
+    else:
+        with st.spinner("🔍 正在识别人物身份（真实 / 虚构）..."):
+            classifications = classify_names(names, api_key, base_url, model_id)
+        st.session_state["classifications"] = {"_names": cache_key,
+                                               **classifications}
+    role_types = {n: ("虚构角色" if c["kind"] == "FICTIONAL_CHARACTER"
+                      else "真实人物")
+                  for n, c in classifications.items()}
+    role_works = {n: c["work"] for n, c in classifications.items()}
+    inferred = "；".join(
+        f"{n}→{'虚构《' + role_works[n] + '》' if role_types[n] == '虚构角色' else '真实人物'}"
+        for n in names)
+    st.caption(f"🧠 已自动识别：{inferred}")
+
+    # 2) 分组建档（虚构没推断出作品的已被 parse_classifications 降级为真人）
     specs = group_build_specs(role_types, role_works)
     if not specs:
         st.error("没有可建档的人物配置。")
         return
+    if len(specs) > 1:
+        st.caption(f"🧩 混合阵营：分 {len(specs)} 批建档"
+                   "（真实人物一批、每个作品一批）。")
     env = build_env(api_key, model_id, max_calls=200)
     for i, spec in enumerate(specs, start=1):
         label = (f"第 {i}/{len(specs)} 批："

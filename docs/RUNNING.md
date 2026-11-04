@@ -2676,10 +2676,38 @@ P6.3 一次加了 3 个码（`VALIDATION_TOPIC_TOO_{BROAD,SHORT,LONG}`），**�
 
 ---
 
+## 5.51 Web 壳 P0：侧边栏去 expander + 实体分类自动推断（2026-11-04）
+
+- **重叠根治**：侧边栏 expander 全部移除（两轮温和 CSS 在云端版本脱靶后，
+  升级暴力 CSS `details summary svg` + `::-webkit-details-marker` 全隐藏作兜底，
+  覆盖主区错误气泡残留的调试 expander）。模型 API 与场景配置改为**常驻分区
+  标题**（必填第一步不该折叠）；角色装扮（纯可选）用 `st.toggle` 门控——
+  带.session 绑定的 widget 条件卸载有状态清扫风险（AppTest 实测
+  `KeyError: provider`），可选输入无此顾虑。
+- **前端瘦身**：删除逐名「真实/虚构」下拉与作品输入框；用户只输名字
+  （如 `林黛玉,马斯克`）。
+- **实体分类推断**：`classify_names()`（urllib 标准库直调 chat/completions，
+  一次调用 ≈0.0001 USD，temperature 0）+ 纯函数 `parse_classifications()`
+  （JSON 宽松解析；**虚构但没推断出作品名 → 降级 REAL_PERSON**——没作品
+  = 没宇宙，跨宇宙认知会错；宁可多搜一次，不可错标虚构）。任何网络/解析
+  失败全部兜底 REAL_PERSON，绝不挡建档主流程。结果按人名缓存进
+  session_state 防重复花钱，建档前给用户一行透明提示。
+- **widget 键初始化**：所有 session 绑定键统一在 `DEFAULTS` 落
+  `setdefault`（条件渲染/重挂载防键缺失）；`_sync_provider` 回调提至模块层
+  （嵌套定义的函数标识不稳定）。
+- **验证**：新增 `tests/test_app_classify_names.py` 10 项（JSON 解析/kind
+  别名归一/名字归一匹配/漏报兜底/虚构无作品降级/垃圾输出兜底/包裹结构/
+  与 group_build_specs 端到端集成）；AppTest 冒烟（常驻布局/装扮门控往返/
+  暴力 CSS 注入/纯名字输入无警告）；全量 **2036 → 2046 项**（2045 绿 +
+  1 红为用户本地 `var/webapp` 守卫）。
+
+---
+
 ## 6. 变更历史
 
 | 日期 | 版本 | 变更 |
 | --- | --- | --- |
+| 2026-11-04 | v0.40 | **Web 壳 P0：侧边栏去 expander + 实体分类自动推断**（详见 §5.51）：侧边栏 expander 全部移除（API/场景常驻分区、装扮 toggle 门控）+ 暴力 CSS 兜底；删除逐名类型/作品手动配置，改为 `classify_names()` 一次极低成本模型调用自动推断（虚构无作品降级真人、失败全兜底真人、结果缓存）；widget 键统一 `DEFAULTS` 初始化；新增 `tests/test_app_classify_names.py` 10 项；全量 **2036 → 2046 项**（2045 绿 + 1 红为用户本地 `var/webapp` 守卫） | 待确认 |
 | 2026-11-04 | v0.39 | **Web 壳上云准备**（详见 §5.50）：expander 默认箭头图标隐藏（四类选择器 `display:none`）+ 标题排版加粗；app.py 数据目录三级解析 `_resolve_data_dir()`（环境变量 > 本地 var/webapp 可写探测 > `tempfile.mkdtemp()` 会话临时目录并缓存防 rerun 换目录）；仓库根新增 `requirements.txt`（仅 `streamlit>=1.41`，核心引擎零依赖不变）；API Key 输入确认 `type="password"` | 待确认 |
 | 2026-11-04 | v0.38 | **P0 群聊体验升级：跨宇宙认知 + 群像法则 + Web 混合世界观建档**（详见 §5.49）：dialogue 静态块 `P0_GROUP_DYNAMICS_RULES`（性格决定话多话少 + 防复读，中性措辞有守卫）+ 纯函数 `build_awareness_block`（读 `PersonEntity` 的 `entity_type`+`works`：同作品=旧识免客套、跨作品=陌生人、REAL×FICTIONAL=允许一次「我演过TA」吐槽、REAL×REAL=按档案；认知许可与事实分离），`DIALOGUE_PROMPT_VERSION` → `p8-crossuniverse-2026-11-04a`；app.py 逐名类型/作品配置 + `group_build_specs` 分批建档（归一化对齐引擎，分批错=认知错）。新增 2 份测试 25 项 + AppTest 冒烟；全量 **2011 → 2036 项**（2035 绿 + 1 红为用户本地 `var/webapp` 守卫） | 待确认 |
 | 2026-11-03 | v0.37 | **全链路泛用性：跨世界观自适应**（详见 §5.48）：抽取 Prompt 新增 dimension 语义表（SPEECH_STYLE 强制捕获说话方式），`PROMPT_VERSION` → `g2-extract-2026-11-03b`；dialogue 静态块去世界观 + 动态身份块（`era_hint` 时代分支互斥、表达 DNA 注入），`DIALOGUE_PROMPT_VERSION` → `p8-era-2026-11-03a`；新增 `tests/test_cross_worldview_prompt.py` 11 项；全量 **2000 → 2011 项**通过 | 待确认 |
