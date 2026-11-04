@@ -334,7 +334,9 @@ class TestAnswerFormat(CtxTestCase):
         # 第四面墙禁令在场：封杀清单 + 活人身份声明
         self.assertIn("机器词汇或工程术语", system)
         self.assertIn("活生生的人", system)
-        self.assertIn("用你所在时代的角色身份去表达", system)
+        # 2026-11-03 P0：措辞随时代自适应改造更新（原"用你所在时代的角色身份去表达"）
+        self.assertIn("用你这个时代、你这个身份的人会说的话去表达", system)
+        self.assertIn("绝不用任何与你时代不符的腔调", system)
 
     def test_refusal_rule_is_three_tiered(self):
         """拒答规则必须是**三档**（RUNNING §5.26）。
@@ -415,7 +417,11 @@ class TestAnswerFormat(CtxTestCase):
         self.assertIn("主动反问访客", system)
 
     def test_p0_initial_identity_rule_present(self):
-        """P0 初始身份认知：不脑补性别年龄、中性称呼、合乎身份地探问。"""
+        """P0 初始身份认知：不脑补性别年龄、中性称呼、合乎身份地探问。
+
+        2026-11-03 P0：档案未标明时代（era UNKNOWN）→ 身份块走中性分支，
+        两侧字面示例都不出现；称呼交给"合乎你时代与身份"的自适应规则。
+        """
         service, provider = self._service()
         sid = self._session(service)
         unwrap(service.run_round(self.ctx, sid, "你好"))
@@ -423,7 +429,7 @@ class TestAnswerFormat(CtxTestCase):
         self.assertIn("初次见面的礼数", system)
         self.assertIn("严禁凭空脑补访客的性别、年龄", system)
         self.assertIn("中性称呼", system)
-        self.assertIn("阁下", system)
+        self.assertIn("合乎你时代与身份", system)
 
     def test_p1_relationship_stages_present(self):
         """第二阶段：关系发展三阶段（初识/熟识/老友）必须全部在场。"""

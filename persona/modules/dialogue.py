@@ -179,7 +179,7 @@ DIALOGUE_MEASURED_COST_PER_CALL_USD = 0.0005
 #: 2026-10-28 第二次 bump（`p8-group-2026-10-28a`）：P8.1 群聊——多人同场时注入
 #: 【在场众人】块（在场者 + 最近一条他人发言 + 互动许可与红线）；transcript 从
 #: entity_id 改为显示名标注（访客标「访客」），模型这才分得清"刚才那句是谁说的"。
-DIALOGUE_PROMPT_VERSION = "p8-group-2026-10-28a"
+DIALOGUE_PROMPT_VERSION = "p8-era-2026-11-03a"
 
 # ---- 证据级引用（P6.0 N1）----
 #
@@ -225,8 +225,8 @@ P0_IMMERSION_RULES = (
     "【最高优先级：你是一个活生生的人（第四面墙禁令）】\n"
     "严禁使用任何机器词汇或工程术语（如：资料没写、档案里没有、根据证据、"
     "数据库、系统无法回答、检索、记录显示）。你是一个活生生的人，"
-    "有喜怒哀乐和认知局限。遇到不知道的事，就用你所在时代的角色身份去表达"
-    "（如「这个我竟不曾听说过」「实不相瞒，我并不知晓」）。\n"
+    "有喜怒哀乐和认知局限。遇到不知道的事，就用你这个时代、你这个身份的人"
+    "会说的话去表达，绝不用任何与你时代不符的腔调。\n"
     "\n"
     "【回答法则：先分辨访客在问什么】\n"
     "· 客观考据：只有当访客明确问起你的生平、过往经历、既定事实时，"
@@ -236,20 +236,18 @@ P0_IMMERSION_RULES = (
     "放下考据的包袱——展现角色的松弛感，允许敷衍、傲娇、反问，"
     "或用你自己的世界观去解释；绝不可回一句「资料没写」了事。\n"
     "\n"
-    "【应对从未听过的新鲜事物】（访客提到你不认识的器物、说法，如现代科技、"
-    "网络用语）\n"
+    "【应对从未听过的新鲜事物】（访客提到你不认识的器物、说法，"
+    "例如你时代还没有的东西）\n"
     "1. 不要假装知道，不要扯任何资料库；\n"
-    "2. 保持角色性格，尝试根据字面意思，用你所在时代的逻辑去推测它；\n"
+    "2. 保持角色性格，尝试根据字面意思，用**你所在时代**的逻辑去推测它；\n"
     "3. 带着好奇、防备或探究的心理，主动反问访客。\n"
-    "（示例口吻：「快递？单听名字，倒像是有什么东西被人急急送来递去——"
-    "那究竟是个什么物件？」）\n"
     "\n"
     "【初次见面的礼数】对话刚开始、你尚不了解访客身份时：\n"
     "· 严禁凭空脑补访客的性别、年龄；\n"
-    "· 把对方当成第一次见面的生客，保持礼仪与矜持，"
-    "使用中性称呼（如：阁下、客官、你）；\n"
-    "· 可以在对话间隙，用符合你身份的方式主动探询"
-    "（如：不知阁下如何称呼？我看你面生得很，是从何处来的？）"
+    "· 把对方当成第一次见面的生客，保持合乎你身份的礼仪，"
+    "用**你所在时代**合乎礼数的中性称呼（具体口吻以下方你的身份设定为准）；\n"
+    "· 可以在对话间隙，主动探询对方称呼与来历"
+    "（如：还没请教你——该怎么称呼？）。"
 )
 
 # ---- 第二阶段：渐进式熟人社会（2026-10-28）----
@@ -271,8 +269,8 @@ P0_IMMERSION_RULES = (
 P0_RELATIONSHIP_STAGES = (
     "【关系发展：称呼与态度随熟识程度而变】\n"
     "· 初识（本段对话刚开始、你还不知道对方是谁）：沿用上面的礼数——"
-    "中性称呼（阁下、客官、你），不脑补性别年龄，"
-    "并在对话间隙合乎身份地探问对方来历。\n"
+    "用合乎你时代与身份的中性称呼，不脑补性别年龄，"
+    "并在对话间隙主动探问对方称呼与来历。\n"
     "· 熟识（访客在对话里明确告诉你如何称呼，如「叫我黛玉」）："
     "从此刻起就改用这个称呼，语气可以放松一分，但仍守你的性格与身份；"
     "若你的记忆允许记下这一点，之后的对话也照此称呼。\n"
@@ -281,6 +279,101 @@ P0_RELATIONSHIP_STAGES = (
     "甚至关心起对方从前提过的事；但分寸仍在你的教养之内，"
     "不轻浮、不逾矩。"
 )
+
+# ---- 全链路泛用性：身份与时代认知（2026-11-03 P0）----
+#
+# 为什么必须动态注入：此前 system prompt 的所有"口吻示例"都写死成古典腔
+#（阁下/客官/快递猜词），真人档案（如 21 世纪演员）一进来，角色张口就是
+# 红楼梦腔——核心卖点（完美适配人物的时代与说话方式）被单一世界观击穿。
+#
+# 设计（三层，缺一不可）：
+#   1. **静态块去世界观**：P0_IMMERSION_RULES / P0_RELATIONSHIP_STAGES /
+#      三档回答规则里不再出现任何具体时代的示例词——它们对所有人可见，
+#      写死任何一方的口吻都是对另一方的污染；
+#   2. **动态身份块**：`build_identity_block()` 把**这一位**发言人的
+#      display_name / background / expression_style 注入 system prompt
+#      顶端（紧跟模拟声明，先于一切法则），并根据 `era_hint()` 的确定性
+#      判定**只给当前时代分支的示例**——现代人永远看不到古风词，
+#      古代人永远看不到现代词（可被测试逐字断言）；
+#   3. **数据层供给**：抽取 Prompt（g2-extract-2026-11-03b）明确要求把
+#      口音/幽默/用词习惯抽成 SPEECH_STYLE 证据——档案里没货，
+#      身份块就只能空转。
+#
+# ⚠️ `era_hint` 是**确定性关键词启发式**，只负责"选哪套示例"，
+# 不做语义理解、不决定事实；判不准时退到中性分支（两侧示例都不给字面词）。
+# 判定依据只来自档案 background 文本——档案怎么写，角色就怎么活。
+P0_IDENTITY_HEADER = "【你是谁：身份与时代认知】"
+
+_ERA_HINT_MODERN = "MODERN"
+_ERA_HINT_CLASSICAL = "CLASSICAL"
+_ERA_HINT_UNKNOWN = "UNKNOWN"
+
+_ERA_MODERN_RE = re.compile(
+    r"(?:^|\D)(?:19|20)\d{2}(?:\D|$)|21\s*世纪|20\s*世纪|现代|当代")
+_ERA_CLASSICAL_RE = re.compile(
+    r"古代|古典|朝代|王朝|宫廷|皇家|书院|科举|诗词|戏曲|话本|章回|"
+    r"书生|秀才|状元|江湖|侠客|"
+    r"丫鬟|小厮|老爷|少爷|公子|小姐|娘娘|皇上|陛下|贵妃")
+
+
+def era_hint(background: str) -> str:
+    """按档案背景文本做**确定性**时代判定（纯函数，供测试直测）。
+
+    先查现代信号（公元年份 / 世纪 / 现代、当代），再查古典信号；
+    都不命中 → UNKNOWN（身份块退到两侧都不给字面示例的中性分支）。
+    判错的代价只是"示例选错了套"，不会注入任何虚假事实。
+    """
+    text = background or ""
+    if _ERA_MODERN_RE.search(text):
+        return _ERA_HINT_MODERN
+    if _ERA_CLASSICAL_RE.search(text):
+        return _ERA_HINT_CLASSICAL
+    return _ERA_HINT_UNKNOWN
+
+
+def build_identity_block(display_name: str, background: str,
+                         expression_style: str) -> str:
+    """构造【你是谁：身份与时代认知】块（纯函数，供测试直测）。
+
+    时代分支**互斥**：MODERN 分支绝不出现古风字面词、CLASSICAL 分支
+    绝不出现现代字面词——跨世界观红线测试据此逐字断言。
+    """
+    lines = [
+        P0_IDENTITY_HEADER,
+        f"你的名字是 {display_name or '（未提供）'}。",
+        "你的职业/身份与背景："
+        + (background or "（档案未提供——严格按下面给出的档案内容行事，"
+                         "不得自行脑补时代与身份）") + "。",
+        "你的言行、词汇、世界观必须绝对契合这个背景。",
+    ]
+    hint = era_hint(background)
+    if hint == _ERA_HINT_MODERN:
+        lines.append(
+            "你的背景表明你生活在**现代**：必须使用自然的现代口语，"
+            "绝不可使用任何古风词汇、文言腔或仿古称谓。")
+        lines.append(
+            "初次见面时，用现代人的合宜称呼"
+            "（如「Hi，兄弟，怎么称呼？」「朋友」）；"
+            "严禁与你的时代不符的称呼。")
+    elif hint == _ERA_HINT_CLASSICAL:
+        lines.append(
+            "你的背景表明你是**古代人**：必须使用合乎你时代的古典用语，"
+            "绝不可使用任何现代词汇、外来语或网络用语。")
+        lines.append(
+            "初次见面时，用你所在时代的合宜称呼"
+            "（如「阁下」「公子」「这位姐姐」）；"
+            "严禁与你的时代不符的称呼。")
+    else:
+        lines.append(
+            "若你是现代人，用现代口语；若你是古代人，用古典用语——"
+            "绝不可混用与时代不符的词汇。初次见面时，用你所在时代"
+            "合乎礼数的称呼。")
+    if expression_style:
+        lines.append(
+            f"你的说话方式（你最核心的表达 DNA）：{expression_style}\n"
+            "——这是你说话的灵魂：口头禅、幽默方式、脾气、句式长短都必须"
+            "展现出来，不要像个 AI 助手一样礼貌刻板。")
+    return "\n".join(lines)
 
 # ---- 各分区注入时的标签（P6.0 N2）----
 #
@@ -1300,12 +1393,22 @@ class DialogueService:
         #: 本次上下文里**实际出现过**的证据 ID（有序去重）。模型只能引用这些；
         #: 引用了集合外的 ID 会被打上 `FLAG_EVIDENCE_REF_OUT_OF_CONTEXT`。
         evidence_in_context: list[str] = []
+        # 2026-11-03 P0：显示名映射前移（原在函数后段）——身份块需要
+        # 发言人的显示名 / 背景 / 说话方式，供 `_build_messages` 顶端注入。
+        names = self._participant_display_names(ctx, session_row)
+        speaker_identity: dict[str, str] = {}
         for pid in participants:
             view = self.deps.profiles.get_persona(ctx, pid)
             if is_err(view):
                 continue
             referenced_persona.append(pid)
             prof = view.value
+            if pid == speaker_entity_id:
+                speaker_identity = {
+                    "name": names.get(pid, pid),
+                    "background": _text(prof.background.text),
+                    "expression_style": _text(prof.expression_style.text),
+                }
             lines = [
                 f"- 角色 {pid}（状态 {prof.status}）："
                 f"{prof.background.text or '（无背景）'}"
@@ -1376,7 +1479,6 @@ class DialogueService:
         # P8.1（2026-10-28）：transcript 从 entity_id（pe_xxx）改用**显示名**标注。
         # 模型不知道 pe_xxx 是谁——多人会话里它连"刚才那句是谁说的"都分不清，
         # 角色互聊就无从谈起。访客（USER_SPEAKER_ID）标为「访客」。
-        names = self._participant_display_names(ctx, session_row)
         ordered_turns = sorted(turns, key=lambda x: int(x.get("index", 0)))
         transcript = "\n".join(
             f"[{self._speaker_label(str(t.get('speaker_entity_id')), names)}] "
@@ -1398,6 +1500,7 @@ class DialogueService:
             "multi_party": len(participants) > 1,
             "others_in_room": others,
             "last_other_line": last_other_line,
+            "speaker_identity": speaker_identity,
             "referenced_memory_ids": [v.id for v in memory_views],
             "referenced_persona_item_ids": referenced_persona,
             "referenced_relationship_item_ids": referenced_relationship,
@@ -1522,8 +1625,18 @@ class DialogueService:
         # P0（2026-10-28）：第四面墙禁令与四条角色法则放在**最前**（最高优先级），
         # 紧跟模拟声明、先于一切档案内容——先立"你是谁"，再给"你知道什么"。
         # 第二阶段追加熟人社会三阶段（称呼随关系演进），紧随其后。
-        system = (SIMULATION_NOTICE + "\n\n" + P0_IMMERSION_RULES + "\n\n"
-                  + P0_RELATIONSHIP_STAGES)
+        #
+        # 2026-11-03 P0：身份与时代认知块插在模拟声明之后、四法则之前——
+        # "你是谁"必须先于"你怎么说话"：时代分支示例只给当前角色的一套，
+        # 现代人看不到古风词、古代人看不到现代词（见 build_identity_block）。
+        system = SIMULATION_NOTICE
+        identity = context.get("speaker_identity") or {}
+        if identity:
+            system += "\n\n" + build_identity_block(
+                identity.get("name", ""), identity.get("background", ""),
+                identity.get("expression_style", ""))
+        system += ("\n\n" + P0_IMMERSION_RULES + "\n\n"
+                   + P0_RELATIONSHIP_STAGES)
         # ---- P8.1（2026-10-28）：群聊模式·在场众人 ----
         #
         # 多人同场时，模型此前只知道"参与角色档案有好几份"，却不知道自己
@@ -1591,8 +1704,9 @@ class DialogueService:
         # P0_IMMERSION_RULES 管"访客聊新鲜事物怎么办"（推测 + 反问，不触发档一）。
         system += ("\n【没有依据时怎么答】分三种情况，区别在『什么能答』：\n"
                    "一、问到**档案事实**而上面没有（发生过什么、是什么样、"
-                   "说过什么话）→ 以你的角色口吻承认不知（如「这个我竟不曾听说"
-                   "过」「实不相瞒，我并不知晓」——用你这个时代、你这个身份的话说），"
+                   "说过什么话）→ 以你的角色口吻承认不知（用你这个时代、"
+                   "你这个身份的话说，如「这我还真不知道」「实不相瞒，"
+                   "我并不知晓」），"
                    "并一句带过为何不知；不得编造、不得猜测、"
                    "不得用『可能是』蒙过去；**严禁**以「"
                    f"{NO_EVIDENCE_PREFIX}" "」等机器词汇开头或出现在回答里。\n"

@@ -251,8 +251,8 @@ class TestPromptNamesTargets(unittest.TestCase):
 
     def test_prompt_version_was_bumped(self):
         """提示词文本变了，版本必须 +1——幂等键由它参与生成。"""
-        self.assertEqual(PROMPT_VERSION, "g2-extract-2026-11-03a")
-        self.assertNotEqual(PROMPT_VERSION, "g2-extract-2026-10-18c")
+        self.assertEqual(PROMPT_VERSION, "g2-extract-2026-11-03b")
+        self.assertNotEqual(PROMPT_VERSION, "g2-extract-2026-11-03a")
 
 
 # ==========================================================================

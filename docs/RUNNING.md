@@ -2579,10 +2579,47 @@ P6.3 一次加了 3 个码（`VALIDATION_TOPIC_TOO_{BROAD,SHORT,LONG}`），**�
 
 ---
 
+## 5.48 全链路泛用性：跨世界观自适应（2026-11-03 P0）
+
+**问题**：真人档案（Ben Affleck / Matt Damon）真跑验收时角色满口红楼梦腔——
+根因有两层：① 数据层：抽取 Prompt 从未解释 `dimension` 各值语义，模型把
+说话风格/性格全填默认 `BACKGROUND` ⇒ 档案 `expression_style`/`traits`/`habits`
+全空（coverage 0/0/0），背景只剩出生日期；② Prompt 层：`P0_IMMERSION_RULES`
+的称呼示例写死「阁下、客官」、口吻示例写死古典腔，静态块对所有人可见 ⇒
+现代角色被古典示例污染。
+
+**修复（三层，缺一不可）**：
+- **数据层**（`extraction.py`）：规则新增第 11 条 dimension 语义表
+  （BACKGROUND=生平背景含职业身份 / TRAIT / HABIT / **SPEECH_STYLE=口音、
+  用词习惯、句式长短、语气词、幽默方式、口头禅、俚语脏话习惯** / EXPERIENCE /
+  RELATION），并明示"材料里关于一个人**怎么说话**的描写必须抽成
+  SPEECH_STYLE，不要漏掉也不要错归 BACKGROUND"；规则 10 的保留优先级
+  加入"说话方式"。`PROMPT_VERSION` → `g2-extract-2026-11-03b`（三处钉子同步）。
+- **Prompt 层**（`dialogue.py`）：
+  - 静态块**去世界观**：四法则/三阶段/三档规则里不再出现任何具体时代的
+    示例词（双向清理：古风词与现代词都不留字面）；
+  - 新增**动态身份块** `build_identity_block()`：注入发言人 display_name /
+    background / expression_style 到 system prompt 顶端（紧跟模拟声明）；
+    时代分支由确定性 `era_hint()`（纯函数关键词启发式，只选示例套不做语义
+    理解）判定——**现代分支绝不出现古风字面词、古典分支绝不出现现代字面词**，
+    UNKNOWN 退到两侧无字面示例的中性分支；expression_style 非空时以
+    "最核心的表达 DNA"注入并强调"不要像个 AI 助手一样礼貌刻板"；
+  - `_assemble_context` 捕获发言人身份三元组（显示名前移计算）；
+  - `DIALOGUE_PROMPT_VERSION` → `p8-era-2026-11-03a`。
+- **测试层**（`tests/test_cross_worldview_prompt.py`，11 项）：静态块双向
+  零字面断言；`era_hint` 三分支；`build_identity_block` 分支互斥 + DNA 注入 +
+  空背景不脑补；端到端——Ben Affleck 式档案整份 prompt **逐字不含**
+  阁下/客官/在下/一道去、林黛玉式档案**逐字不含** Hi/披萨/兄弟。
+
+**验证**：全量回归 2000 → **2011 项**通过；真跑验收见下节记录。
+
+---
+
 ## 6. 变更历史
 
 | 日期 | 版本 | 变更 |
 | --- | --- | --- |
+| 2026-11-03 | v0.37 | **全链路泛用性：跨世界观自适应**（详见 §5.48）：抽取 Prompt 新增 dimension 语义表（SPEECH_STYLE 强制捕获说话方式），`PROMPT_VERSION` → `g2-extract-2026-11-03b`；dialogue 静态块去世界观 + 动态身份块（`era_hint` 时代分支互斥、表达 DNA 注入），`DIALOGUE_PROMPT_VERSION` → `p8-era-2026-11-03a`；新增 `tests/test_cross_worldview_prompt.py` 11 项；全量 **2000 → 2011 项**通过 | 待确认 |
 | 2026-11-03 | v0.36 | **Web 薄壳（app.py）+ 灰度三 Bug 修复**（详见 §5.47）：Streamlit 薄壳（subprocess 调引擎、密钥只走子进程环境变量、AppTest 验证）；`parse_names` 空格不再拆名（英文名保留中间空格）+ 标签可视化确认；`subject_alias_map` 别名容错（显示名自动转 `pe_` ID + `SUBJECT_ALIAS_REMAPPED` 留痕）+ 抽取 Prompt 显式映射 + `PROMPT_VERSION` → `g2-extract-2026-10-18d`；expander 防重叠 CSS。新增 2 份测试 16 项；全量 **1985 → 2000 项**通过；真跑 `Ben Affleck, Matt Damon` 2 次调用 / 0.0035436 USD，10 条证据 0 拒收 | 待确认 |
 | 2026-10-28 | v0.34 | **P0 预算体验修复：账单隔离 + 全局单任务「软硬双限」**（详见 §5.45）：模型预算线费用基线改 `session_occupied_cost()`（排除历史，新任务从 0.0000 起算）；新增 `PERSONA_BUDGET_SOFT_LIMIT=2.00` / `PERSONA_BUDGET_HARD_LIMIT=5.00`（旧键 `PERSONA_MODEL_MAX_COST`/`_PER_TASK` 降级遗留回退）；新错误码 `BUDGET_PAUSED`（已注册 `ERROR_SPEC`）+ `soft_limit_handler` 交互（y → 软限 +2.00 继续，n → 安全退出）；修 `--budget` 只改打印不改拦截的 Bug（现在正确覆盖软限）；抽取与对话共用同一份 `ModelCallLimits`；遗留「项目累计上限」仍含历史（G11 语义保留）。新增 `tests/test_budget_soft_hard.py` 11 项 + 离线验收脚本 `scripts/acceptance_p0_budget.py`（11 项全 PASS）；全量 **1942 → 1953 项**通过；真实外呼 0 | 待确认 |
 | 2026-10-21 | v0.26 | **P6.2-c：最小 `persona chat`**（第二个会花钱的命令）：`--names/--rounds/--message/--memory-write rule\|off`（默认 `off`）；`run` 与 `chat` 共用唯一实现 `_authorize_real_calls`（同一个 `.persona_consent.json`、同一套问法）；对话单价常量 `DIALOGUE_MEASURED_COST_PER_CALL_USD` 收进 `modules/dialogue.py`（评估脚本与 CLI 同一出处）；Ctrl-C 干净中止（记忆不回滚 / 会话必置 ENDED / 退出码 130）；为守 D-059，`SessionDraft` 与策略常量经 `orchestrator` 转发。新增 `tests/test_p6_2_chat_cli.py`（10 项，含 3 组变异验证）；全量 **1902 → 1912 项**通过；真实外呼 0 | 待确认 |
