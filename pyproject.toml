@@ -17,7 +17,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "generic-persona-skill"
-version = "0.1.0.dev0"
+version = "1.0.0"
 description = "通用人物与关系模拟：输入两个或更多人名，自动构建人物与关系档案并模拟对话（本地 CLI）"
 readme = "README.md"
 requires-python = ">=3.12"

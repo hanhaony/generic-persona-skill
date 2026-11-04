@@ -62,7 +62,7 @@ P2.1 工程配置、P2.2 配置管理、**P2.3 任务生命周期基础闭环（
     docs/DATA_MODEL.md   docs/INTERFACES.md   docs/ERROR_HANDLING.md   docs/DECISIONS.md
 """
 
-__version__ = "0.1.0.dev0"
+__version__ = "1.0.0"
 
 # 当前所处的开发阶段，供 CLI 的 `persona info` 与 `--help` 结尾展示
 # 注意：阶段号**以仓库 ROADMAP 编号为准**（用户口头编号放括号里，见 DECISIONS §3 Q-37）

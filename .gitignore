@@ -69,6 +69,8 @@ pip-wheel-metadata/
 # ---------- 7. 编辑器与操作系统 ----------
 .idea/
 .vscode/
+.agents/
+.claude/
 *.swp
 *.swo
 *~
