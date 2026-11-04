@@ -1,0 +1,11 @@
+# ============================================================
+# generic-persona-skill —— Web 壳（app.py）云端运行依赖
+#
+# 核心引擎（persona/ 包）保持**零第三方依赖**（只用标准库，
+# 见 pyproject.toml 的 D-004 决策），本文件只服务 Streamlit Web 壳。
+#
+# 本地运行：pip install -r requirements.txt
+# 云端（Streamlit Community Cloud）：仓库根放置本文件即自动安装。
+# ============================================================
+
+streamlit>=1.41

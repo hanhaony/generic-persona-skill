@@ -2659,10 +2659,28 @@ P6.3 一次加了 3 个码（`VALIDATION_TOPIC_TOO_{BROAD,SHORT,LONG}`），**�
 
 ---
 
+## 5.50 Web 壳上云准备：expander 图标隐藏 + 数据目录三级解析（2026-11-04）
+
+- **CSS**：expander 默认箭头图标整体隐藏（`stExpanderToggleIcon` / `summary svg` /
+  `.material-icons` / `::-webkit-details-marker` 全部 `display:none`），标题加粗
+  600 / 16px / 莫兰迪暖灰 `#5c4f46`，左内边距 12px——文字独占头部不再重叠。
+- **数据目录三级解析** `_resolve_data_dir()`：显式环境变量
+  `PERSONA_WEBAPP_DATA_DIR` > 本地 `var/webapp`（探测可写才用，原行为不变）>
+  `tempfile.mkdtemp()` 会话临时目录（Streamlit Community Cloud 容器除 /tmp 只读）。
+  ⚠️ mkdtemp 结果必须缓存进 `st.session_state`——Streamlit 每轮交互重跑 app.py，
+  不缓存则第二次点击就是空库。
+- **requirements.txt**：仓库根新增，仅 `streamlit>=1.41`（Web 壳唯一第三方依赖；
+  核心引擎零依赖不变，D-004）。API Key 输入框此前已是 `type="password"`。
+- **验证**：AppTest 冒烟（CSS 注入 / 渲染正常）+ 三分支脚本验证（环境变量 /
+  本地可写 / 只读回退且 rerun 不换目录）。
+
+---
+
 ## 6. 变更历史
 
 | 日期 | 版本 | 变更 |
 | --- | --- | --- |
+| 2026-11-04 | v0.39 | **Web 壳上云准备**（详见 §5.50）：expander 默认箭头图标隐藏（四类选择器 `display:none`）+ 标题排版加粗；app.py 数据目录三级解析 `_resolve_data_dir()`（环境变量 > 本地 var/webapp 可写探测 > `tempfile.mkdtemp()` 会话临时目录并缓存防 rerun 换目录）；仓库根新增 `requirements.txt`（仅 `streamlit>=1.41`，核心引擎零依赖不变）；API Key 输入确认 `type="password"` | 待确认 |
 | 2026-11-04 | v0.38 | **P0 群聊体验升级：跨宇宙认知 + 群像法则 + Web 混合世界观建档**（详见 §5.49）：dialogue 静态块 `P0_GROUP_DYNAMICS_RULES`（性格决定话多话少 + 防复读，中性措辞有守卫）+ 纯函数 `build_awareness_block`（读 `PersonEntity` 的 `entity_type`+`works`：同作品=旧识免客套、跨作品=陌生人、REAL×FICTIONAL=允许一次「我演过TA」吐槽、REAL×REAL=按档案；认知许可与事实分离），`DIALOGUE_PROMPT_VERSION` → `p8-crossuniverse-2026-11-04a`；app.py 逐名类型/作品配置 + `group_build_specs` 分批建档（归一化对齐引擎，分批错=认知错）。新增 2 份测试 25 项 + AppTest 冒烟；全量 **2011 → 2036 项**（2035 绿 + 1 红为用户本地 `var/webapp` 守卫） | 待确认 |
 | 2026-11-03 | v0.37 | **全链路泛用性：跨世界观自适应**（详见 §5.48）：抽取 Prompt 新增 dimension 语义表（SPEECH_STYLE 强制捕获说话方式），`PROMPT_VERSION` → `g2-extract-2026-11-03b`；dialogue 静态块去世界观 + 动态身份块（`era_hint` 时代分支互斥、表达 DNA 注入），`DIALOGUE_PROMPT_VERSION` → `p8-era-2026-11-03a`；新增 `tests/test_cross_worldview_prompt.py` 11 项；全量 **2000 → 2011 项**通过 | 待确认 |
 | 2026-11-03 | v0.36 | **Web 薄壳（app.py）+ 灰度三 Bug 修复**（详见 §5.47）：Streamlit 薄壳（subprocess 调引擎、密钥只走子进程环境变量、AppTest 验证）；`parse_names` 空格不再拆名（英文名保留中间空格）+ 标签可视化确认；`subject_alias_map` 别名容错（显示名自动转 `pe_` ID + `SUBJECT_ALIAS_REMAPPED` 留痕）+ 抽取 Prompt 显式映射 + `PROMPT_VERSION` → `g2-extract-2026-10-18d`；expander 防重叠 CSS。新增 2 份测试 16 项；全量 **1985 → 2000 项**通过；真跑 `Ben Affleck, Matt Damon` 2 次调用 / 0.0035436 USD，10 条证据 0 拒收 | 待确认 |

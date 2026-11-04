@@ -19,6 +19,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import streamlit as st
@@ -29,7 +30,43 @@ import streamlit as st
 
 REPO_ROOT = Path(__file__).resolve().parent
 PY_EXE = sys.executable
-DATA_DIR = REPO_ROOT / "var" / "webapp"          # 与仓库 .gitignore 的 var/ 对齐
+
+
+def _resolve_data_dir() -> Path:
+    """数据目录三级解析：显式环境变量 > 本地 var/webapp（可写时）> 会话临时目录。
+
+    Streamlit Community Cloud 的容器除 /tmp 外基本只读，且多个访客共享文件
+    系统——本地目录探测写失败时回退到 tempfile.mkdtemp() 的会话级目录：
+    ① 云端可写；② 每个访客一个独立目录，不跨用户串数据。
+    ⚠️ 不能每轮 rerun 都 mkdtemp：目录句柄必须缓存进 st.session_state，
+    否则第二次交互就是空库（档案"消失"）。
+    """
+    env_dir = os.environ.get("PERSONA_WEBAPP_DATA_DIR")
+    if env_dir:
+        return Path(env_dir)
+    probe = REPO_ROOT / "var" / "webapp"
+    try:
+        probe.mkdir(parents=True, exist_ok=True)
+        marker = probe / ".write_probe"
+        marker.touch()
+        marker.unlink()
+        return probe
+    except OSError:
+        try:
+            cached = st.session_state.get("webapp_data_dir")
+        except Exception:  # noqa: BLE001 —— 无脚本运行上下文（如纯导入）时不炸
+            cached = None
+        if cached:
+            return Path(str(cached))
+        data_dir = Path(tempfile.mkdtemp(prefix="persona-webapp-"))
+        try:
+            st.session_state["webapp_data_dir"] = str(data_dir)
+        except Exception:  # noqa: BLE001
+            pass
+        return data_dir
+
+
+DATA_DIR = _resolve_data_dir()                     # 云端回退临时目录，本地仍是 var/webapp
 DB_PATH = DATA_DIR / "persona.db"
 AVATAR_DIR = DATA_DIR / "avatars"
 
@@ -304,11 +341,15 @@ st.markdown(
         border-radius: 12px;
       }
       /* —— expander 头部防重叠（灰度实测：标题与图标挤在一起）——
-         重置 padding 与 line-height，恢复图标与文字的间距，不动 flex 结构 */
+         方案升级：直接隐藏默认箭头图标（用户要求），文字独占头部；
+         保留 padding 与 line-height 重置，排版干净 */
       [data-testid="stExpander"] summary {
-        padding: 0.65rem 1rem;
+        padding: 0.65rem 1rem 0.65rem 12px;
         line-height: 1.5;
         min-height: 2.2rem;
+        font-weight: 600 !important;
+        font-size: 16px !important;
+        color: #5c4f46 !important;
       }
       [data-testid="stExpander"] summary p,
       [data-testid="stExpander"] summary div,
@@ -316,10 +357,14 @@ st.markdown(
         margin: 0;
         line-height: 1.5;
       }
-      [data-testid="stExpander"] summary [data-testid="stExpanderToggleIcon"],
-      [data-testid="stExpander"] summary svg {
-        flex: 0 0 auto;
-        margin-right: 8px;
+      /* 隐藏折叠面板默认的箭头图标（svg / material 图标 / 原生 details 标记） */
+      [data-testid="stExpander"] summary svg,
+      [data-testid="stExpander"] summary .material-icons,
+      details summary::-webkit-details-marker {
+        display: none !important;
+      }
+      [data-testid="stExpander"] summary [data-testid="stExpanderToggleIcon"] {
+        display: none !important;
       }
       .name-tag {
         display: inline-block;
