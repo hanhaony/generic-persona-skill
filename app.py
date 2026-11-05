@@ -354,12 +354,26 @@ def save_avatar(upload, role_key: str) -> str | None:
 
 
 def build_env(api_key: str, model_id: str, max_calls: int) -> dict[str, str]:
-    """子进程环境变量。密钥只走环境变量（引擎侧设计），Model ID 可被覆盖。"""
+    """子进程环境变量。密钥只走环境变量（引擎侧设计），Model ID 可被覆盖。
+
+    云端没有 .env：设了预算（--budget）就必须给单价 + token 估算，
+    否则配置校验拒绝启动（闸门不用估计值冒充）。这里用 setdefault 兜底
+    DeepSeek 官方价目表数值——本地 .env 已配的不受影响（同名环境变量优先级
+    高于 .env，且数值一致）。
+    """
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PERSONA_MODEL_PROVIDER"] = "deepseek"      # v1.0.0 仅登记 DeepSeek
     env["PERSONA_MODEL_ID"] = model_id
     env["PERSONA_MODEL_MAX_CALLS"] = str(int(max_calls))
+    # 云端无 .env 的预算配套缺口（与仓库 .env 同源：DeepSeek 官方价目表 2026-10）
+    env.setdefault("PERSONA_MODEL_PRICE_IN_PER_1M", "0.3")
+    env.setdefault("PERSONA_MODEL_PRICE_OUT_PER_1M", "1.2")
+    env.setdefault("PERSONA_MODEL_PRICE_SOURCE",
+                   "https://api-docs.deepseek.com/quick_start/pricing")
+    env.setdefault("PERSONA_MODEL_PRICE_CHECKED_AT", "2026-10-16")
+    env.setdefault("PERSONA_MODEL_EST_TOKENS_IN", "3000")
+    env.setdefault("PERSONA_MODEL_EST_TOKENS_OUT", "2000")
     if api_key:
         env["PERSONA_PROVIDER_API_KEY"] = api_key
         # 引擎的别名：同时给，防某条路径只认别名
