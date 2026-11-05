@@ -21,6 +21,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 from pathlib import Path
 
@@ -69,8 +70,14 @@ def _resolve_data_dir() -> Path:
 
 
 DATA_DIR = _resolve_data_dir()                     # 云端回退临时目录，本地仍是 var/webapp
-DB_PATH = DATA_DIR / "persona.db"
 AVATAR_DIR = DATA_DIR / "avatars"
+# —— 多会话（2026-11-05 P1，微信式多开）——
+# 每个会话一个**独立 DB**：引擎预算是全库累计（external_usage_records 不分
+# project），只传不同 --project 挡不住预算串台；独立 DB 让预算、长期记忆、
+# 人物档案三层全部物理隔离。会话元数据（群名/人名/聊天记录/project_id）
+# 另存 JSON，刷新页面后恢复列表。云端 /tmp 目录随容器生命周期，属平台限制。
+SESSIONS_DIR = DATA_DIR / "sessions"
+SESSIONS_FILE = DATA_DIR / "web_sessions.json"
 
 DEFAULT_GROUP_NAME = "大观园日常"
 DEFAULT_API_BASE = "https://api.deepseek.com"
@@ -161,6 +168,74 @@ def pick_emoji(name: str) -> str:
         if key in name:
             return emoji
     return EMOJI_POOL[sum(ord(c) for c in name) % len(EMOJI_POOL)]
+
+
+# --------------------------------------------------------------------------
+# 多会话管理（2026-11-05 P1：微信式多开 + 历史保存）
+# --------------------------------------------------------------------------
+
+
+def new_session_id() -> str:
+    """会话 ID：时间戳 + 2 字节随机尾巴（同一秒连点也不会撞）。"""
+    return ("s_" + time.strftime("%Y%m%d_%H%M%S")
+            + "_" + os.urandom(2).hex())
+
+
+def make_project_id(session_id: str) -> str:
+    """会话的底层引擎 project_id：`prj_web_<净化后的 sid>`。
+
+    每个会话已有独立 DB（预算/记忆/档案物理隔离），`--project` 是第二道
+    隔离：就算哪天把多个会话并进同一个库，命名空间也不会串。
+    """
+    return "prj_web_" + re.sub(r"\W+", "_", str(session_id)).strip("_")
+
+
+def session_db_path(session_id: str) -> Path:
+    """会话独立数据库：<DATA_DIR>/sessions/<sid>/persona.db。"""
+    return SESSIONS_DIR / str(session_id) / "persona.db"
+
+
+def session_label(group_name: str, names: list[str]) -> str:
+    """会话列表显示名：群名优先；没填就用人物名（3 个起步 + 省略号）。"""
+    base = str(group_name or "").strip()
+    if base:
+        return base
+    if names:
+        shown = "、".join(names[:3])
+        return shown + ("…" if len(names) > 3 else "")
+    return "未命名群聊"
+
+
+def unique_label(base: str, existing: set[str]) -> str:
+    """radio 选项必须唯一：重名会话自动加「（2）（3）」后缀。"""
+    if base not in existing:
+        return base
+    n = 2
+    while f"{base}（{n}）" in existing:
+        n += 1
+    return f"{base}（{n}）"
+
+
+def save_sessions(chat_sessions: dict) -> None:
+    """会话元数据落盘（聊天记录/群名/人名/project_id）——刷新后恢复。
+
+    写盘失败（云端只读盘）静默降级：会话仍在 session_state 里活着，
+    只是本次浏览器会话结束后不再恢复。
+    """
+    try:
+        SESSIONS_FILE.write_text(
+            json.dumps(chat_sessions, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def load_sessions() -> dict:
+    """从磁盘恢复会话列表；文件缺失/损坏一律返回空（绝不炸启动）。"""
+    try:
+        data = json.loads(SESSIONS_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
 # --------------------------------------------------------------------------
@@ -350,6 +425,50 @@ def parse_turns(output: str) -> list[tuple[str, str]]:
     return turns
 
 
+# --------------------------------------------------------------------------
+# 动作 / 台词分离（2026-11-05 P1 阅读体验：让"说的"和"做的"视觉分离）
+# --------------------------------------------------------------------------
+
+# 动作包裹形态：全角括号 / 半角括号 / **强调** / *斜体舞台指示*
+_ACTION_RE = re.compile(r"（[^（）]*）|\([^()]*\)|\*\*[^*\n]+\*\*|\*[^*\n]+\*")
+
+
+def split_action_segments(text: str) -> list[tuple[str, str]]:
+    """把混合了动作描写与台词的发言拆成有序段：("action"/"speech", 内容)。
+
+    动作 = （…）/ (…) / **…** / *…* 包裹的内容（剥掉包裹符，保留内文）；
+    其余均为台词。段序与原文一致；无法解析时整体按台词兜底。
+    """
+    if not text or not text.strip():
+        return []
+    segments: list[tuple[str, str]] = []
+    pos = 0
+    for match in _ACTION_RE.finditer(text):
+        if match.start() > pos:
+            speech = text[pos:match.start()].strip()
+            if speech:
+                segments.append(("speech", speech))
+        raw = match.group(0)
+        inner = raw.strip("（）()*").strip()
+        if inner:
+            if raw.startswith("（") or raw.startswith("("):
+                segments.append(("action", raw))   # 括号形态忠实保留原文笔迹
+            else:
+                segments.append(("action", inner))  # 星号形态剥掉包裹符
+        pos = match.end()
+    if pos < len(text):
+        speech = text[pos:].strip()
+        if speech:
+            segments.append(("speech", speech))
+    return segments or [("speech", text.strip())]
+
+
+def _speech_chunks(text: str) -> list[str]:
+    """把台词按句读切成小段，供逐句浮现（打字机效果按句粒度最流畅）。"""
+    chunks = re.findall(r"[^，。！？；…!?;、]+[，。！？；…!?;、]?|…", text)
+    return [c for c in chunks if c.strip()] or [text]
+
+
 def friendly_error(returncode: int, output: str, err: str) -> str:
     """把引擎的失败翻译成人话；具体技术细节放可展开的调试区。"""
     blob = (output + "\n" + err)
@@ -393,7 +512,7 @@ st.set_page_config(page_title="专属人物模拟器", page_icon="🎭", layout=
 st.markdown(
     """
     <style>
-      @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&display=swap');
+      @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&family=Noto+Serif+SC:wght@400;500;600&display=swap');
 
       .stApp {
         background: linear-gradient(160deg, #fbf8f3 0%, #f6efe7 55%, #f3ebe1 100%);
@@ -408,13 +527,54 @@ st.markdown(
       section[data-testid="stSidebar"] * {
         font-family: 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif;
       }
+      /* —— 对话气泡：实体书排版（2026-11-05 P1 阅读体验）——
+         衬线体只用于聊天气泡正文，侧边栏等 UI 仍是无衬线（功能可读性优先） */
       [data-testid="stChatMessage"] {
-        background: rgba(255, 255, 255, 0.78);
+        background: rgba(255, 255, 255, 0.85);
         border: 1px solid #eee4d8;
-        border-radius: 12px;
-        box-shadow: 0 2px 10px rgba(120, 100, 80, 0.07);
-        padding: 12px 16px;
+        border-radius: 16px;
+        box-shadow: 0 4px 12px rgba(120, 100, 80, 0.08);
+        padding: 15px 18px;
         margin-bottom: 10px;
+        font-family: 'Noto Serif SC', 'Songti SC', 'SimSun', serif !important;
+        line-height: 1.8 !important;
+        letter-spacing: 0.5px !important;
+      }
+      [data-testid="stChatMessage"] strong {
+        color: #5c4f46;
+        font-size: 1.05em;
+      }
+      /* 动作描写：灰色斜体小一号，和台词一眼分开 */
+      .action-text {
+        color: #8c8478;
+        font-style: italic;
+        font-size: 0.92em;
+        margin-bottom: 8px;
+        display: block;
+      }
+      /* —— 会话列表（微信式，2026-11-05 P1）：卡片化 + 选中高亮 —— */
+      div[role="radiogroup"] label[data-baseweb="radio"] {
+        width: 100%;
+        padding: 8px 12px !important;
+        border-radius: 10px;
+        margin: 2px 0;
+        border: 1px solid transparent;
+        transition: background 0.15s;
+      }
+      div[role="radiogroup"] label[data-baseweb="radio"]:hover {
+        background: rgba(124, 104, 82, 0.08);
+      }
+      div[role="radiogroup"] label[data-baseweb="radio"]:has(input[aria-checked="true"]) {
+        background: rgba(124, 104, 82, 0.16);
+        border-color: #d9c8b2;
+      }
+      /* 无会话时的欢迎语：居中留白 */
+      .welcome-hero {
+        text-align: center;
+        padding: 6rem 1rem;
+        color: #8c8478;
+        font-size: 1.15rem;
+        font-family: 'Noto Serif SC', 'Songti SC', serif;
       }
       [data-testid="stChatInput"] textarea, [data-testid="stChatInput"] {
         border-radius: 12px !important;
@@ -492,28 +652,31 @@ st.markdown(
 # --------------------------------------------------------------------------
 
 DEFAULTS = {
-    "messages": [],            # [{role, name, text, avatar(路径或 None), emoji}]
-    "profiles_ready": False,
-    "built_names": [],         # 已确认有档案的人名
+    # —— 多会话（2026-11-05 P1）——
+    "chat_sessions": {},       # session_id → {group_name, names, messages, project_id…}
+    "current_session_id": None,
+    "creating_new": False,     # 「新建群聊」模式：主区显示建档表单
     "provider": "DeepSeek",
     # widget 键的默认值统一在此落 session_state（首次渲染前初始化，
     # 避免条件渲染与重挂载时的键缺失——AppTest 实测过这条坑）。
     "base_url": PROVIDER_PRESETS["DeepSeek"]["base_url"],
     "model_id": PROVIDER_PRESETS["DeepSeek"]["model_id"],
     "budget": 2.0,
-    "group_name": DEFAULT_GROUP_NAME,
-    "names_raw": "林黛玉,贾宝玉,薛宝钗",
-    "user_name": "访客",
-    "memory_topic": DEFAULT_GROUP_NAME,
+    # —— 新建群聊表单的 widget 键（条件渲染，必须预置默认值）——
+    "new_group_name": "",
+    "new_names_raw": "",
+    "new_user_name": "访客",
+    "memory_on": True,
+    "memory_topic": "",
+    "show_dress": False,
 }
 for key, value in DEFAULTS.items():
     st.session_state.setdefault(key, value)
 
-
-def reset_chat_history() -> None:
-    st.session_state.messages = []
-    st.session_state.profiles_ready = False
-    st.session_state.built_names = []
+# 刷新/重开浏览器：从磁盘恢复会话列表（聊天记录随会话一起回来）。
+if not st.session_state.get("sessions_loaded"):
+    st.session_state.chat_sessions.update(load_sessions())
+    st.session_state["sessions_loaded"] = True
 
 
 def _sync_provider() -> None:
@@ -528,13 +691,65 @@ def _sync_provider() -> None:
 # --------------------------------------------------------------------------
 
 with st.sidebar:
-    st.markdown("## 🏮 设置")
+    st.markdown("## 🏮 会话")
 
-    # ---------- 面板 1：模型 API 配置（常驻） ----------
+    chat_sessions = st.session_state.chat_sessions
+    creating_new = bool(st.session_state.creating_new)
+    cur_id = st.session_state.current_session_id
+
+    # ---------- 会话列表（微信式多开，2026-11-05 P1） ----------
+    if st.button("➕ 新建群聊", use_container_width=True, key="new_session_btn"):
+        st.session_state.creating_new = True
+        st.session_state.current_session_id = None
+        st.session_state.pop("session_picker", None)   # 选项集将变化，清掉旧选择
+        st.rerun()
+
+    if creating_new:
+        st.caption("📝 正在新建群聊——在右侧填写人物并生成档案。")
+    elif chat_sessions:
+        # radio 选项必须唯一：重名群聊自动加「（2）」后缀；列表按创建时间
+        # 倒序（新会话在上，像微信的最近聊天）。
+        used_labels: set[str] = set()
+        label_to_id: dict[str, str] = {}
+        for sid, sess in chat_sessions.items():
+            lab = unique_label(session_label(sess["group_name"], sess["names"]),
+                               used_labels)
+            used_labels.add(lab)
+            label_to_id[lab] = sid
+        labels = list(reversed(list(label_to_id)))
+        if cur_id not in chat_sessions:
+            # 刷新恢复/旧状态失效：自动选中最近一个会话（微信打开即最近聊天）
+            cur_id = label_to_id[labels[0]]
+            st.session_state.current_session_id = cur_id
+        cur_label = next((lab for lab, sid in label_to_id.items() if sid == cur_id),
+                         labels[0])
+        # 选项集变化后旧 widget 状态可能失效——失效就清掉让 index 重新生效
+        if st.session_state.get("session_picker") not in labels:
+            st.session_state.pop("session_picker", None)
+
+        def _pick_session() -> None:
+            st.session_state.current_session_id = label_to_id.get(
+                st.session_state.session_picker,
+                st.session_state.current_session_id)
+            st.session_state.creating_new = False
+
+        st.radio("会话列表", labels,
+                 index=labels.index(cur_label),
+                 key="session_picker", on_change=_pick_session,
+                 label_visibility="collapsed")
+        st.caption("👆 点击切换会话——每个会话的档案、记忆与预算完全独立。")
+    else:
+        st.caption("还没有会话——点上面「新建群聊」开一个吧。")
+
+    active = None if creating_new else chat_sessions.get(cur_id)
+
+    st.divider()
+
+    # ---------- 模型 API 配置（全局，常驻） ----------
     # 2026-11-04 P0：st.expander 的箭头图标与文字重叠（两轮 CSS 均被云端版本
-    # 脱靶）→ 侧边栏弃用 expander，改分区标题 + 常驻布局。API 与场景两块
-    # 是必填的第一步，常驻比折叠更好；只有纯可选的角色装扮用 toggle 门控
-    # （带 session 绑定的 widget 条件卸载有状态清扫风险，AppTest 实测过）。
+    # 脱靶）→ 侧边栏弃用 expander，改分区标题 + 常驻布局。API 是必填的第一步，
+    # 常驻比折叠更好；只有纯可选的角色装扮用 toggle 门控（带 session 绑定的
+    # widget 条件卸载有状态清扫风险，AppTest 实测过）。
     st.markdown("**📡 模型 API 配置**")
     provider = st.selectbox("服务商", list(PROVIDER_PRESETS.keys()),
                             key="provider", on_change=_sync_provider,
@@ -556,113 +771,81 @@ with st.sidebar:
         st.warning("v1.0.0 的引擎只登记了 DeepSeek 端点；选其它服务商暂时跑不了，"
                    "等核心装配层开放后这里会自动生效。")
 
-    # ---------- 面板 2：场景与角色配置（常驻） ----------
-    st.markdown("**🏮 场景与角色配置**")
-    group_name = st.text_input("群名", key="group_name")
-    names_raw = st.text_input(
-        "人物名字（必填）", key="names_raw",
-        placeholder="用逗号分隔，如：林黛玉,马斯克")
-    st.caption("💡 多个名字请用逗号分隔；英文名请保留中间空格。"
-               "真实/虚构身份会自动识别，不用你操心。")
-    user_name = st.text_input("你的昵称", key="user_name")
-    user_avatar_file = st.file_uploader(
-        "你的头像", type=["png", "jpg", "jpeg", "webp"], key="user_avatar")
-    st.caption("不上传就默认 🙎‍♂️。")
+    # ---------- 群聊节奏与角色装扮（属于当前会话） ----------
+    if active:
+        max_resp = max(1, len(active["names"]))
+        # 切换会话后人数上限会变：先把存量值夹进新边界，再交给 slider
+        stored_resp = min(int(st.session_state.get("responses", 2) or 2), max_resp)
+        st.session_state["responses"] = max(1, stored_resp)
+        responses = st.slider("每条消息后，几位角色依次回应", 1, max_resp,
+                              key="responses",
+                              help="后答的角色看得见先答角色的话。")
+        group_turns = st.slider("群聊互动轮数（角色自主互聊）", 0, 6,
+                                key="group_turns",
+                                help="你说完之后角色自己接话的轮数；"
+                                     "互聊内容绝不进长期记忆。")
+        per_msg_calls = responses + group_turns
+        st.caption(f"💰 每条消息 ≈ 最多 {per_msg_calls} 次模型调用"
+                   f"（实测 ≈{CHAT_COST_PER_CALL_USD:.4f} USD/次，"
+                   f"约 {per_msg_calls * CHAT_COST_PER_CALL_USD:.4f} USD）。")
 
-    memory_on = st.toggle("跨会话记忆（记得住你说的话）", value=True,
-                          key="memory_on",
-                          help="引擎的确定性规则：只记**你的原话**，"
-                               "角色互聊内容绝不入档。")
-    memory_topic = st.text_input(
-        "记忆锚点（--topic）", key="memory_topic",
-        help="角色只会召回**内容里包含这个词**的往事——建议用你聊天时"
-             "会反复出现的词（作品名、常用称呼、地名）。至少 2 个字。")
-
-    names = parse_names(names_raw)
-    if names_raw and not names:
-        st.warning("人名没解析出来，检查一下分隔符。")
-    if len(names) == 1:
-        st.info("群聊至少要两位角色——再加一位吧，一个人开不了会话。")
-
-    # ---------- 混合世界观：自动推断（2026-11-04 P0 大瘦身）----------
-    #
-    # 旧壳要求每位人物手动选「真实/虚构」+ 填作品名——对只想输名字就开聊的
-    # 用户极其反人类。现在点击「生成档案」时由 classify_names() 一次性推断
-    # （真实/虚构 + 虚构的最著名作品名），失败一律按真实人物兜底（引擎会去
-    # 搜索）。类型与作品是引擎「谁认识谁」的判定依据（跨宇宙认知），推断
-    # 结果经 group_build_specs() 分批传入建档。
-
-    # ---------- 面板 3：角色装扮（可选） ----------
-    show_dress = st.toggle("🎎 角色装扮（可选）", value=False, key="show_dress",
-                           help="换昵称、传头像；不展开就直接用默认。")
-    nicknames: dict[str, str] = {}
-    char_avatars: dict[str, str | None] = {}
-    if show_dress:
-        for name in names:
-            c1, c2 = st.columns([1, 3])
-            with c1:
-                st.markdown(f"<div style='font-size:1.9rem;text-align:center'>"
-                            f"{pick_emoji(name)}</div>",
-                            unsafe_allow_html=True)
-            with c2:
-                nicknames[name] = st.text_input(
-                    f"{name} · 角色昵称",
-                    placeholder=NICK_SUGGEST.get(name, "（可选）"),
-                    key=f"nick_{name}", label_visibility="collapsed")
-            char_avatars[name] = save_avatar(
-                st.file_uploader(f"{name} · 头像",
-                                 type=["png", "jpg", "jpeg", "webp"],
-                                 key=f"avatar_{name}"),
-                role_key=f"char_{re.sub(r'\\W+', '_', name)}")
-
-    # ---------- 群聊节奏与建档按钮（常驻，不进装扮门控） ----------
-    max_resp = max(1, len(names))
-    responses = st.slider("每条消息后，几位角色依次回应", 1, max_resp,
-                          value=min(2, max_resp), key="responses",
-                          help="后答的角色看得见先答角色的话。")
-    group_turns = st.slider("群聊互动轮数（角色自主互聊）", 0, 6, 3,
-                            key="group_turns",
-                            help="你说完之后角色自己接话的轮数；"
-                                 "互聊内容绝不进长期记忆。")
-    per_msg_calls = responses + group_turns
-    st.caption(f"💰 每条消息 ≈ 最多 {per_msg_calls} 次模型调用"
-               f"（实测 ≈{CHAT_COST_PER_CALL_USD:.4f} USD/次，"
-               f"约 {per_msg_calls * CHAT_COST_PER_CALL_USD:.4f} USD）。")
-
-    can_build = (len(names) >= 2 and bool(api_key)
-                 and provider == "DeepSeek" and bool(model_id))
-    build_btn = st.button("🚀 生成人物档案", use_container_width=True,
-                          disabled=not can_build)
-    if not api_key:
-        st.caption("⬆️ 先填 API Key 才能生成档案。")
-    if st.session_state.profiles_ready:
-        st.success(f"✅ 档案已加载：{'、'.join(st.session_state.built_names)}")
-        if parse_names(names_raw) != st.session_state.built_names:
-            st.caption("人名改过了——重新生成档案即可生效。")
+        show_dress = st.toggle("🎎 角色装扮（可选）", value=False, key="show_dress",
+                               help="换昵称、传头像；不展开就直接用默认。"
+                                    "装扮属于当前会话，发消息时保存。")
+        nicknames: dict[str, str] = {}
+        char_avatars: dict[str, str | None] = {}
+        if show_dress:
+            sid_ = active["session_id"]
+            for name in active["names"]:
+                st.session_state.setdefault(
+                    f"nick_{sid_}_{name}",
+                    active.get("nicknames", {}).get(name, ""))
+                c1, c2 = st.columns([1, 3])
+                with c1:
+                    st.markdown(f"<div style='font-size:1.9rem;text-align:center'>"
+                                f"{pick_emoji(name)}</div>",
+                                unsafe_allow_html=True)
+                with c2:
+                    nicknames[name] = st.text_input(
+                        f"{name} · 角色昵称",
+                        placeholder=NICK_SUGGEST.get(name, "（可选）"),
+                        key=f"nick_{sid_}_{name}", label_visibility="collapsed")
+                char_avatars[name] = save_avatar(
+                    st.file_uploader(f"{name} · 头像",
+                                     type=["png", "jpg", "jpeg", "webp"],
+                                     key=f"avatar_{sid_}_{name}"),
+                    role_key=f"char_{sid_}_{re.sub(r'\\W+', '_', name)}")
 
 # --------------------------------------------------------------------------
-# 生成档案（run）
+# 生成档案（run）——按会话隔离：--db <会话独立库> --project <会话命名空间>
 # --------------------------------------------------------------------------
 
 
-def build_profiles() -> None:
-    """触发引擎 `run`：先自动推断真实/虚构，再按 (类型, 作品) **分批**建档。
+def build_session_profiles(names: list[str], api_key: str, base_url: str,
+                           model_id: str, budget: float, db_path: Path,
+                           project_id: str,
+                           cached_class: dict | None = None) -> dict | None:
+    """为一个会话建档：实体推断（可带缓存）→ 分批 run → 逐个验证。
+
+    所有引擎调用都带 `--db <会话独立库>` 与 `--project <会话命名空间>`：
+    预算是全库累计的（external_usage_records 不分 project），所以独立 DB
+    才是真隔离——预算、长期记忆、人物档案三层都不会与其它会话串台。
 
     推断（classify_names）失败一律按真实人物兜底——宁可多搜一次，不可错标
     虚构。引擎 `run` 的类型与作品整批统一，所以真实人物合一批、虚构角色按
     作品各一批（分组逻辑见 `group_build_specs`）。每批 = 一次检索 + 抽取
     （约 0.008 USD/批）；某批失败立即停止，不烧后面几批的钱。
+
+    成功返回 classifications（dict）；失败返回 None（错误已就地展示）。
     """
     # 1) 实体分类推断（≈0.0001 USD，一次调用；结果按人名缓存防重复花钱）
     cache_key = ",".join(names)
-    cached = st.session_state.get("classifications") or {}
-    if cached.get("_names") == cache_key:
-        classifications = {k: v for k, v in cached.items() if k != "_names"}
+    if cached_class and cached_class.get("_names") == cache_key:
+        classifications = {k: v for k, v in cached_class.items()
+                           if k != "_names"}
     else:
         with st.spinner("🔍 正在识别人物身份（真实 / 虚构）..."):
             classifications = classify_names(names, api_key, base_url, model_id)
-        st.session_state["classifications"] = {"_names": cache_key,
-                                               **classifications}
     role_types = {n: ("虚构角色" if c["kind"] == "FICTIONAL_CHARACTER"
                       else "真实人物")
                   for n, c in classifications.items()}
@@ -676,7 +859,7 @@ def build_profiles() -> None:
     specs = group_build_specs(role_types, role_works)
     if not specs:
         st.error("没有可建档的人物配置。")
-        return
+        return None
     if len(specs) > 1:
         st.caption(f"🧩 混合阵营：分 {len(specs)} 批建档"
                    "（真实人物一批、每个作品一批）。")
@@ -689,7 +872,8 @@ def build_profiles() -> None:
         with st.spinner(f"📖 {label}——正在搜集资料..."):
             cli_args = ["run", "--names", ",".join(spec["names"]),
                         "--type", spec["entity_type"],
-                        "--out", str(DATA_DIR), "--budget", str(budget),
+                        "--db", str(db_path), "--project", project_id,
+                        "--out", str(db_path.parent), "--budget", str(budget),
                         "--yes"]
             if spec["work_title"]:
                 cli_args += ["--work-title", spec["work_title"]]
@@ -697,60 +881,159 @@ def build_profiles() -> None:
         if code != 0:
             st.error(f"😤 {label} 没能建档：" + friendly_error(code, out, err))
             show_debug(out, err)
-            return
+            return None
     # 逐个验证档案真的在库里（只读命令，不花钱）
     missing = []
     for name in names:
-        rc, _, _ = run_cli(["show", name, "--db", str(DB_PATH)],
-                           env, timeout=60.0)
+        rc, _, _ = run_cli(["show", name, "--db", str(db_path),
+                            "--project", project_id], env, timeout=60.0)
         if rc != 0:
             missing.append(name)
     if missing:
         st.warning("⚠️ 档案部分生成，这几位还没就位：" + "、".join(missing)
-                   + "。可以点一次「生成人物档案」补齐。")
-        st.session_state.profiles_ready = False
-        return
-    st.session_state.profiles_ready = True
-    st.session_state.built_names = list(names)
-    st.success(f"✅ 档案已加载：{'、'.join(names)}——去下面跟他们打个招呼吧！")
-
-
-if build_btn:
-    with st.spinner("📖 正在搜集资料生成档案..."):
-        build_profiles()
+                   + "。回到左侧再点一次「新建群聊」补齐（同样的人名会复用"
+                     "已生成的档案，不重复花钱）。")
+        return None
+    return classifications
 
 # --------------------------------------------------------------------------
-# 右侧主聊天区
+# 右侧主区：新建表单 / 欢迎语 / 当前会话聊天（2026-11-05 P1 多会话）
 # --------------------------------------------------------------------------
 
-display_name = {n: (nicknames.get(n, "").strip() or n) for n in names}
+chat_sessions = st.session_state.chat_sessions
+creating_new = bool(st.session_state.creating_new)
+active = (None if creating_new
+          else chat_sessions.get(st.session_state.current_session_id))
+
+if creating_new or active is None:
+    if creating_new:
+        # ---------- 新建群聊表单 ----------
+        st.markdown("<h1 class='garden-title'>✨ 新建群聊</h1>",
+                    unsafe_allow_html=True)
+        st.caption("填好人物名字，系统自动识别真实/虚构并生成档案。"
+                   "新会话的档案、记忆与预算完全独立，不影响已有群聊。")
+        c1, c2 = st.columns(2)
+        group_name = c1.text_input("群名（选填）", key="new_group_name",
+                                   placeholder="不填就用人物名当会话名")
+        names_raw = c2.text_input("人物名字（必填，逗号分隔）",
+                                  key="new_names_raw",
+                                  placeholder="如：林黛玉,马斯克")
+        st.caption("💡 多个名字用逗号分隔；英文名请保留中间空格。"
+                   "真实/虚构身份会自动识别。")
+        user_name = st.text_input("你的昵称", key="new_user_name")
+        user_avatar_file = st.file_uploader(
+            "你的头像", type=["png", "jpg", "jpeg", "webp"],
+            key="new_user_avatar")
+        st.caption("不上传就默认 🙎‍♂️。")
+        memory_on = st.toggle("跨会话记忆（记得住你说的话）", key="memory_on",
+                              help="引擎的确定性规则：只记**你的原话**，"
+                                   "角色互聊内容绝不入档。")
+        memory_topic = st.text_input(
+            "记忆锚点（--topic）", key="memory_topic",
+            help="角色只会召回**内容里包含这个词**的往事。"
+                 "不填就用群名。至少 2 个字。")
+        names = parse_names(names_raw)
+        if names_raw and not names:
+            st.warning("人名没解析出来，检查一下分隔符。")
+        if len(names) == 1:
+            st.info("群聊至少要两位角色——再加一位吧，一个人开不了会话。")
+        can_build = (len(names) >= 2 and bool(api_key)
+                     and provider == "DeepSeek" and bool(model_id))
+        if st.button("🚀 创建群聊并生成档案", use_container_width=True,
+                     disabled=not can_build):
+            sid = new_session_id()
+            classifications = build_session_profiles(
+                names, api_key, base_url, model_id, budget,
+                session_db_path(sid), make_project_id(sid))
+            if classifications is not None:
+                st.session_state.chat_sessions[sid] = {
+                    "session_id": sid,
+                    "project_id": make_project_id(sid),
+                    "group_name": group_name.strip(),
+                    "names": list(names),
+                    "messages": [],
+                    "user_name": (user_name or "访客").strip() or "访客",
+                    "user_avatar": save_avatar(
+                        user_avatar_file, role_key=f"user_{sid}") or "🙎‍♂️",
+                    "memory_on": bool(memory_on),
+                    "memory_topic": (memory_topic.strip()
+                                     or session_label(group_name, names)),
+                    "built_names": list(names),
+                    "nicknames": {},
+                    "classifications": {"_names": ",".join(names),
+                                        **classifications},
+                }
+                st.session_state.current_session_id = sid
+                st.session_state.creating_new = False
+                save_sessions(st.session_state.chat_sessions)
+                st.rerun()
+    else:
+        st.markdown("<div class='welcome-hero'>"
+                    "👈 请在左侧新建一个群聊，开始你的跨宇宙之旅。</div>",
+                    unsafe_allow_html=True)
+    st.stop()
+
+# ---------- 当前会话的聊天界面 ----------
+names = active["names"]
+display_name = {}
+for n in names:
+    nick = st.session_state.get(f"nick_{active['session_id']}_{n}", "")
+    display_name[n] = (nick or "").strip() or n
 cast_line = " · ".join(f"{pick_emoji(n)} {display_name[n]}（{n}）" for n in names)
 
-st.markdown(f"<h1 class='garden-title'>🎭 {group_name or '专属人物模拟器'}</h1>",
+st.markdown(f"<h1 class='garden-title'>🎭 "
+            f"{session_label(active['group_name'], names)}</h1>",
             unsafe_allow_html=True)
 st.markdown(f"<p class='garden-sub'>{cast_line}</p>", unsafe_allow_html=True)
 st.divider()
 
-user_avatar_path = save_avatar(user_avatar_file, role_key="user")
-user_avatar = user_avatar_path or "🙎‍♂️"
+user_avatar = active.get("user_avatar") or "🙎‍♂️"
 
 
-def render_history() -> None:
-    for msg in st.session_state.messages:
+def render_assistant_message(msg: dict, animate: bool = False,
+                             pause_after: bool = False) -> None:
+    """渲染一条角色发言：动作灰斜体、台词正常字；animate=True 时逐句浮现。
+
+    animate 仅用于**本轮新发言**——历史消息每次交互都会静态重渲染，
+    若对历史也做延时，用户每点一次都要重看一遍动画（Streamlit 全页重跑）。
+    """
+    with st.chat_message("assistant",
+                         avatar=msg.get("avatar") or msg.get("emoji")):
+        st.markdown(f"<span class='speaker-name'>"
+                    f"{msg['name']}</span>", unsafe_allow_html=True)
+        segments = split_action_segments(msg["text"])
+        for kind, content in segments:
+            if kind == "action":
+                st.markdown(f"<span class='action-text'>{content}</span>",
+                            unsafe_allow_html=True)
+            elif animate:
+                placeholder = st.empty()
+                shown = ""
+                for chunk in _speech_chunks(content):
+                    shown += chunk
+                    placeholder.markdown(shown + " ▌")
+                    time.sleep(0.15)
+                placeholder.markdown(shown)
+            else:
+                st.markdown(content)
+    if animate and pause_after:
+        with st.spinner(f"{pick_emoji(msg.get('name', ''))} "
+                        f"{msg['name']} 正在斟酌词句…"):
+            time.sleep(1.2)   # 角色间的"活人感"时间差（模拟打字与思考）
+
+
+def render_history(messages: list[dict]) -> None:
+    for msg in messages:
         if msg["role"] == "user":
             with st.chat_message("user", avatar=msg.get("avatar") or "🙎‍♂️"):
                 st.markdown(f"<span class='speaker-name-user'>"
                             f"{msg['name']}</span>", unsafe_allow_html=True)
                 st.markdown(msg["text"])
         else:
-            with st.chat_message("assistant",
-                                 avatar=msg.get("avatar") or msg.get("emoji")):
-                st.markdown(f"<span class='speaker-name'>"
-                            f"{msg['name']}</span>", unsafe_allow_html=True)
-                st.markdown(msg["text"])
+            render_assistant_message(msg, animate=False)
 
 
-render_history()
+render_history(active["messages"])
 
 # 闪存错误：失败路径经 rerun 回到这里显示一次，然后清掉
 flash = st.session_state.pop("flash_error", None)
@@ -764,25 +1047,27 @@ prompt = st.chat_input(
 
 if prompt:
     # ---------- 防呆闸门 ----------
-    if not st.session_state.profiles_ready:
-        st.warning("请先在左侧生成人物档案哦~")
-        st.stop()
     if provider != "DeepSeek" or not api_key:
         st.warning("先在左侧配好服务商与 API Key（v1.0.0 暂只支持 DeepSeek）。")
         st.stop()
 
-    st.session_state.messages.append({
-        "role": "user", "name": user_name or "访客",
+    active["messages"].append({
+        "role": "user", "name": active.get("user_name") or "访客",
         "text": prompt, "avatar": user_avatar})
-    render_history()
+    render_history(active["messages"])
 
-    with st.spinner(THINKING_LINES[len(st.session_state.messages) % len(THINKING_LINES)]):
+    with st.spinner(THINKING_LINES[len(active["messages"]) % len(THINKING_LINES)]):
         cli_args = ["chat", "--names", ",".join(names), "--rounds", "1",
                     "--responses", str(responses), "--group", str(group_turns),
-                    "--message", prompt, "--db", str(DB_PATH),
+                    "--message", prompt,
+                    "--db", str(session_db_path(active["session_id"])),
+                    "--project", active["project_id"],
                     "--budget", str(budget), "--yes"]
-        if memory_on:
-            cli_args += ["--memory-write", "rule", "--topic", memory_topic.strip()]
+        if active.get("memory_on"):
+            cli_args += ["--memory-write", "rule"]
+            topic = (active.get("memory_topic") or "").strip()
+            if len(topic) >= 2:
+                cli_args += ["--topic", topic]
         env = build_env(api_key, model_id, max_calls=per_msg_calls + 1)
         code, out, err = run_cli(cli_args, env,
                                  timeout=120.0 * per_msg_calls + 60.0)
@@ -790,23 +1075,33 @@ if prompt:
     if code != 0:
         # 回滚刚才那条用户消息：失败的发言不该留在历史里。
         # 用「闪存错误 + rerun」而不是就地报错——否则气泡会残留到下一次交互。
-        st.session_state.messages.pop()
+        active["messages"].pop()
         st.session_state.flash_error = ("😶 " + friendly_error(code, out, err),
                                         out, err)
         st.rerun()
 
     turns = parse_turns(out)
     if not turns:
-        st.session_state.messages.pop()
+        active["messages"].pop()
         st.session_state.flash_error = (
             "😶 角色们没接话（引擎正常返回但没有发言）。", out, err)
         st.rerun()
 
-    for speaker, text in turns:
+    new_msgs: list[dict] = []
+    for idx, (speaker, text) in enumerate(turns):
         matched = next((n for n in names if n in speaker or speaker in n), None)
         key = matched or speaker
-        st.session_state.messages.append({
+        new_msgs.append({
             "role": "assistant", "name": display_name.get(key, speaker),
             "text": text, "avatar": char_avatars.get(matched),
             "emoji": pick_emoji(key)})
+    # 视觉小说式呈现：先动画播放本轮发言（角色间有时间差），播完才入历史
+    for idx, msg in enumerate(new_msgs):
+        render_assistant_message(msg, animate=True,
+                                 pause_after=idx < len(new_msgs) - 1)
+    active["messages"].extend(new_msgs)
+    # 昵称随消息落盘（装扮面板的改动跟着会话持久化）
+    active["nicknames"] = {n: display_name[n] for n in names
+                           if display_name[n] != n}
+    save_sessions(st.session_state.chat_sessions)
     st.rerun()

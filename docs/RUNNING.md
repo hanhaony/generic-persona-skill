@@ -2703,10 +2703,61 @@ P6.3 一次加了 3 个码（`VALIDATION_TOPIC_TOO_{BROAD,SHORT,LONG}`），**�
 
 ---
 
+## 5.52 Web 阅读体验 P1：视觉小说式呈现（2026-11-05）
+
+- **动作/台词分离**：纯函数 `split_action_segments()`——（…）/(…) 括号形态
+  忠实保留原文笔迹，`**…**`/`*…*` 星号形态剥掉包裹符（否则渲染成 markdown
+  粗体破坏灰斜体）；台词按序保留。渲染层动作段挂 `.action-text` CSS
+  （灰 `#8c8478` / 斜体 / 0.92em）。
+- **拟真时间差**：多角色发言逐条呈现，角色间 `time.sleep(1.2)` +
+  `st.spinner("🌸 X 正在斟酌词句…")`；**只对本轮新发言动画，历史静态渲染**
+  ——Streamlit 每次交互全页重跑，对历史做延时等于每次重播一遍。
+- **伪流式打字机**：纯函数 `_speech_chunks()` 按句读切分台词，`st.empty()`
+  逐句浮现 + " ▌"光标（句粒度比逐字流畅，sleep 0.15/句）。
+- **全局排版**：聊天气泡换衬线体 `Noto Serif SC`（UI 其余部分保持无衬线）、
+  line-height 1.8、letter-spacing 0.5px、16px 圆角 + 柔和阴影。
+- **验证**：新增 `tests/test_app_render_rich.py` 17 项（四种动作包裹形态/
+  交错段序/纯动作发言/句读切分/CSS 与动画接线静态断言——AST 装载器同步
+  摘取 `_ACTION_RE` 模块级常量）；AppTest 冒烟（排版 CSS 注入/侧边栏结构
+  完好）；全量 **2046 → 2063 项**（2062 绿 + 1 红为用户本地 `var/webapp`
+  守卫）。
+
+### §5.53 Web 多会话管理（微信式多开 + 历史保存，2026-11-05，v0.42）
+
+单会话换人物/刷新即丢历史，多群同开时底层记忆与预算共用一个库会串台。
+本次把 `app.py` 重构为多会话架构：
+
+- **数据结构**：`chat_sessions`（session_id → {群名, 人名, messages,
+  project_id, user_name/avatar, memory_on/topic, nicknames, classifications}）
+  + `current_session_id` + `creating_new`；会话元数据落
+  `<DATA_DIR>/web_sessions.json`，刷新后恢复（写失败静默降级）。
+- **底层隔离（关键）**：**每会话一个独立 DB** `<DATA_DIR>/sessions/<sid>/
+  persona.db`——引擎预算是全库累计（external_usage_records 不分 project），
+  只换 `--project` 挡不住预算串台；独立 DB 让预算、长期记忆、人物档案三层
+  物理隔离。`--project prj_web_<sid>` 是第二道命名空间隔离。
+- **UI**：侧边栏顶部「➕ 新建群聊」+ radio 会话列表（新建时间倒序、重名
+  自动「（2）」后缀、CSS 卡片化 + 选中高亮 `:has(input[aria-checked])`）；
+  建档表单（群名/人名/昵称/头像/记忆设置）搬进主区；无会话时显示欢迎语。
+- **节奏滑杆与装扮按当前会话**：人数上限随会话变化（存量值先夹进新边界
+  防 slider 越界异常）；装扮 widget 键带 sid 前缀（同名角色不同会话不互踩），
+  昵称随消息落盘。
+- **widget 状态纪律**：radio 选项集变化前 pop 旧 `session_picker`；新建表单
+  键统一在 `DEFAULTS` 预置；`_pick_session` 回调提侧边栏作用域。
+- **验证**：新增 `tests/test_app_sessions.py` 16 项（隔离路径/命名空间/
+  标签唯一化/JSON 往返/损坏兜底/ID 唯一性）；AppTest 冒烟（新建表单/双会话
+  切换/消息防串台/节奏滑杆/欢迎语/按钮防呆）；全量 **2063 → 2079 项**
+  （2078 绿 + 1 红为用户本地 `var/webapp` 守卫）。
+- **迁移说明**：旧版单会话数据仍在 `var/webapp/persona.db`（档案不丢），
+  旧聊天记录本就只存 session_state 无法找回；新版会话从零开始。
+
+---
+
 ## 6. 变更历史
 
 | 日期 | 版本 | 变更 |
 | --- | --- | --- |
+| 2026-11-05 | v0.41 | **Web 阅读体验 P1：视觉小说式呈现**（详见 §5.52）：`split_action_segments` 动作/台词分离（括号忠实保留、星号剥除）+ `.action-text` 灰斜体样式；多角色发言拟真时间差（sleep 1.2s + 思考 spinner，仅新发言动画、历史静态）；`_speech_chunks` 句读切分 + `st.empty()` 逐句打字机；聊天气泡衬线体 `Noto Serif SC` + line-height 1.8 + 柔和阴影。新增 `tests/test_app_render_rich.py` 17 项；全量 **2046 → 2063 项**（2062 绿 + 1 红为用户本地 `var/webapp` 守卫） | 待确认 |
+| 2026-11-05 | v0.42 | **Web 多会话管理：微信式多开 + 历史保存**（详见 §5.53）：`chat_sessions`/`current_session_id` 会话数据结构 + `web_sessions.json` 刷新恢复；**每会话独立 DB**（预算/记忆/档案物理隔离——引擎预算全库累计，只换 --project 挡不住串台）+ `prj_web_<sid>` 第二道隔离；侧边栏 ➕ 新建群聊 + radio 会话列表（倒序/重名后缀/CSS 高亮），建档表单搬主区，无会话欢迎语；节奏滑杆与装扮按当前会话（滑杆值夹边界防越界）。新增 `tests/test_app_sessions.py` 16 项；全量 **2063 → 2079 项**（2078 绿 + 1 红为用户本地 `var/webapp` 守卫） | 待确认 |
 | 2026-11-04 | v0.40 | **Web 壳 P0：侧边栏去 expander + 实体分类自动推断**（详见 §5.51）：侧边栏 expander 全部移除（API/场景常驻分区、装扮 toggle 门控）+ 暴力 CSS 兜底；删除逐名类型/作品手动配置，改为 `classify_names()` 一次极低成本模型调用自动推断（虚构无作品降级真人、失败全兜底真人、结果缓存）；widget 键统一 `DEFAULTS` 初始化；新增 `tests/test_app_classify_names.py` 10 项；全量 **2036 → 2046 项**（2045 绿 + 1 红为用户本地 `var/webapp` 守卫） | 待确认 |
 | 2026-11-04 | v0.39 | **Web 壳上云准备**（详见 §5.50）：expander 默认箭头图标隐藏（四类选择器 `display:none`）+ 标题排版加粗；app.py 数据目录三级解析 `_resolve_data_dir()`（环境变量 > 本地 var/webapp 可写探测 > `tempfile.mkdtemp()` 会话临时目录并缓存防 rerun 换目录）；仓库根新增 `requirements.txt`（仅 `streamlit>=1.41`，核心引擎零依赖不变）；API Key 输入确认 `type="password"` | 待确认 |
 | 2026-11-04 | v0.38 | **P0 群聊体验升级：跨宇宙认知 + 群像法则 + Web 混合世界观建档**（详见 §5.49）：dialogue 静态块 `P0_GROUP_DYNAMICS_RULES`（性格决定话多话少 + 防复读，中性措辞有守卫）+ 纯函数 `build_awareness_block`（读 `PersonEntity` 的 `entity_type`+`works`：同作品=旧识免客套、跨作品=陌生人、REAL×FICTIONAL=允许一次「我演过TA」吐槽、REAL×REAL=按档案；认知许可与事实分离），`DIALOGUE_PROMPT_VERSION` → `p8-crossuniverse-2026-11-04a`；app.py 逐名类型/作品配置 + `group_build_specs` 分批建档（归一化对齐引擎，分批错=认知错）。新增 2 份测试 25 项 + AppTest 冒烟；全量 **2011 → 2036 项**（2035 绿 + 1 红为用户本地 `var/webapp` 守卫） | 待确认 |
