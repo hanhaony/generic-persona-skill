@@ -872,8 +872,8 @@ def build_session_profiles(names: list[str], api_key: str, base_url: str,
         with st.spinner(f"📖 {label}——正在搜集资料..."):
             cli_args = ["run", "--names", ",".join(spec["names"]),
                         "--type", spec["entity_type"],
-                        "--db", str(db_path), "--project", project_id,
-                        "--out", str(db_path.parent), "--budget", str(budget),
+                        "--out", str(db_path.parent), "--project", project_id,
+                        "--budget", str(budget),
                         "--yes"]
             if spec["work_title"]:
                 cli_args += ["--work-title", spec["work_title"]]
