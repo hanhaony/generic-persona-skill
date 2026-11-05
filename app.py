@@ -353,7 +353,8 @@ def save_avatar(upload, role_key: str) -> str | None:
 # --------------------------------------------------------------------------
 
 
-def build_env(api_key: str, model_id: str, max_calls: int) -> dict[str, str]:
+def build_env(api_key: str, model_id: str, max_calls: int,
+              search_key: str = "") -> dict[str, str]:
     """子进程环境变量。密钥只走环境变量（引擎侧设计），Model ID 可被覆盖。
 
     云端没有 .env：设了预算（--budget）就必须给单价 + token 估算，
@@ -378,6 +379,10 @@ def build_env(api_key: str, model_id: str, max_calls: int) -> dict[str, str]:
         env["PERSONA_PROVIDER_API_KEY"] = api_key
         # 引擎的别名：同时给，防某条路径只认别名
         env.setdefault("DEEPSEEK_API_KEY", api_key)
+    if search_key:
+        # 检索密钥（云端无 .env 的通道）：TAVILY_API_KEY 是引擎认可的别名
+        env["TAVILY_API_KEY"] = search_key
+        env.setdefault("PERSONA_SEARCH_API_KEY", search_key)
     return env
 
 
@@ -776,6 +781,12 @@ with st.sidebar:
                              placeholder="如 deepseek-chat")
     api_key = st.text_input("API Key", type="password", key="api_key",
                             placeholder="只存在本机内存里，绝不落盘")
+    search_key = st.text_input("检索 Key（Tavily）", type="password",
+                               key="search_key",
+                               help="建档材料全部来自 Tavily 搜索，没有它引擎"
+                                    "拒绝花钱（一条检索都不发起）。"
+                                    "本地 .env 已配 TAVILY_API_KEY 的可留空；"
+                                    "云端部署必须在这里填。")
     budget = st.number_input("单次预算上限（美元）", min_value=0.05,
                              max_value=10.0, value=2.0, step=0.05,
                              help="引擎软上限：花到这个数会暂停询问。")
@@ -837,7 +848,7 @@ with st.sidebar:
 
 def build_session_profiles(names: list[str], api_key: str, base_url: str,
                            model_id: str, budget: float, db_path: Path,
-                           project_id: str,
+                           project_id: str, search_key: str = "",
                            cached_class: dict | None = None) -> dict | None:
     """为一个会话建档：实体推断（可带缓存）→ 分批 run → 逐个验证。
 
@@ -877,7 +888,7 @@ def build_session_profiles(names: list[str], api_key: str, base_url: str,
     if len(specs) > 1:
         st.caption(f"🧩 混合阵营：分 {len(specs)} 批建档"
                    "（真实人物一批、每个作品一批）。")
-    env = build_env(api_key, model_id, max_calls=200)
+    env = build_env(api_key, model_id, max_calls=200, search_key=search_key)
     for i, spec in enumerate(specs, start=1):
         label = (f"第 {i}/{len(specs)} 批："
                  + "、".join(spec["names"])
@@ -958,7 +969,8 @@ if creating_new or active is None:
             sid = new_session_id()
             classifications = build_session_profiles(
                 names, api_key, base_url, model_id, budget,
-                session_db_path(sid), make_project_id(sid))
+                session_db_path(sid), make_project_id(sid),
+                search_key=search_key)
             if classifications is not None:
                 st.session_state.chat_sessions[sid] = {
                     "session_id": sid,
@@ -1082,7 +1094,8 @@ if prompt:
             topic = (active.get("memory_topic") or "").strip()
             if len(topic) >= 2:
                 cli_args += ["--topic", topic]
-        env = build_env(api_key, model_id, max_calls=per_msg_calls + 1)
+        env = build_env(api_key, model_id, max_calls=per_msg_calls + 1,
+                        search_key=search_key)
         code, out, err = run_cli(cli_args, env,
                                  timeout=120.0 * per_msg_calls + 60.0)
 
