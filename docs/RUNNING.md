@@ -2738,6 +2738,14 @@ P6.3 一次加了 3 个码（`VALIDATION_TOPIC_TOO_{BROAD,SHORT,LONG}`），**�
 - **UI**：侧边栏顶部「➕ 新建群聊」+ radio 会话列表（新建时间倒序、重名
   自动「（2）」后缀、CSS 卡片化 + 选中高亮 `:has(input[aria-checked])`）；
   建档表单（群名/人名/昵称/头像/记忆设置）搬进主区；无会话时显示欢迎语。
+  v0.43 起**新建期间列表常驻**：点任一旧会话即退出新建模式；另加
+  「↩️ 取消新建」按钮（记住来路会话，取消后直接回到原会话）。
+- **云端部署 env 通道（v0.43 补记）**：云端没有 `.env`，壳层必须补齐引擎的
+  环境依赖——`build_env` 对预算配套六件套（`PRICE_IN/OUT_PER_1M`、
+  `PRICE_SOURCE`、`PRICE_CHECKED_AT`、`EST_TOKENS_IN/OUT`）setdefault 兜底；
+  侧边栏新增「检索 Key（Tavily）」输入框，经 `build_env` 同时注入
+  `TAVILY_API_KEY` 与 `PERSONA_SEARCH_API_KEY`（引擎 loader 的别名映射）。
+  建档命令只用 `--out`（`run` 没有 `--db`，数据库在 `<out>/persona.db`）。
 - **节奏滑杆与装扮按当前会话**：人数上限随会话变化（存量值先夹进新边界
   防 slider 越界异常）；装扮 widget 键带 sid 前缀（同名角色不同会话不互踩），
   昵称随消息落盘。
@@ -2754,8 +2762,9 @@ P6.3 一次加了 3 个码（`VALIDATION_TOPIC_TOO_{BROAD,SHORT,LONG}`），**�
 
 ## 6. 变更历史
 
-| 日期 | 版本 | 变更 |
-| --- | --- | --- |
+| 日期 | 版本 | 变更 | 状态 |
+| --- | --- | --- | --- |
+| 2026-11-08 | v0.43 | **Web 云端部署三连修 + 新建态会话列表常驻**（详见 §5.53 补记）：建档命令去掉误传的 `--db`（`persona run` 只有 `--out`，数据库在 `<out>/persona.db`）；云端无 `.env` 时 `build_env` 对预算配套六件套 setdefault 兜底（单价 0.3/1.2 + 官方价目表来源 + 估算 3000/2000）；侧边栏新增「检索 Key（Tavily）」输入，`build_env` 注入 `TAVILY_API_KEY`/`PERSONA_SEARCH_API_KEY` 双别名；「新建群聊」期间会话列表常驻（点旧会话即返回）+ 新增「↩️ 取消新建」（记住来路会话）。全量 **2079 项**（2078 绿 + 1 红为用户本地 `var/webapp` 守卫） | 待确认 |
 | 2026-11-05 | v0.41 | **Web 阅读体验 P1：视觉小说式呈现**（详见 §5.52）：`split_action_segments` 动作/台词分离（括号忠实保留、星号剥除）+ `.action-text` 灰斜体样式；多角色发言拟真时间差（sleep 1.2s + 思考 spinner，仅新发言动画、历史静态）；`_speech_chunks` 句读切分 + `st.empty()` 逐句打字机；聊天气泡衬线体 `Noto Serif SC` + line-height 1.8 + 柔和阴影。新增 `tests/test_app_render_rich.py` 17 项；全量 **2046 → 2063 项**（2062 绿 + 1 红为用户本地 `var/webapp` 守卫） | 待确认 |
 | 2026-11-05 | v0.42 | **Web 多会话管理：微信式多开 + 历史保存**（详见 §5.53）：`chat_sessions`/`current_session_id` 会话数据结构 + `web_sessions.json` 刷新恢复；**每会话独立 DB**（预算/记忆/档案物理隔离——引擎预算全库累计，只换 --project 挡不住串台）+ `prj_web_<sid>` 第二道隔离；侧边栏 ➕ 新建群聊 + radio 会话列表（倒序/重名后缀/CSS 高亮），建档表单搬主区，无会话欢迎语；节奏滑杆与装扮按当前会话（滑杆值夹边界防越界）。新增 `tests/test_app_sessions.py` 16 项；全量 **2063 → 2079 项**（2078 绿 + 1 红为用户本地 `var/webapp` 守卫） | 待确认 |
 | 2026-11-04 | v0.40 | **Web 壳 P0：侧边栏去 expander + 实体分类自动推断**（详见 §5.51）：侧边栏 expander 全部移除（API/场景常驻分区、装扮 toggle 门控）+ 暴力 CSS 兜底；删除逐名类型/作品手动配置，改为 `classify_names()` 一次极低成本模型调用自动推断（虚构无作品降级真人、失败全兜底真人、结果缓存）；widget 键统一 `DEFAULTS` 初始化；新增 `tests/test_app_classify_names.py` 10 项；全量 **2036 → 2046 项**（2045 绿 + 1 红为用户本地 `var/webapp` 守卫） | 待确认 |

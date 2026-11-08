@@ -719,15 +719,17 @@ with st.sidebar:
     # ---------- 会话列表（微信式多开，2026-11-05 P1） ----------
     if st.button("➕ 新建群聊", use_container_width=True, key="new_session_btn"):
         st.session_state.creating_new = True
+        # 记住从哪个会话进来的，取消新建时能回去
+        st.session_state.prev_session_id = st.session_state.current_session_id
         st.session_state.current_session_id = None
         st.session_state.pop("session_picker", None)   # 选项集将变化，清掉旧选择
         st.rerun()
 
-    if creating_new:
-        st.caption("📝 正在新建群聊——在右侧填写人物并生成档案。")
-    elif chat_sessions:
+    if chat_sessions:
         # radio 选项必须唯一：重名群聊自动加「（2）」后缀；列表按创建时间
-        # 倒序（新会话在上，像微信的最近聊天）。
+        # 倒序（新会话在上，像微信的最近聊天）。**新建状态下也常驻**——
+        # 点任意旧会话即退出新建模式（v0.43：之前新建时把列表藏了，
+        # 用户点「新建群聊」后找不到老会话入口）。
         used_labels: set[str] = set()
         label_to_id: dict[str, str] = {}
         for sid, sess in chat_sessions.items():
@@ -736,7 +738,7 @@ with st.sidebar:
             used_labels.add(lab)
             label_to_id[lab] = sid
         labels = list(reversed(list(label_to_id)))
-        if cur_id not in chat_sessions:
+        if not creating_new and cur_id not in chat_sessions:
             # 刷新恢复/旧状态失效：自动选中最近一个会话（微信打开即最近聊天）
             cur_id = label_to_id[labels[0]]
             st.session_state.current_session_id = cur_id
@@ -752,11 +754,25 @@ with st.sidebar:
                 st.session_state.current_session_id)
             st.session_state.creating_new = False
 
+        if creating_new:
+            st.caption("📝 正在新建群聊——点下面任一旧会话即可返回。")
+            if st.button("↩️ 取消新建", use_container_width=True,
+                         key="cancel_new_btn"):
+                st.session_state.creating_new = False
+                prev = st.session_state.pop("prev_session_id", None)
+                if prev in chat_sessions:
+                    st.session_state.current_session_id = prev
+                elif labels:
+                    st.session_state.current_session_id = label_to_id[labels[0]]
+                st.session_state.pop("session_picker", None)
+                st.rerun()
         st.radio("会话列表", labels,
                  index=labels.index(cur_label),
                  key="session_picker", on_change=_pick_session,
                  label_visibility="collapsed")
         st.caption("👆 点击切换会话——每个会话的档案、记忆与预算完全独立。")
+    elif creating_new:
+        st.caption("📝 正在新建群聊——在右侧填写人物并生成档案。")
     else:
         st.caption("还没有会话——点上面「新建群聊」开一个吧。")
 
