@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -70,14 +71,63 @@ def _resolve_data_dir() -> Path:
 
 
 DATA_DIR = _resolve_data_dir()                     # 云端回退临时目录，本地仍是 var/webapp
-AVATAR_DIR = DATA_DIR / "avatars"
 # —— 多会话（2026-11-05 P1，微信式多开）——
 # 每个会话一个**独立 DB**：引擎预算是全库累计（external_usage_records 不分
 # project），只传不同 --project 挡不住预算串台；独立 DB 让预算、长期记忆、
 # 人物档案三层全部物理隔离。会话元数据（群名/人名/聊天记录/project_id）
-# 另存 JSON，刷新页面后恢复列表。云端 /tmp 目录随容器生命周期，属平台限制。
-SESSIONS_DIR = DATA_DIR / "sessions"
-SESSIONS_FILE = DATA_DIR / "web_sessions.json"
+# 另存 JSON，刷新页面后恢复。云端 /tmp 目录随容器生命周期，属平台限制。
+#
+# —— 私人空间（2026-11-08 v0.44 多用户隔离）——
+# 真正的会话/档案/头像目录**按口令哈希分空间**（DATA_DIR/users/<uid>/）：
+# 同口令=同空间（跨设备续聊），不同口令=完全隔离，不填=浏览器会话级访客目录。
+# SESSIONS_DIR / SESSIONS_FILE / AVATAR_DIR 三个全局在主流程开头依据口令
+# 动态赋值（见「私人空间口令」段），本文件后续代码一律只用这三个名字。
+APP_SPACE_SALT = "persona-webapp-space-v1"
+
+
+def space_uid(passphrase: str) -> str:
+    """口令 → 空间 ID（PBKDF2-SHA256 10 万轮取 16 位 hex）。
+
+    盐是公开常量：防的是拿哈希表反推，防不了对短口令的离线枚举——所以 UI
+    一直提醒口令要长。空间 ID 里不含口令本身，落盘内容只有这个 ID。
+    """
+    return hashlib.pbkdf2_hmac(
+        "sha256", (passphrase or "").strip().encode("utf-8"),
+        APP_SPACE_SALT.encode("utf-8"), 100_000).hex()[:16]
+
+
+def resolve_space_dir(passphrase: str) -> tuple[Path, str]:
+    """口令 → (私人数据目录, 空间 ID)。空口令 = 会话级访客目录。
+
+    有口令：DATA_DIR/users/<uid>/（目录在此建好，save_sessions 才能
+    直接写文件）。无口令：DATA_DIR/guest/<mkdtemp>/ 并缓存进
+    session_state——rerun 之间稳定，浏览器会话结束即散。
+    """
+    if (passphrase or "").strip():
+        uid = space_uid(passphrase)
+        space = DATA_DIR / "users" / uid
+        try:
+            space.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass  # 建不出来就让 save_sessions 静默降级（云端只读盘的兜底路径）
+        return space, uid
+    try:
+        cached = st.session_state.get("guest_data_dir")
+        if cached:
+            return Path(str(cached)), "guest"
+    except Exception:  # noqa: BLE001 —— 无脚本运行上下文（如纯导入）时不炸
+        return DATA_DIR / "guest", "guest"
+    try:
+        guest_root = DATA_DIR / "guest"
+        guest_root.mkdir(parents=True, exist_ok=True)
+        gdir = Path(tempfile.mkdtemp(prefix="guest-", dir=str(guest_root)))
+    except OSError:
+        gdir = DATA_DIR / "guest"
+    try:
+        st.session_state["guest_data_dir"] = str(gdir)
+    except Exception:  # noqa: BLE001
+        pass
+    return gdir, "guest"
 
 DEFAULT_GROUP_NAME = "大观园日常"
 DEFAULT_API_BASE = "https://api.deepseek.com"
@@ -688,9 +738,35 @@ DEFAULTS = {
     "memory_on": True,
     "memory_topic": "",
     "show_dress": False,
+    "space_pass": "",
 }
 for key, value in DEFAULTS.items():
     st.session_state.setdefault(key, value)
+
+# ---------- 私人空间口令（2026-11-08 v0.44 多用户隔离）----------
+# 必须发生在会话恢复之前：SESSIONS_DIR/SESSIONS_FILE/AVATAR_DIR 三个全局
+# 由口令决定，load_sessions 读的是当前空间的文件。
+with st.sidebar:
+    space_pass = st.text_input(
+        "私人空间口令", type="password", key="space_pass",
+        help="决定你的数据放在哪个私人空间：同一口令在任何设备打开都回到"
+             "同一个空间（聊天记录/档案/记忆一起回来）；不同口令完全隔离。"
+             "口令就是这道空间唯一的门，请用长一点、别人猜不到的。")
+    if not space_pass:
+        st.caption("🎩 未填口令 = 临时访客空间（浏览器会话结束就清空，"
+                   "想留住记忆请设一个自己的口令）。")
+
+_space_dir, _space_uid = resolve_space_dir(space_pass)
+SESSIONS_DIR = _space_dir / "sessions"
+SESSIONS_FILE = _space_dir / "web_sessions.json"
+AVATAR_DIR = _space_dir / "avatars"
+if st.session_state.get("active_space_uid") != _space_uid:
+    # 换空间（口令改了/首次进入）：旧空间会话清场，下面的恢复段从新空间重载
+    st.session_state["chat_sessions"] = {}
+    st.session_state["current_session_id"] = None
+    st.session_state["creating_new"] = False
+    st.session_state["active_space_uid"] = _space_uid
+    st.session_state["sessions_loaded"] = False
 
 # 刷新/重开浏览器：从磁盘恢复会话列表（聊天记录随会话一起回来）。
 if not st.session_state.get("sessions_loaded"):
