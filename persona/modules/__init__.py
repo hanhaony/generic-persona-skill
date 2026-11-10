@@ -18,6 +18,7 @@
 """
 
 from . import (
+    character,
     compliance,
     dialogue,
     evidence,
@@ -35,6 +36,7 @@ __all__ = [
     "evidence",
     "persona",
     "relationship",
+    "character",
     "dialogue",
     "memory",
     "evaluation",

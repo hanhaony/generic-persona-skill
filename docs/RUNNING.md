@@ -2769,10 +2769,62 @@ P6.3 一次加了 3 个码（`VALIDATION_TOPIC_TOO_{BROAD,SHORT,LONG}`），**�
 
 ---
 
+## 5.54 P8.1-B：故事人物实例与认知模型（叙事引擎第一步，2026-11-10）
+
+> 设计依据：P8.1-A-R 修订版设计报告（同日，人工审核后批准实施）。
+> 性质：**纯引擎层新增**——CLI/app/对话链路零改动，`persona run`/`chat`
+> 真跑路径与输出完全不变；现有 2091 项测试零破坏。
+
+- **第 14 个实体 `CharacterInstance`（chi_）**：同一 `PersonaProfile` 在不同
+  故事里的独立化身（故事人物实例）。档案（pnf_）是现实锚永不因故事改写；
+  实例是故事层产物，namespace 恒 `SIMULATED`——与 EV-V1（SIMULATED 永不进
+  证据）构成防污染双闸。payload 内嵌全部故事态，依托 records 表 kind+payload
+  文档式设计，**零 SQLite Schema 改动**（schema.py/sqlite.py 未动）。
+- **支撑标识符**（`ids.py::AUX_PREFIXES`，引用型不建表）：`Story sty_`（故事锚，
+  多实例归同一场故事；与 ConversationSession 的桥接属 P8.3 接线决策，本阶段
+  完全解耦）、`KnowledgeEntry kn_`（知识条目 ID，内嵌 payload 但全局唯一）。
+- **BehaviorPolicy（纯函数装配，不落库可重算）**：core_dispositions（traits
+  PATTERN）/ situational_patterns（habits + REPEATED）/ relational_patterns
+  （按 target_id 分键，interaction_patterns 关系对象信息保留，只装本人单向
+  视角）。**纪律**：single_events 与 SINGLE 条目结构性排除（单次行为不进策略）；
+  无 trigger/action 键对（禁止固定 IF-THEN）；values/motivations 起步恒空
+  （NOT IMPLEMENTED，缺口如实进 open_questions，不从 traits 猜）。
+- **KnowledgeState（七类）**：OBSERVED/TOLD/INFERRED/BELIEVED/SUSPECTED/SECRET，
+  UNKNOWN 不落条目（"不知情"由 ACTIVE 条目缺席表达）。**TOLD 强制溯源**
+  （source_ref 指向具体传播轮次/事件 + teller_id）；讲述者可信度与内容可信度
+  **分开存不换算**；INFERRED 强制依据（EV-V3 精神）；修正链 CORRECTED→
+  superseded_by 指向新条（修正不删旧条）。SECRET 结构性单持有者（条目只在
+  持有人实例 payload 里，他人实例根本不携带）。
+- **LatentRelation（隐性关系看法）**：定性枚举（trust 五档 + stance，无数值
+  ——避开 FORBIDDEN_FIELD_PATTERN 纪律）；**origin_refs ≥1 强制**（没有故事
+  事件依据不得产生关系看法，禁止把档案 feeling_toward 无依据换算）；A 对 B
+  与 B 对 A 分别存在各自实例、互不合并。演化逻辑是后续阶段能力，本阶段只做
+  写入校验。
+- **OOC 基础确定性检查（4 条，全结构化比对，不是语义理解）**：K1 知识边界
+  （集合比对，FLAGGED）/ S1 秘密疑似泄密（关键词启发，**只报 SUSPECTED_LEAK**，
+  处置权在叙事层）/ I1 身份事实（无解释 BLOCKED；可追溯 motivation →
+  TOLERATED 并记录为重要行为；自报错引按缺失处理）/ T1 经历时序（查无 →
+  BLOCKED）。输出分级 OK/TOLERATED/SUSPECTED_LEAK/FLAGGED/BLOCKED，评估器
+  永不改写人物数据。语义级 OOC、关系演化、自动传播均 NOT IMPLEMENTED（如实
+  标注，无半实现）。
+- **错误码复用**：模块层校验全部复用既有 `VALIDATION_GATE_REJECTED`/
+  `STATE_CONFLICT_NO_NEW_EVIDENCE`（同 persona.create_profile 先例）/
+  `NOT_FOUND_ENTITY` 等，**零新增 ErrorCode**。
+- **evaluation.py 无需改动**：`run_static_checks` 本就遍历 modules/ 全目录做
+  FORBIDDEN_FIELD_PATTERN/依赖/签名三项扫描，character.py 自动纳入（T18 钉住）。
+- **验证**：新增 `tests/test_character_module.py` 21 项（T1~T20 + 修订约束
+  补充），全确定性零 AI：实例 CRUD/闸门/装配纪律/知识七类与修正链/关系看法
+  双向独立/OOC 四检查边界/防污染端到端（写 100 条知识后证据表计数不变）/
+  字段名守卫。全量 **2091 → 2112 项**（2111 绿 + 1 红为用户本地 `var/webapp`
+  守卫）。文档同步：DATA_MODEL v0.3、INTERFACES v0.1.7（§16 新增）。
+
+---
+
 ## 6. 变更历史
 
 | 日期 | 版本 | 变更 | 状态 |
 | --- | --- | --- | --- |
+| 2026-11-10 | v0.45 | **P8.1-B：故事人物实例与认知模型**（详见 §5.54）：第 14 个实体 `CharacterInstance`（chi_，namespace 恒 SIMULATED，payload 承载目标/情绪/信念/知识/关系看法，零 Schema 改动）；支撑标识符 `Story sty_` / `KnowledgeEntry kn_`；BehaviorPolicy 纯函数装配（single_events/SINGLE 排除、个人与关系行为分离、无 trigger/action 键）；KnowledgeState 七类（TOLD 强制溯源 + 双可信度分立、INFERRED 强制依据、修正链、SECRET 结构性单持有者、UNKNOWN 缺席表达）；LatentRelation 定性枚举（origin_refs ≥1、双向分实例）；OOC 基础四检查（K1/S1/I1/T1，S1 只报疑似、I1 无解释 BLOCKED/可追溯 TOLERATED）；复用既有错误码零新增；evaluation.py 零改动（全目录扫描自动覆盖）。CLI/app/对话链路零改动，真跑路径不变。新增 `tests/test_character_module.py` 21 项；全量 **2091 → 2112 项**（2111 绿 + 1 红为用户本地 `var/webapp` 守卫）。设计依据 P8.1-A-R 修订版（同日审核通过） | 待确认 |
 | 2026-11-08 | v0.44 | **Web 多用户隔离：私人空间口令制**（详见 §5.53）：数据目录按口令哈希分空间（`users/<uid>/`，PBKDF2-SHA256 10 万轮）；同口令跨设备同空间、异口令完全隔离、不填 = 会话级访客目录；换空间自动清场重载；API Key 保持浏览器内存不落盘。此前云端可写盘时全体访客共享 `var/webapp`（记录/档案/头像互通）即本次修复的缺陷。新增 `tests/test_app_spaces.py` 12 项；全量 **2079 → 2091 项**（2090 绿 + 1 红为用户本地 `var/webapp` 守卫） | 待确认 |
 | 2026-11-08 | v0.43 | **Web 云端部署三连修 + 新建态会话列表常驻**（详见 §5.53 补记）：建档命令去掉误传的 `--db`（`persona run` 只有 `--out`，数据库在 `<out>/persona.db`）；云端无 `.env` 时 `build_env` 对预算配套六件套 setdefault 兜底（单价 0.3/1.2 + 官方价目表来源 + 估算 3000/2000）；侧边栏新增「检索 Key（Tavily）」输入，`build_env` 注入 `TAVILY_API_KEY`/`PERSONA_SEARCH_API_KEY` 双别名；「新建群聊」期间会话列表常驻（点旧会话即返回）+ 新增「↩️ 取消新建」（记住来路会话）。全量 **2079 项**（2078 绿 + 1 红为用户本地 `var/webapp` 守卫） | 待确认 |
 | 2026-11-05 | v0.41 | **Web 阅读体验 P1：视觉小说式呈现**（详见 §5.52）：`split_action_segments` 动作/台词分离（括号忠实保留、星号剥除）+ `.action-text` 灰斜体样式；多角色发言拟真时间差（sleep 1.2s + 思考 spinner，仅新发言动画、历史静态）；`_speech_chunks` 句读切分 + `st.empty()` 逐句打字机；聊天气泡衬线体 `Noto Serif SC` + line-height 1.8 + 柔和阴影。新增 `tests/test_app_render_rich.py` 17 项；全量 **2046 → 2063 项**（2062 绿 + 1 红为用户本地 `var/webapp` 守卫） | 待确认 |

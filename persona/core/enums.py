@@ -322,6 +322,12 @@ class PausedReason(_StrEnum):
 # --------------------------------------------------------------------------
 
 # 13 个业务实体（DATA_MODEL §3）+ 支撑实体，与 ID 前缀一一对应（见 core/ids.py）
+#
+# P8.1-B（2026-11-10）追加 `CharacterInstance`（第 14 个实体，DATA_MODEL §10 变更
+# 历史同步登记）：**故事人物实例**——同一 PersonaProfile 在不同故事里的独立化身。
+# 实例是故事层产物，namespace 恒为 SIMULATED（闸门见下）：档案（pnf_）是现实锚，
+# 模拟永不写回；实例的状态（目标/情绪/信念/知识/关系看法）全部在 payload 内，
+# 依托 records 表 kind+payload 文档式设计，零 Schema 改动。
 ENTITY_KINDS: frozenset[str] = frozenset(
     {
         "Project",
@@ -337,6 +343,7 @@ ENTITY_KINDS: frozenset[str] = frozenset(
         "MemoryItem",
         "TaskRecord",
         "DerivedArtifact",
+        "CharacterInstance",
     }
 )
 
@@ -365,6 +372,10 @@ NAMESPACE_WRITE_GATE: dict[str, frozenset[ProvenanceNamespace]] = {
             ProvenanceNamespace.SIMULATED,
         }
     ),
+    # P8.1-B：故事人物实例是纯故事层产物——**只许 SIMULATED**。
+    # 这与 EV-V1（SIMULATED 永不进证据）共同构成防污染双闸：档案/证据现实层
+    # 与实例故事层在命名空间上彻底隔离。
+    "CharacterInstance": frozenset({ProvenanceNamespace.SIMULATED}),
 }
 
 

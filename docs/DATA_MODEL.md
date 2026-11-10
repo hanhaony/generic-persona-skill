@@ -68,6 +68,12 @@
 | MemoryItem | `mem_` | `mem_6e72…` |
 | TaskRecord | `tsk_` | `tsk_0aa5…` |
 | DerivedArtifact | `dar_` | `dar_c912…` |
+| CharacterInstance | `chi_` | `chi_7d31…`（P8.1-B，故事人物实例） |
+
+支撑引用型标识符（不是业务实体，不建表，`ids.py::AUX_PREFIXES` 登记）：
+`UsageRecord usg_` / `AuditRecord adt_` / **`Story sty_`（P8.1-B，故事锚，把多个
+实例归到同一场故事；与 ConversationSession 的桥接属 P8.3 接线决策）** /
+**`KnowledgeEntry kn_`（P8.1-B，内嵌实例 payload，须全局唯一以支持跨实例引用）**。
 
 ### 2.2 通用字段（每条记录都有）
 
@@ -96,7 +102,9 @@
 
 ## 3. 实体总览与关系图
 
-共 **13 个实体**：11 个业务核心 + 2 个支撑实体（`ConflictRecord`、`DerivedArtifact`）。
+共 **14 个实体**：11 个业务核心 + 2 个支撑实体（`ConflictRecord`、`DerivedArtifact`）
++ 1 个故事层实体（`CharacterInstance`，P8.1-B：同一 `PersonaProfile` 在不同故事
+中的独立化身；namespace 恒 `SIMULATED`，payload 承载目标/情绪/信念/知识/关系看法）。
 
 ### 3.1 Mermaid 实体关系图
 
@@ -123,6 +131,7 @@ erDiagram
     CONVERSATION_SESSION ||--o{ CONVERSATION_TURN : "由轮次组成"
     CONVERSATION_TURN ||--o{ MEMORY_ITEM : "产生 仅 SIMULATED"
 
+    PERSON_ENTITY ||--o{ CHARACTER_INSTANCE : "P8.1-B 故事化身（同一档案多实例）"
     MEMORY_ITEM }o--o{ DERIVED_ARTIFACT : "被摘要或缓存"
 ```
 
@@ -1293,3 +1302,4 @@ PENDING ──start──► RUNNING ──► COMPLETED
 | 2026-10-13 | v0.1 | 初版：Source / Evidence / Person / Relationship / Session / Memory 六类结构 |
 | 2026-10-13 | v0.2 | P1.1 重写：13 个实体；引入 `EntityType`（真人与虚构角色）、`SourceEvent`、`TaskRecord`、`Project`、`ConflictRecord`、`DerivedArtifact`；`PROFILE` → `PROFILE_BACKGROUND`；`origin` → `namespace`；新增转载族谱、改编版本隔离、派生产物失效治理、40 项校验清单 |
 | 2026-10-13 | v0.2.1 | P1.2-A 同步：`TaskStatus` 收敛为六态 + `paused_reason`；新增 `UsageRecord`、`AuditRecord` 两条支撑记录及其校验规则；标注 Q-06 / Q-07 / Q-25 已决定；与 `INTERFACES.md` §14 建立实体—接口对照 |
+| 2026-11-10 | v0.3 | **P8.1-B 第 14 个实体 `CharacterInstance`（chi_）**：故事人物实例——同一 PersonaProfile 在不同故事中的独立化身；namespace 恒 `SIMULATED`（写入闸门 + EV-V1 构成防污染双闸）；payload 内嵌 KnowledgeState（七类：OBSERVED/TOLD/INFERRED/BELIEVED/SUSPECTED/SECRET，UNKNOWN 以缺席表达；TOLD 强制溯源 + 双可信度）与 LatentRelation（定性枚举、origin_refs ≥1、双向分实例存储）；新增支撑引用型标识符 `Story sty_` / `KnowledgeEntry kn_`（AUX_PREFIXES，不建表）；records 表 kind+payload 文档式承载，零 Schema 改动。设计依据 P8.1-A-R 修订版（同日） |

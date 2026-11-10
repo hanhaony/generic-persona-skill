@@ -16,7 +16,7 @@
 | --- | --- |
 | 要实现某个模块的开发者 | 先读 §1 公共契约，再读你负责的那一节，最后读 §13 依赖约束 |
 | 要写测试的开发者 | 读每个操作的「失败」列（这就是测试用例清单）+ §10 Evaluation |
-| 想改接口的人 | 先读 `DECISIONS.md` §4 变更流程，本文 §16 留痕 |
+| 想改接口的人 | 先读 `DECISIONS.md` §4 变更流程，本文 §17 留痕 |
 
 **全篇通用的三条规则**：
 
@@ -54,7 +54,11 @@ project_id
    ├── TaskRecord.project_id        ← 唯一持有 checkpoints 的实体
    │      └── checkpoint.artifact_ids{ source_ids[], evidence_ids[],
    │             persona_ids[], relationship_ids[], session_id[] }
-   └── DerivedArtifact.source_memory_ids[] → MemoryItem.id
+   ├── DerivedArtifact.source_memory_ids[] → MemoryItem.id
+   └── CharacterInstance.character_id → PersonEntity.id   （P8.1-B）
+          └── story_id = sty_（故事锚，多个实例归同一场故事；
+              profile_version 钉住 PersonaProfile 版本；
+              knowledge[id=kn_] / relationship_state 内嵌 payload）
 ```
 
 > **没有任何模块跨步骤"手递手"传大对象**，只传 ID。产出落盘到 `Storage`，下游按 ID 取。这就是断点续跑能成立的原因。
@@ -1316,7 +1320,34 @@ L6 {CLI, Evaluation}  →  L5 {Orchestrator}  →  L4 {Research, Persona, Relati
 
 ---
 
-## 16. 变更历史
+## 16. Character —— 故事人物实例（P8.1-B，2026-11-10）
+
+### 16.1 职责与非职责
+
+✅ CharacterInstance（chi_）的创建/读取/修订/按故事查询；BehaviorPolicy 确定性装配（纯函数，不落库）；KnowledgeState 写入校验与隔离查询（`load_knowledge` 为 P8.3 注入的冻结接口）；LatentRelation 写入校验；OOC 基础确定性检查 4 条（K1/S1/I1/T1，结构化比对）。
+
+⛔ **不做**（P8.1-A-R §5 NOT IMPLEMENTED，如实标注）：关系演化、自动知识传播、语义级 OOC、values/motivations 自动填充、Dialogue 注入（P8.3 接线）。
+
+### 16.2 主要操作（`modules/character.py`）
+
+| 操作 | 签名要点 | 校验 |
+| --- | --- | --- |
+| `create_instance` | `(ctx, draft, project_id) -> Result[View]` | story_id 必须 `sty_` 格式；character_id 合法 pe_；同故事同人去重（`STATE_CONFLICT.no_new_evidence`，同 persona.create_profile 先例）；namespace 恒 SIMULATED（存储层双保险） |
+| `revise_instance` | `(ctx, id, patch, change_reason, expected_rev)` | change_reason 必填（D-112）；身份字段不可修订；patch 字段白名单 |
+| `add_knowledge` / `correct_knowledge` | TOLD 强制 source_ref + teller_id；INFERRED 强制依据；双可信度分立；修正链 CORRECTED→superseded_by | 修正不删旧条（D-025 精神） |
+| `set_relation` | origin_refs ≥1（无故事事件依据不得产生关系看法） | 定性枚举取值域；对自我的看法拒收 |
+| `load_knowledge` | `(ctx, story_id, character_id, project_id)` | 只返回 ACTIVE；SECRET 结构性单持有者 |
+| `build_behavior_policy` | 纯函数 `(profile, relationships) -> Result[Policy]` | single_events/SINGLE 结构性排除；个人/关系行为分离；无 trigger/action 键 |
+
+### 16.3 OOC 基础检查（确定性，**非语义理解**）
+
+`ooc_check(proposal, knowledge, experiences, policy)` 组合四条：K1 知识边界（集合比对，FLAGGED）/ S1 秘密疑似泄密（关键词启发，**只报 SUSPECTED_LEAK**）/ I1 身份事实（无解释 BLOCKED、可追溯 motivation TOLERATED）/ T1 经历时序（查无 BLOCKED）。完整分级边界与 NOT IMPLEMENTED 清单见 P8.1-A-R 修订版报告 §4。
+
+---
+
+| 日期 | 版本 | 变更 |
+| --- | --- | --- |
+## 17. 变更历史
 
 | 日期 | 版本 | 变更 |
 | --- | --- | --- |
@@ -1327,3 +1358,4 @@ L6 {CLI, Evaluation}  →  L5 {Orchestrator}  →  L4 {Research, Persona, Relati
 | 2026-10-14 | v0.1.6 | 新增 **§5.4 来源材料 → 候选 claim 的抽取（G-2）**：`modules/extraction.py` 的 `ClaimExtractorPort` 唯一入口、`SourceMaterial` 下沉到 `core/types.py`（避免 L4↔L4 同层调用）；三种 claim 的机械区分（VERBATIM 带可逐字核对的摘录 / 归纳不带摘录 / INFERENCE 走 `record_inference` 且无根即丢弃）；8 种拒收原因全部进 `rejected` 不静默丢弃；`MockClaimExtractor` 打 `mock-fixture` 标签、`ProviderClaimExtractor` 只定义契约与错误处理（不接真实模型）；抽取器**拿不到** Evidence（AST 断言）。同时更新 §5.3（Research 新增 `materials` 输出）与 §12.7（`evidence_seeds` 变可选、新增 `conflict_ids`、登记新缺口 G-4「材料无法落检查点」）（D-221 ~ D-235） |
 | 2026-10-14 | v0.1.5 | 新增 **§12.7 业务编排器（H-10A）**：`orchestrator/business.py::BusinessOrchestrator` 实现 `UnitHandler` 接入既有 `TaskRunner`（复用六态机/预算/检查点，不复制第二套）；阶段间数据**只经检查点** `artifact_ids` 传递；新增 `BusinessRequest` / `EvidenceSeed` / `BusinessStepResult` / `BusinessRunResult`，`status ∈ {SUCCEEDED, PARTIAL, PAUSED, FAILED}` 且只有五步全执行才报 `SUCCEEDED`；登记缺口 G-1（`TaskType` 无全流程成员）/ G-2（源→证据自动抽取未实现）/ G-3（检查点不存业务请求）（D-206 ~ D-220） |
 | 2026-10-14 | v0.1.4 | 新增 **§5.3 Research 实现状态与边界（H-11A）**：`Research` 由 Protocol-only 推进为可执行实现（`ResearchService`），并逐条登记对契约的取舍——只注入 `SourceRegistrarPort`（仅 `register_source`，堵死 F-10）、不承担预算/检查点（Orchestrator 职责）、`filter_and_rank` 增加可选关键字 `target_entity_ids`（对象边界）、`fetch_status=NO_RESULT` 用模块常量表达（不改已审 `FetchStatus`）、`VALIDATION.empty_targets` 未登记故复用 `required_field`（D-191 ~ D-205） |
+| 2026-11-10 | v0.1.7 | 新增 **§16 Character —— 故事人物实例（P8.1-B）**：`modules/character.py` 接口契约（create/revise/add_knowledge/correct_knowledge/set_relation/load_knowledge/build_behavior_policy + OOC 四检查）；原 §16 变更历史顺延为 §17；DATA_MODEL §2.1/§3 同步第 14 个实体（chi_）与支撑标识符 sty_/kn_（P8.1-A-R 设计拍板） |

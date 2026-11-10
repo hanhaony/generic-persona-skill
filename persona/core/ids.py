@@ -29,12 +29,23 @@ ID_PREFIXES: dict[str, str] = {
     "MemoryItem": "mem_",
     "TaskRecord": "tsk_",
     "DerivedArtifact": "dar_",
+    # P8.1-B：故事人物实例（第 14 个实体）。同一 PersonaProfile 可在多个故事中
+    # 各有一个独立实例；实例状态全部在 payload（records 表文档式承载）。
+    "CharacterInstance": "chi_",
 }
 
 # 支撑记录（用量、审计）不属于 13 个业务实体，但也用同样的规则
 AUX_PREFIXES: dict[str, str] = {
     "UsageRecord": "usg_",
     "AuditRecord": "adt_",
+    # P8.1-B：故事标识符与知识条目 ID。
+    # - `Story`（sty_）是**引用型标识符**：把多个 CharacterInstance 归到同一场
+    #   故事。它不是业务实体（不进 ENTITY_KINDS、不建表），由调用方生成并
+    #   在创建实例时携带；与 ConversationSession 的桥接属 P8.3 接线决策。
+    # - `KnowledgeEntry`（kn_）内嵌在实例 payload 里，但必须全局唯一
+    #   （跨实例引用如 Belief.formed_from 可能指向他处）。
+    "Story": "sty_",
+    "KnowledgeEntry": "kn_",
 }
 
 ALL_PREFIXES: dict[str, str] = {**ID_PREFIXES, **AUX_PREFIXES}
