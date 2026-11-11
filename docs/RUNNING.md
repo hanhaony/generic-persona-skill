@@ -2818,12 +2818,40 @@ P6.3 一次加了 3 个码（`VALIDATION_TOPIC_TOO_{BROAD,SHORT,LONG}`），**�
   字段名守卫。全量 **2091 → 2112 项**（2111 绿 + 1 红为用户本地 `var/webapp`
   守卫）。文档同步：DATA_MODEL v0.3、INTERFACES v0.1.7（§16 新增）。
 
+### P8.1-C 补记（同日，KnowledgeState 完整性修复，v0.46）
+
+只读审计（p81c-knowledge-state-audit-20261110.md）发现 4 个缺陷后修复，
+只改 `character.py` + 测试：
+
+1. **条目 ID 唯一性**（F1）：`_validate_knowledge_chain` 增加重复 ID 检测——
+   同实例内重复 `kn_` ID 会污染 OOC K1 的 `known_ids` 集合比对与
+   `superseded_by` 指向。add/correct/revise 三条写入路径统一经此闸门。
+2. **修订旁路堵死**（F2，审计 C2）：`revise_instance` 此前允许 patch
+   `knowledge`/`relationship_state`/`current_beliefs` 任意 dict，绕过全部
+   写入校验（可注入 UNKNOWN 类别、无溯源条目、空依据关系看法、断修正链）。
+   现对三类 patch 逐条过 `_validate_knowledge_dict`/`_validate_relation_dict`
+   （规则与对象级校验器对齐）+ 修正链校验，修订不再是旁路。
+3. **分页取全**（F3，审计 C3）：`_query_project` 曾固定 `limit=200` 静默
+   截断——实例超 200 时去重检查漏检（可重复创建）、按故事查询漏返回。
+   改为 `_all_project_rows` 循环翻页直到取全（FILTER_KEYS 白名单不动）。
+4. **修正可信度参数化**（F4，审计 C4）：`correct_knowledge` 不再硬编码
+   双可信度 HIGH（"修正"不天然可信），默认 `UNVERIFIED`、由调用方断言、
+   非法取值被闸门拒绝。
+
+验证：新增 T21~T26 六项（重复 ID 拒绝 / patch 注入 UNKNOWN 与非法可信度
+拒绝 / 断链 patch 拒绝 / 空 origin_refs patch 拒绝 / 210 实例跨边界去重与
+查询取全 / 修正可信度默认与传参与非法值），21 项既有测试零改动回归；
+全量 **2112 → 2118 项**（2117 绿 + 1 红为用户本地 `var/webapp` 守卫）。
+审计其余观察项（Belief.formed_from 引用校验、set_relation 历史、
+SUSPECTED/BELIEVED 语义细分、S1 匹配增强等）记入 backlog 延期。
+
 ---
 
 ## 6. 变更历史
 
 | 日期 | 版本 | 变更 | 状态 |
 | --- | --- | --- | --- |
+| 2026-11-10 | v0.46 | **P8.1-C：KnowledgeState 完整性修复**（依据同日只读审计，详见 §5.54 补记）：①`_validate_knowledge_chain` 增加实例内条目 ID 唯一性检测（重复 ID 污染 K1 集合比对与 superseded_by 指向）；②`revise_instance` 对 `knowledge`/`relationship_state`/`current_beliefs` patch 过同一套闸门（新增 dict 级校验器 `_validate_knowledge_dict`/`_validate_relation_dict`，与对象级校验器规则对齐——修订路径不再是写入校验的旁路，可注入 UNKNOWN 类别/无溯源条目/空依据关系看法/断修正链全部被拒）；③分页取全替换 `_query_project` 固定 `limit=200` 静默截断（实例超 200 时去重检查漏检、按故事查询漏返回，现循环翻页直到取全）；④`correct_knowledge` 修正可信度参数化（默认 UNVERIFIED，不再无依据硬编码 HIGH）。只改 character.py + 测试，零新依赖零新错误码。新增 T21~T26 六项；全量 **2112 → 2118 项**（2117 绿 + 1 红为用户本地 `var/webapp` 守卫） | 待确认 |
 | 2026-11-10 | v0.45 | **P8.1-B：故事人物实例与认知模型**（详见 §5.54）：第 14 个实体 `CharacterInstance`（chi_，namespace 恒 SIMULATED，payload 承载目标/情绪/信念/知识/关系看法，零 Schema 改动）；支撑标识符 `Story sty_` / `KnowledgeEntry kn_`；BehaviorPolicy 纯函数装配（single_events/SINGLE 排除、个人与关系行为分离、无 trigger/action 键）；KnowledgeState 七类（TOLD 强制溯源 + 双可信度分立、INFERRED 强制依据、修正链、SECRET 结构性单持有者、UNKNOWN 缺席表达）；LatentRelation 定性枚举（origin_refs ≥1、双向分实例）；OOC 基础四检查（K1/S1/I1/T1，S1 只报疑似、I1 无解释 BLOCKED/可追溯 TOLERATED）；复用既有错误码零新增；evaluation.py 零改动（全目录扫描自动覆盖）。CLI/app/对话链路零改动，真跑路径不变。新增 `tests/test_character_module.py` 21 项；全量 **2091 → 2112 项**（2111 绿 + 1 红为用户本地 `var/webapp` 守卫）。设计依据 P8.1-A-R 修订版（同日审核通过） | 待确认 |
 | 2026-11-08 | v0.44 | **Web 多用户隔离：私人空间口令制**（详见 §5.53）：数据目录按口令哈希分空间（`users/<uid>/`，PBKDF2-SHA256 10 万轮）；同口令跨设备同空间、异口令完全隔离、不填 = 会话级访客目录；换空间自动清场重载；API Key 保持浏览器内存不落盘。此前云端可写盘时全体访客共享 `var/webapp`（记录/档案/头像互通）即本次修复的缺陷。新增 `tests/test_app_spaces.py` 12 项；全量 **2079 → 2091 项**（2090 绿 + 1 红为用户本地 `var/webapp` 守卫） | 待确认 |
 | 2026-11-08 | v0.43 | **Web 云端部署三连修 + 新建态会话列表常驻**（详见 §5.53 补记）：建档命令去掉误传的 `--db`（`persona run` 只有 `--out`，数据库在 `<out>/persona.db`）；云端无 `.env` 时 `build_env` 对预算配套六件套 setdefault 兜底（单价 0.3/1.2 + 官方价目表来源 + 估算 3000/2000）；侧边栏新增「检索 Key（Tavily）」输入，`build_env` 注入 `TAVILY_API_KEY`/`PERSONA_SEARCH_API_KEY` 双别名；「新建群聊」期间会话列表常驻（点旧会话即返回）+ 新增「↩️ 取消新建」（记住来路会话）。全量 **2079 项**（2078 绿 + 1 红为用户本地 `var/webapp` 守卫） | 待确认 |

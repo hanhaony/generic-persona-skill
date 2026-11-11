@@ -115,6 +115,10 @@ STORY_ID_RE = re.compile(r"^sty_[0-9a-f]{32}$")
 #: "人物对 X 不知情" 由「其知识条目中不存在关于 X 的 ACTIVE 条目」表达。
 K_UNKNOWN_PLACEHOLDER = "UNKNOWN"
 
+#: 分页取全的单页大小（P8.1-C F3）：FILTER_KEYS 不含 payload 键，story_id
+#: 过滤只能取回后做；单页截断曾致去重/查询漏检，现循环翻页直到取全。
+_PAGE_SIZE = 200
+
 
 # --------------------------------------------------------------------------
 # DTO：行为策略（装配产物，不落库，随时可重算）
@@ -506,12 +510,11 @@ class CharacterService:
     def query_instances_by_story(self, ctx: CallContext, story_id: str,
                                  project_id: str) -> Result[list[CharacterInstanceView]]:
         """按故事查询实例。payload 过滤不在 FILTER_KEYS 白名单——取回后过滤
-        （初期量级可控；量级上来再立项 payload 索引，不动现有表）。"""
-        page = self.storage.query(ctx, KIND,
-                                  _query_project(project_id))
-        if is_err(page):
-            return Err(page.error)
-        return Ok([_row_to_view(r) for r in page.value.items
+        （分页取全，P8.1-C F3；量级上来再立项 payload 索引，不动现有表）。"""
+        rows = self._all_project_rows(ctx, project_id)
+        if is_err(rows):
+            return Err(rows.error)
+        return Ok([_row_to_view(r) for r in rows.value
                    if r["payload"].get("story_id") == story_id])
 
     def load_knowledge(self, ctx: CallContext, story_id: str,
@@ -571,6 +574,46 @@ class CharacterService:
                                  trace_ref=ctx.trace_ref))
         merged = {**_view_payload(current.value), **patch,
                   "change_reason": str(change_reason)}
+        # P8.1-C F2：patch 内容过同一套闸门——校验只在专用方法上时，
+        # 修订路径就是旁路（可注入 UNKNOWN 类别/无溯源条目/空依据关系看法）。
+        if "knowledge" in patch:
+            for e in patch["knowledge"]:
+                bad_entry = _validate_knowledge_dict(e)
+                if bad_entry is not None:
+                    return Err(new_error(
+                        ErrorCode.VALIDATION_GATE_REJECTED,
+                        f"patch.knowledge 校验失败：{bad_entry}",
+                        trace_ref=ctx.trace_ref))
+            chain = _validate_knowledge_chain(patch["knowledge"], instance_id)
+            if chain is not None:
+                return Err(new_error(ErrorCode.VALIDATION_GATE_REJECTED,
+                                     f"patch.knowledge 校验失败：{chain}",
+                                     trace_ref=ctx.trace_ref))
+        if "relationship_state" in patch:
+            for r in patch["relationship_state"]:
+                bad_rel = _validate_relation_dict(r, current.value.character_id)
+                if bad_rel is not None:
+                    return Err(new_error(
+                        ErrorCode.VALIDATION_GATE_REJECTED,
+                        f"patch.relationship_state 校验失败：{bad_rel}",
+                        trace_ref=ctx.trace_ref))
+        if "current_beliefs" in patch:
+            for b in patch["current_beliefs"]:
+                if not isinstance(b, dict):
+                    return Err(new_error(
+                        ErrorCode.VALIDATION_GATE_REJECTED,
+                        "patch.current_beliefs 条目必须是 dict",
+                        trace_ref=ctx.trace_ref))
+                if not str(b.get("belief_id") or "").strip():
+                    return Err(new_error(
+                        ErrorCode.VALIDATION_GATE_REJECTED,
+                        "patch.current_beliefs 条目缺 belief_id",
+                        trace_ref=ctx.trace_ref))
+                if not str(b.get("text") or "").strip():
+                    return Err(new_error(
+                        ErrorCode.VALIDATION_GATE_REJECTED,
+                        "patch.current_beliefs 条目缺 text",
+                        trace_ref=ctx.trace_ref))
         updated = self.storage.update(ctx, KIND, instance_id, merged,
                                       expected_rev=expected_rev)
         if is_err(updated):
@@ -599,12 +642,16 @@ class CharacterService:
 
     def correct_knowledge(self, ctx: CallContext, instance_id: str,
                           entry_id: str, new_content: str,
-                          acquired_turn: int, expected_rev: int | None = None
+                          acquired_turn: int, expected_rev: int | None = None,
+                          teller_credibility: str = "UNVERIFIED",
+                          content_credibility: str = "UNVERIFIED"
                           ) -> Result[CharacterInstanceView]:
         """修正一条知识：旧条 → CORRECTED + superseded_by，新条 ACTIVE。
 
         修正链校验：被修正条必须是 ACTIVE；修正后链上 CORRECTED 条目必须
         都有 superseded_by 且指向本实例内的条目。
+        修正内容的可信度由调用方断言（P8.1-C F4：默认 UNVERIFIED——
+        "修正"并不天然可信，修正本身可能基于低可信的新消息）。
         """
         current = self.get_instance(ctx, instance_id)
         if is_err(current):
@@ -625,7 +672,8 @@ class CharacterService:
             category=str(target.get("category")), about=str(target.get("about", "world")),
             source_ref=f"correction_of:{entry_id}", teller_id="",
             acquired_turn=int(acquired_turn), acquired_at=to_iso(utc_now()),
-            teller_credibility="HIGH", content_credibility="HIGH",
+            teller_credibility=teller_credibility,
+            content_credibility=content_credibility,
             status="ACTIVE", keywords=list(target.get("keywords") or []))
         if not new_entry.content:
             return Err(new_error(ErrorCode.VALIDATION_REQUIRED_FIELD,
@@ -674,20 +722,41 @@ class CharacterService:
     def _find_by_story_and_character(self, ctx: CallContext, story_id: str,
                                      character_id: str, project_id: str
                                      ) -> Result[dict | None]:
-        page = self.storage.query(ctx, KIND, _query_project(project_id))
-        if is_err(page):
-            return Err(page.error)
-        for row in page.value.items:
+        rows = self._all_project_rows(ctx, project_id)
+        if is_err(rows):
+            return Err(rows.error)
+        for row in rows.value:
             payload = row["payload"]
             if (payload.get("story_id") == story_id
                     and payload.get("character_id") == character_id):
                 return Ok(row)
         return Ok(None)
 
+    def _all_project_rows(self, ctx: CallContext,
+                          project_id: str) -> Result[list[dict]]:
+        """分页取全本项目的 CharacterInstance 行（P8.1-C F3）。
 
-def _query_project(project_id: str) -> Query:
-    """按 project_id 过滤的 Query（FILTER_KEYS 白名单内）。"""
-    return Query(filters={"project_id": project_id}, limit=200)
+        FILTER_KEYS 不含 payload 键，story_id 过滤只能取回后做；曾用单页
+        limit=200 静默截断——实例超 200 时去重检查漏检（可重复创建）、
+        按故事查询漏返回。现在循环翻页直到取全。
+        """
+        rows: list[dict] = []
+        offset = 0
+        while True:
+            page = self.storage.query(ctx, KIND,
+                                      _query_project(project_id, offset))
+            if is_err(page):
+                return Err(page.error)
+            rows.extend(page.value.items)
+            offset += len(page.value.items)
+            if offset >= page.value.total or not page.value.items:
+                return Ok(rows)
+
+
+def _query_project(project_id: str, offset: int = 0) -> Query:
+    """按 project_id 过滤的单页 Query（FILTER_KEYS 白名单内）。"""
+    return Query(filters={"project_id": project_id},
+                 limit=_PAGE_SIZE, offset=offset)
 
 
 # --------------------------------------------------------------------------
@@ -726,9 +795,16 @@ def _validate_knowledge_entry(entry: KnowledgeEntry) -> str | None:
 
 
 def _validate_knowledge_chain(knowledge: list[dict], instance_id: str) -> str | None:
-    """修正链校验：CORRECTED/SUPERSEDED 条目必须带 superseded_by 且指向同实例
-    中存在的条目；被指向的条目应为 ACTIVE。"""
-    ids = {str(e.get("id")) for e in knowledge}
+    """修正链校验：①条目 ID 在实例内必须唯一（P8.1-C F1——重复 ID 会污染
+    K1 集合比对与 superseded_by 指向）；②CORRECTED/SUPERSEDED 条目必须带
+    superseded_by 且指向同实例中存在的条目。"""
+    ids: set[str] = set()
+    for entry in knowledge:
+        entry_id = str(entry.get("id") or "")
+        if entry_id in ids:
+            return f"知识条目 ID 重复：{entry_id}（同一实例内条目 ID 必须唯一）"
+        if entry_id:
+            ids.add(entry_id)
     for entry in knowledge:
         status = str(entry.get("status"))
         if status in ("CORRECTED", "SUPERSEDED"):
@@ -755,6 +831,59 @@ def _validate_latent_relation(relation: LatentRelation,
         return f"trust 必须是 {sorted(TRUST_LEVELS)} 之一，得到 {relation.trust!r}"
     if relation.stance not in STANCE_LEVELS:
         return f"stance 必须是 {sorted(STANCE_LEVELS)} 之一，得到 {relation.stance!r}"
+    return None
+
+
+def _validate_knowledge_dict(e: dict) -> str | None:
+    """dict 形状的知识条目校验（P8.1-C F2，revise_instance patch 路径）。
+
+    规则与 _validate_knowledge_entry **对齐**——写入闸门不允许经修订旁路：
+    可注入 UNKNOWN 类别/无溯源条目/非法可信度/破坏修正链，与专用方法同拒。
+    """
+    if not isinstance(e, dict):
+        return "条目必须是 dict"
+    if not str(e.get("id") or "").startswith("kn_"):
+        return "知识条目 ID 必须是 kn_ 前缀"
+    if not str(e.get("content") or "").strip():
+        return "知识内容不得为空"
+    category = str(e.get("category"))
+    if category not in KNOWLEDGE_CATEGORIES:
+        return f"category 必须是 {sorted(KNOWLEDGE_CATEGORIES)} 之一，得到 {category!r}"
+    if category == K_UNKNOWN_PLACEHOLDER:
+        return "UNKNOWN 不落条目：'不知情'由 ACTIVE 条目的缺席表达"
+    if not str(e.get("source_ref") or "").strip():
+        return (f"category={category} 的 source_ref 必填"
+                + ("（TOLD 必须可溯源到具体传播轮次/事件）"
+                   if category == K_TOLD else "（无源知识禁止写入）"))
+    if category == K_TOLD and not str(e.get("teller_id") or "").strip():
+        return "TOLD 必须记录讲述者 teller_id（P8.1-A-R 修订 4）"
+    if category != K_TOLD and str(e.get("teller_id") or "").strip():
+        return f"category={category} 不允许填 teller_id（恒空）"
+    for key in ("teller_credibility", "content_credibility"):
+        if e.get(key) not in CREDIBILITY_LEVELS:
+            return f"{key} 必须是 {sorted(CREDIBILITY_LEVELS)} 之一，得到 {e.get(key)!r}"
+    if e.get("status") not in KNOWLEDGE_STATUSES:
+        return f"status 必须是 {sorted(KNOWLEDGE_STATUSES)} 之一，得到 {e.get('status')!r}"
+    return None
+
+
+def _validate_relation_dict(r: dict, character_id: str) -> str | None:
+    """dict 形状的关系看法校验（P8.1-C F2，revise_instance patch 路径）。
+
+    规则与 _validate_latent_relation 对齐：origin_refs ≥1、不许指向自己、
+    trust/stance 取值域——禁止经修订无依据换算档案 feeling_toward。
+    """
+    if not isinstance(r, dict):
+        return "条目必须是 dict"
+    if str(r.get("target_id")) == character_id:
+        return "target_id 不得指向自己（对自我的看法属档案/信念层，不在关系看法）"
+    if not r.get("origin_refs"):
+        return ("origin_refs 至少 1 条：没有故事事件依据不得产生关系看法"
+                "（禁止无依据地把档案 feeling_toward 换算成 trust/stance）")
+    if r.get("trust") not in TRUST_LEVELS:
+        return f"trust 必须是 {sorted(TRUST_LEVELS)} 之一，得到 {r.get('trust')!r}"
+    if r.get("stance") not in STANCE_LEVELS:
+        return f"stance 必须是 {sorted(STANCE_LEVELS)} 之一，得到 {r.get('stance')!r}"
     return None
 
 

@@ -576,5 +576,132 @@ class TestAntiPollutionAndGuards(unittest.TestCase):
         return page.value.total
 
 
+class TestP81CFixes(unittest.TestCase):
+    """P8.1-C T21~T26：知识写入旁路堵死 + 分页取全 + 修正可信度参数化。"""
+
+    def setUp(self):
+        self.f = CharacterFixture()
+        self.addCleanup(self.f.close)
+
+    def _entry(self, **overrides) -> KnowledgeEntry:
+        kw = dict(id=new_id("KnowledgeEntry"), content="账本在晚上失踪了",
+                  category=K_OBSERVED, about="world", source_ref="ctn_1",
+                  acquired_turn=1, teller_credibility="HIGH",
+                  content_credibility="HIGH")
+        kw.update(overrides)
+        return KnowledgeEntry(**kw)
+
+    def test_t21_duplicate_entry_id_rejected(self):
+        """T21（F1）：同实例内知识条目 ID 必须唯一——重复追加被拒。"""
+        inst = self.f.create()
+        entry = self._entry(id="kn_dup000000000000000000000000")
+        self.assertTrue(is_ok(self.f.service.add_knowledge(
+            self.f.ctx, inst.id, entry)))
+        dup = self.f.service.add_knowledge(self.f.ctx, inst.id, entry)
+        self.assertTrue(is_err(dup))
+        self.assertIn("重复", dup.error.message)
+        # 不同 ID 正常追加不受影响
+        self.assertTrue(is_ok(self.f.service.add_knowledge(
+            self.f.ctx, inst.id, self._entry())))
+
+    def test_t22_revise_knowledge_patch_validated(self):
+        """T22（F2）：revise patch 注入 UNKNOWN 类别条目被拒——修订不是旁路。"""
+        inst = self.f.create()
+        patched = self.f.service.revise_instance(
+            self.f.ctx, inst.id,
+            {"knowledge": [{"id": "kn_x1", "content": "秘密", "category": "UNKNOWN",
+                            "source_ref": "ctn_1", "teller_credibility": "HIGH",
+                            "content_credibility": "HIGH", "status": "ACTIVE"}]},
+            "测试注入")
+        self.assertTrue(is_err(patched))
+        self.assertIn("UNKNOWN", patched.error.message)
+        # 注入非法可信度同样被拒
+        bad_cred = self.f.service.revise_instance(
+            self.f.ctx, inst.id,
+            {"knowledge": [{"id": "kn_x2", "content": "谣言", "category": K_TOLD,
+                            "source_ref": "ctn_2", "teller_id": "pe_ffff0000111122223333444455556666",
+                            "teller_credibility": "VERY_HIGH", "content_credibility": "HIGH",
+                            "status": "ACTIVE"}]},
+            "测试注入")
+        self.assertTrue(is_err(bad_cred))
+
+    def test_t23_revise_knowledge_patch_chain_enforced(self):
+        """T23（F2+F5）：revise patch 注入缺 superseded_by 的 CORRECTED 条被拒。"""
+        inst = self.f.create()
+        patched = self.f.service.revise_instance(
+            self.f.ctx, inst.id,
+            {"knowledge": [{"id": "kn_c1", "content": "旧说法", "category": K_OBSERVED,
+                            "source_ref": "ctn_1", "teller_credibility": "HIGH",
+                            "content_credibility": "HIGH",
+                            "status": "CORRECTED"}]},
+            "测试注入断链")
+        self.assertTrue(is_err(patched))
+        self.assertIn("superseded_by", patched.error.message)
+
+    def test_t24_revise_relation_patch_validated(self):
+        """T24（F2）：revise patch 注入 origin_refs=[] 的关系看法被拒。"""
+        a = self.f.create()
+        b = self.f.create(character_id="pe_ffff0000111122223333444455556666")
+        patched = self.f.service.revise_instance(
+            self.f.ctx, a.id,
+            {"relationship_state": [{"target_id": b.character_id, "trust": "WARM",
+                                     "stance": "ALLY", "origin_refs": []}]},
+            "测试无依据换算")
+        self.assertTrue(is_err(patched))
+        self.assertIn("origin_refs", patched.error.message)
+        # 注入非法 trust 档位同样被拒
+        bad_trust = self.f.service.revise_instance(
+            self.f.ctx, a.id,
+            {"relationship_state": [{"target_id": b.character_id, "trust": 0.8,
+                                     "stance": "ALLY", "origin_refs": ["ctn_1"]}]},
+            "测试数值回潮")
+        self.assertTrue(is_err(bad_trust))
+
+    def test_t25_pagination_beyond_200(self):
+        """T25（F3）：项目内实例超 200 后去重检查仍命中、按故事查询不漏。"""
+        story = _story_id()
+        ids = [f"pe_{i:032x}" for i in range(210)]
+        for i, cid in enumerate(ids):
+            self.f.create(story, character_id=cid)
+        # 去重检查跨过截断边界仍然命中
+        dup = self.f.service.create_instance(
+            self.f.ctx, self.f.draft(story, character_id=ids[205]), PROJECT)
+        self.assertTrue(is_err(dup))
+        self.assertEqual(dup.error.code, "STATE_CONFLICT.no_new_evidence")
+        # 按故事查询取全 210 条
+        views = self.f.service.query_instances_by_story(
+            self.f.ctx, story, PROJECT)
+        self.assertTrue(is_ok(views))
+        self.assertEqual(len(views.value), 210)
+
+    def test_t26_correction_credibility_parameterized(self):
+        """T26（F4）：修正可信度由调用方断言，默认 UNVERIFIED，不再硬编码 HIGH。"""
+        inst = self.f.create()
+        entry = self._entry(id="kn_fix000000000000000000000000")
+        self.assertTrue(is_ok(self.f.service.add_knowledge(
+            self.f.ctx, inst.id, entry)))
+        revised = self.f.service.correct_knowledge(
+            self.f.ctx, inst.id, entry.id, "账本是被 B 拿走的", acquired_turn=5)
+        self.assertTrue(is_ok(revised))
+        entries = {e["id"]: e for e in revised.value.knowledge}
+        new_id_ref = entries[entry.id]["superseded_by"]
+        self.assertEqual(entries[new_id_ref]["teller_credibility"], "UNVERIFIED")
+        self.assertEqual(entries[new_id_ref]["content_credibility"], "UNVERIFIED")
+        # 显式传入的可信度被尊重（且非法值被闸门拒绝）
+        revised2 = self.f.service.correct_knowledge(
+            self.f.ctx, inst.id, new_id_ref, "账本被 B 放回了原处",
+            acquired_turn=9, teller_credibility="HIGH",
+            content_credibility="MEDIUM")
+        self.assertTrue(is_ok(revised2))
+        entries2 = {e["id"]: e for e in revised2.value.knowledge}
+        newest = entries2[new_id_ref]["superseded_by"]
+        self.assertEqual(entries2[newest]["teller_credibility"], "HIGH")
+        self.assertEqual(entries2[newest]["content_credibility"], "MEDIUM")
+        bad = self.f.service.correct_knowledge(
+            self.f.ctx, inst.id, newest, "再修一次", acquired_turn=11,
+            teller_credibility="100%")
+        self.assertTrue(is_err(bad))
+
+
 if __name__ == "__main__":
     unittest.main()
