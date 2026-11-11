@@ -21,6 +21,7 @@ from . import (
     character,
     compliance,
     dialogue,
+    distill,
     evidence,
     evaluation,
     extraction,
@@ -41,4 +42,5 @@ __all__ = [
     "memory",
     "evaluation",
     "compliance",
+    "distill",
 ]

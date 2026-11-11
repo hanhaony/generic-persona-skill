@@ -1347,7 +1347,38 @@ L6 {CLI, Evaluation}  →  L5 {Orchestrator}  →  L4 {Research, Persona, Relati
 
 | 日期 | 版本 | 变更 |
 | --- | --- | --- |
-## 17. 变更历史
+## 17. Distill —— 人格蒸馏投影（P8.2-B，2026-11-11）
+
+### 17.1 职责与非职责
+
+✅ `distill_profile(profile, evidence_lookup) -> Result[DistilledProfileView]` **只读纯函数**：把已有 PersonaProfile 投影为 A/B/C 显式分层，并补三类可见性（tier 构成 / 时间跨度 / 冲突指针）。零存储、零 AI、零 Schema 改动、零新 ErrorCode；不修改原始 profile；对同一 (profile, 证据现状) 幂等（无 generated_at 字段，保证逐值相等）。
+
+⛔ **不做**（NOT IMPLEMENTED，立项需预算审批 + PROMPT_VERSION 纪律）：AI 语义蒸馏主体 `distill(ctx, entity_id, options)`（语义聚类 / 跨措辞同义归并 / 动机与价值观推断）——投影层只呈现确定性规则能证明的东西（计数、构成、跨度、指针），不假装语义理解。
+
+### 17.2 分层规则（与 AC-7 / D-109 口径对齐，只分流不复制桶逻辑）
+
+| 层 | 来源 | 语义 |
+| --- | --- | --- |
+| A `stable_traits` | traits ∩ PATTERN | 已通过稳定性判定（judge_stability：≥3 不同来源） |
+| B `tentative_patterns` | traits ∩ REPEATED + habits | 恒标 `tentative=True`；**结构性禁止直接升 A**——升级只能走新证据 → judge_stability → revise 既有链路 |
+| C `insufficient` | single_events + open_questions + status != OK | 不得表述为稳定人格特征；status_note 如实说明 |
+
+防御性口径：traits 里出现非 PATTERN/REPEATED 条目（AC-7 正常会挡住）落 C 层 `anomalous_traits`，不伪造归层；证据引用查不到记 `missing_evidence_ids`、namespace=SIMULATED 记 `simulated_evidence_ids`，两者均**不计入任何构成统计**（EV-V1 精神的二次过滤）。
+
+### 17.3 可见性（只展示、不裁决、不删除——D-013/D-055）
+
+- `tier_composition`（每特征 + 全局 `tier_totals`）：证据层级构成；`third_party_ratio` = THIRD_PARTY / 可解析证据（第三方评价占比一目了然）。
+- `time_span`：证据 `stated_at.start` 的（最早, 最晚）；不足两个不同起点为 None——时间不可考不编造（judge_stability 同口径）。
+- `conflicts_visible`：`ConflictPointer(item_id, layer, evidence_id, conflict_ids)` 引用指针；带冲突的特征本身保留在原层。
+- 置信度**不造数值**（PF-V4：confidence 恒 0.0 是排序权重）：依据 = evidence_count / source_count / tier_composition / time_span（ConfidenceBasis）。
+
+### 17.4 输入约定
+
+`evidence_lookup: Callable[[str], EvidenceView | dict | None]`——支持 EvidenceView 属性与 dict 两种形状；查不到返回 None（如实记 missing）。lookup 抛异常按"查不到"处理，不伪造。本模块不 import Storage / Provider；签名无 ctx。
+
+---
+
+## 18. 变更历史
 
 | 日期 | 版本 | 变更 |
 | --- | --- | --- |
@@ -1359,3 +1390,4 @@ L6 {CLI, Evaluation}  →  L5 {Orchestrator}  →  L4 {Research, Persona, Relati
 | 2026-10-14 | v0.1.5 | 新增 **§12.7 业务编排器（H-10A）**：`orchestrator/business.py::BusinessOrchestrator` 实现 `UnitHandler` 接入既有 `TaskRunner`（复用六态机/预算/检查点，不复制第二套）；阶段间数据**只经检查点** `artifact_ids` 传递；新增 `BusinessRequest` / `EvidenceSeed` / `BusinessStepResult` / `BusinessRunResult`，`status ∈ {SUCCEEDED, PARTIAL, PAUSED, FAILED}` 且只有五步全执行才报 `SUCCEEDED`；登记缺口 G-1（`TaskType` 无全流程成员）/ G-2（源→证据自动抽取未实现）/ G-3（检查点不存业务请求）（D-206 ~ D-220） |
 | 2026-10-14 | v0.1.4 | 新增 **§5.3 Research 实现状态与边界（H-11A）**：`Research` 由 Protocol-only 推进为可执行实现（`ResearchService`），并逐条登记对契约的取舍——只注入 `SourceRegistrarPort`（仅 `register_source`，堵死 F-10）、不承担预算/检查点（Orchestrator 职责）、`filter_and_rank` 增加可选关键字 `target_entity_ids`（对象边界）、`fetch_status=NO_RESULT` 用模块常量表达（不改已审 `FetchStatus`）、`VALIDATION.empty_targets` 未登记故复用 `required_field`（D-191 ~ D-205） |
 | 2026-11-10 | v0.1.7 | 新增 **§16 Character —— 故事人物实例（P8.1-B）**：`modules/character.py` 接口契约（create/revise/add_knowledge/correct_knowledge/set_relation/load_knowledge/build_behavior_policy + OOC 四检查）；原 §16 变更历史顺延为 §17；DATA_MODEL §2.1/§3 同步第 14 个实体（chi_）与支撑标识符 sty_/kn_（P8.1-A-R 设计拍板） |
+| 2026-11-11 | v0.1.8 | 新增 **§17 Distill —— 人格蒸馏投影（P8.2-B）**：`modules/distill.py::distill_profile` 只读纯函数（A/B/C 显式分层 + tier 构成/时间跨度/冲突指针三类可见性 + ConfidenceBasis 依据口径）；原 §17 变更历史顺延为 §18。**B/C 升 A 无投影层通道**（只能走新证据→judge_stability→revise）；AI 语义蒸馏主体保持 NOT IMPLEMENTED（P8.2-A 审计拍板 READY_WITH_LIMITATIONS）；不修改 persona/evidence/business/character 等既有模块，零 Schema/零 ErrorCode/零 AI |
