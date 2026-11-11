@@ -271,6 +271,174 @@ class DistillSafetyTests(unittest.TestCase):
         prof = _profile(traits=[_item("t1", "谨慎", Stability.PATTERN)])
         self.assertTrue(is_err(distill_profile(prof, "not-callable")))
 
+    # ------------------------------------------------------------------
+    # P8.2-C 修复回归（D1 / D2 / D3 / D5 + 组合）
+    # ------------------------------------------------------------------
+
+    def test_d1_layer_c_conflicts_collected(self):
+        """D1：C 层（single_events / anomalous_traits）证据冲突进 conflicts_visible。"""
+        lookup = _lookup(se=_ev("evd_se", conflict_ids=["cnf_002"]),
+                         an=_ev("evd_an", conflict_ids=["cnf_003"]))
+        prof = _profile(
+            traits=[_item("t_sin", "某次失态", Stability.SINGLE,
+                          refs=["evd_an"])],          # 防御性落 anomalous_traits
+            single_events=[_item("se1", "单次行为", Stability.SINGLE,
+                                 refs=["evd_se"])])
+        view = distill_profile(prof, lookup.get).value
+        c_ptrs = [p for p in view.conflicts_visible if p.layer == "C"]
+        self.assertEqual({p.evidence_id for p in c_ptrs},
+                         {"evd_se", "evd_an"})
+        self.assertEqual(
+            {p.item_id for p in c_ptrs}, {"se1", "t_sin"})
+        self.assertEqual({tuple(p.conflict_ids) for p in c_ptrs},
+                         {("cnf_002",), ("cnf_003",)})
+
+    def test_d1_conflict_pointer_dedup_across_items(self):
+        """D1：多条目引用同一冲突证据只报一次（按 evidence_id 全局去重）。"""
+        lookup = _lookup(sh=_ev("evd_sh", conflict_ids=["cnf_x"]))
+        prof = _profile(
+            traits=[_item("t1", "谨慎", Stability.PATTERN, refs=["evd_sh"]),
+                    _item("t2", "冷静", Stability.REPEATED, refs=["evd_sh"])])
+        view = distill_profile(prof, lookup.get).value
+        self.assertEqual(len(view.conflicts_visible), 1)
+        self.assertEqual(view.conflicts_visible[0].evidence_id, "evd_sh")
+
+    def test_d1_layer_ab_conflict_collection_unchanged(self):
+        """D1：A/B 层冲突收集行为不退化（原 CASE-05 口径仍成立）。"""
+        lookup = _lookup(t_c=_ev("evd_t_c", conflict_ids=["cnf_001"]))
+        prof = _profile(traits=[_item("t_c", "冲动", Stability.REPEATED)])
+        view = distill_profile(prof, lookup.get).value
+        self.assertEqual(len(view.conflicts_visible), 1)
+        ptr = view.conflicts_visible[0]
+        self.assertEqual((ptr.layer, ptr.evidence_id, ptr.conflict_ids),
+                         ("B", "evd_t_c", ["cnf_001"]))
+
+    def test_d2_unresolved_evidence_count(self):
+        """D2：特征级 unresolved_evidence_count = missing + failed + SIMULATED。"""
+        lookup = _lookup(ok=_ev("evd_ok"), sim=_ev("evd_sim",
+                                                   namespace="SIMULATED"))
+        prof = _profile(traits=[_item(
+            "t1", "谨慎", Stability.PATTERN,
+            refs=["evd_ok", "evd_ghost", "evd_sim"])])
+        view = distill_profile(prof, lookup.get).value
+        trait = view.stable_traits[0]
+        self.assertEqual(trait.evidence_count, 3)
+        self.assertEqual(trait.unresolved_evidence_count, 2)  # ghost + sim
+        self.assertEqual(trait.tier_composition, {"VERBATIM": 1})
+        # 全部缺失：unresolved == evidence_count，特征不伪装成有效
+        prof2 = _profile(traits=[_item("t2", "冷静", Stability.REPEATED,
+                                       refs=["evd_g1", "evd_g2"])])
+        v2 = distill_profile(prof2, lookup.get).value
+        self.assertEqual(v2.tentative_patterns[0].unresolved_evidence_count, 2)
+        # 无缺失：为 0，分层不受影响
+        prof3 = _profile(traits=[_item("t3", "果敢", Stability.PATTERN,
+                                       refs=["evd_ok"])])
+        v3 = distill_profile(prof3, lookup.get).value
+        self.assertEqual(v3.stable_traits[0].unresolved_evidence_count, 0)
+        self.assertEqual(len(v3.stable_traits), 1)  # D2 不改变 A/B/C 分配
+
+    def test_d3_failed_vs_missing_distinguished(self):
+        """D3：lookup 异常进 failed_evidence_ids，与 missing 分列。"""
+        call_state = {"raise": True}
+
+        def flaky(ref):
+            if call_state["raise"]:
+                raise RuntimeError("storage I/O failure")
+            return None
+
+        prof = _profile(traits=[_item("t1", "谨慎", Stability.PATTERN,
+                                      refs=["evd_x"])])
+        v_fail = distill_profile(prof, flaky).value
+        self.assertEqual(v_fail.confidence_basis.failed_evidence_ids,
+                         ["evd_x"])
+        self.assertNotIn("evd_x", v_fail.confidence_basis.missing_evidence_ids)
+        # 同一 lookup 正常返回 None → 只进 missing，不进 failed
+        call_state["raise"] = False
+        v_none = distill_profile(prof, flaky).value
+        self.assertEqual(v_none.confidence_basis.missing_evidence_ids,
+                         ["evd_x"])
+        self.assertEqual(v_none.confidence_basis.failed_evidence_ids, [])
+        # 同一 ID 不重复记录：两个特征引用同一异常证据只登记一次
+        call_state["raise"] = True
+        prof2 = _profile(traits=[
+            _item("t1", "谨慎", Stability.PATTERN, refs=["evd_x"]),
+            _item("t2", "冷静", Stability.REPEATED, refs=["evd_x"])])
+        v2 = distill_profile(prof2, flaky).value
+        self.assertEqual(v2.confidence_basis.failed_evidence_ids, ["evd_x"])
+        # 条目本身仍在（异常不静默丢条目信息）：A 层特征保留，unresolved 可见
+        self.assertEqual(len(v2.stable_traits), 1)
+        self.assertEqual(v2.stable_traits[0].unresolved_evidence_count, 1)
+        # 不输出异常堆栈或敏感内部信息
+        self.assertNotIn("RuntimeError", repr(v2))
+        self.assertNotIn("storage", repr(v2))
+
+    def test_d5_dedupe_refs_preserve_order(self):
+        """D5：引用去重保序，重复引用只贡献一次统计。"""
+        lookup = _lookup(x=_ev("evd_x", source_id="src_x"),
+                         a=_ev("evd_a", source_id="src_a"),
+                         b=_ev("evd_b", source_id="src_b"))
+        # 全重复
+        prof = _profile(traits=[_item("t1", "谨慎", Stability.PATTERN,
+                                      refs=["evd_x", "evd_x"])])
+        view = distill_profile(prof, lookup.get).value
+        t = view.stable_traits[0]
+        self.assertEqual((t.evidence_refs, t.evidence_count),
+                         (["evd_x"], 1))
+        self.assertEqual(t.tier_composition, {"VERBATIM": 1})
+        self.assertEqual(t.source_count, 1)
+        # 混合重复：["evd_a","evd_b","evd_a"] → ["evd_a","evd_b"]
+        prof2 = _profile(traits=[_item("t2", "冷静", Stability.REPEATED,
+                                       refs=["evd_a", "evd_b", "evd_a"])])
+        v2 = distill_profile(prof2, lookup.get).value
+        t2 = v2.tentative_patterns[0]
+        self.assertEqual(t2.evidence_refs, ["evd_a", "evd_b"])
+        self.assertEqual(t2.evidence_count, 2)
+        self.assertEqual(t2.tier_composition, {"VERBATIM": 2})
+        self.assertEqual(t2.source_ids, ["src_a", "src_b"])
+
+    def test_combined_c_conflict_missing_dup_and_failure(self):
+        """组合：C 层冲突 + 缺失证据 + 重复 refs + lookup 异常，同框验证。"""
+        def mixed_lookup(ref):
+            if ref == "evd_boom":
+                raise RuntimeError("storage I/O failure")
+            if ref == "evd_dup":
+                return _ev("evd_dup", conflict_ids=["cnf_dup"])
+            if ref == "evd_ok":
+                return _ev("evd_ok", conflict_ids=["cnf_se"])
+            return None  # evd_ghost：正常缺失
+
+        prof = _profile(
+            traits=[_item("t_a", "谨慎", Stability.PATTERN,
+                          refs=["evd_dup", "evd_dup", "evd_boom"]),
+                    _item("t_bad", "失态", Stability.SINGLE,
+                          refs=["evd_ghost"])],
+            single_events=[_item("se1", "单次行为", Stability.SINGLE,
+                                 refs=["evd_boom", "evd_boom", "evd_ok"])])
+        view = distill_profile(prof, mixed_lookup).value
+        # D5：A 层特征 refs 去重保序 + D2 unresolved 含 failed
+        ta = view.stable_traits[0]
+        self.assertEqual(ta.evidence_refs, ["evd_dup", "evd_boom"])
+        self.assertEqual(ta.unresolved_evidence_count, 1)  # boom（failed）
+        self.assertEqual(ta.tier_composition, {"VERBATIM": 1})
+        # D1：C 层 single_events 冲突收集（evd_ok 带 cnf_se）+ D5：C 层 refs 去重
+        se = view.insufficient.single_events[0]
+        self.assertEqual(se.evidence_refs, ["evd_boom", "evd_ok"])
+        c_ptr = [p for p in view.conflicts_visible if p.layer == "C"]
+        self.assertEqual([p.evidence_id for p in c_ptr], ["evd_ok"])
+        self.assertEqual(c_ptr[0].conflict_ids, ["cnf_se"])
+        # D1：C 层 anomalous_traits（t_bad）条目保留、缺失登记
+        self.assertEqual([r.item_id for r in view.insufficient.anomalous_traits],
+                         ["t_bad"])
+        # D3：failed 与 missing 分列
+        self.assertEqual(view.confidence_basis.failed_evidence_ids,
+                         ["evd_boom"])
+        self.assertEqual(view.confidence_basis.missing_evidence_ids,
+                         ["evd_ghost"])
+        # 冲突指针：A 层 evd_dup 一个（去重），layer="A"
+        a_ptrs = [p for p in view.conflicts_visible if p.layer == "A"]
+        self.assertEqual([p.evidence_id for p in a_ptrs], ["evd_dup"])
+        self.assertEqual(a_ptrs[0].conflict_ids, ["cnf_dup"])
+
     def test_15_static_forbidden_field_guard(self):
         """FORBIDDEN_FIELD_PATTERN（score/closeness/intimacy）全模块零命中。"""
         import re

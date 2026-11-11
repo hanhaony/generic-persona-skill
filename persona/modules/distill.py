@@ -23,8 +23,11 @@
 - **不修改原始 profile**：只读访问，所有列表输出为拷贝。
 - 防御性口径：traits 里出现非 PATTERN/REPEATED 的条目（正常情况被 AC-7
   挡在装配层）**不伪造归层**，落 C 层 `anomalous_traits` 如实暴露；
-  证据引用查不到 / namespace 为 SIMULATED 的证据**不计入任何构成统计**，
-  分别记入 missing_evidence_ids / simulated_evidence_ids。
+  证据引用查不到（missing）/ lookup 调用异常（failed，**与缺失分列**）/ 
+  namespace 为 SIMULATED 的证据**不计入任何构成统计**，分别登记，
+  并计入特征级 `unresolved_evidence_count`（P8.2-C D2/D3）。
+- 冲突指针 **A/B/C 三层统一收集**，按 evidence_id 全局去重（P8.2-C D1）；
+  引用先去重保序，重复引用只贡献一次统计（P8.2-C D5）。
 - 字段命名不命中 FORBIDDEN_FIELD_PATTERN（evaluation 的关系禁词表）。
 """
 
@@ -76,7 +79,7 @@ class DistilledTrait:
     tentative: bool                  # B 层恒 True；A 层 False
     evidence_refs: list[str] = field(default_factory=list)
     source_ids: list[str] = field(default_factory=list)
-    evidence_count: int = 0          # 引用的证据总数（含无法解析的）
+    evidence_count: int = 0          # 引用的证据总数（D5：去重保序后）
     #: 证据层级构成：{"VERBATIM": n, "THIRD_PARTY": m, ...}——只统计
     #: 能解析且非 SIMULATED 的证据。第三方评价占比一目了然。
     tier_composition: dict[str, int] = field(default_factory=dict)
@@ -86,6 +89,9 @@ class DistilledTrait:
     #: ——时间不可考就如实置 None，不编造（judge_stability 同口径）。
     time_span: tuple[str, str] | None = None
     uncertainty_note: str = ""
+    #: 引用中**未能参与统计**的证据数（missing + failed + SIMULATED）——
+    #: P8.2-C D2：特征级缺失一目了然，消费方不必自行用 composition 反推。
+    unresolved_evidence_count: int = 0
 
 
 @dataclass
@@ -129,6 +135,9 @@ class ConfidenceBasis:
     #: 全投影范围内（A/B/C 所有条目）的证据解析情况。
     resolved_evidence_count: int = 0
     missing_evidence_ids: list[str] = field(default_factory=list)
+    #: lookup **调用异常**的证据 ID（与"正常返回 None = 证据不存在"分列——
+    #: P8.2-C D3：查询故障不得静默降级成证据缺失）。
+    failed_evidence_ids: list[str] = field(default_factory=list)
     simulated_evidence_ids: list[str] = field(default_factory=list)
     #: A+B 层各 tier 合计（第三方评价占比的全局口径）。
     tier_totals: dict[str, int] = field(default_factory=dict)
@@ -195,11 +204,13 @@ def distill_profile(profile: PersonaProfileView,
     for section in (profile.background, profile.expression_style):
         all_refs.extend(str(x) for x in (section.evidence_refs or []))
     resolved: dict[str, Any] = {}
+    failed: set[str] = set()          # P8.2-C D3：lookup 异常单独登记
     for ref in dict.fromkeys(all_refs):          # 去重保序
         try:
             resolved[ref] = evidence_lookup(ref)
-        except Exception:                         # noqa: BLE001 —— lookup 异常按"查不到"处理，不伪造
+        except Exception:                         # noqa: BLE001 —— lookup 异常按"查询失败"登记，不伪造
             resolved[ref] = None
+            failed.add(ref)
 
     view = DistilledProfileView(
         entity_id=str(profile.entity_id),
@@ -218,18 +229,21 @@ def distill_profile(profile: PersonaProfileView,
     for item in profile.traits:
         stability = _stability_of(item)
         if stability == _TRAIT_STABILITY_A:
-            view.stable_traits.append(_distill_item(item, LAYER_STABLE, resolved, view))
+            view.stable_traits.append(_distill_item(item, LAYER_STABLE, resolved, view, failed))
         elif stability == _TRAIT_STABILITY_B:
-            view.tentative_patterns.append(_distill_item(item, LAYER_TENTATIVE, resolved, view))
+            view.tentative_patterns.append(
+                _distill_item(item, LAYER_TENTATIVE, resolved, view, failed))
         else:
-            view.insufficient.anomalous_traits.append(_raw_ref(item, stability))
+            view.insufficient.anomalous_traits.append(
+                _c_item(item, stability, resolved, view, failed))
     for item in profile.habits:
-        view.tentative_patterns.append(_distill_item(item, LAYER_TENTATIVE, resolved, view))
+        view.tentative_patterns.append(
+            _distill_item(item, LAYER_TENTATIVE, resolved, view, failed))
 
     # —— C 层：single_events + open_questions + status ——
     for item in profile.single_events:
         view.insufficient.single_events.append(
-            _raw_ref(item, _stability_of(item)))
+            _c_item(item, _stability_of(item), resolved, view, failed))
     view.insufficient.open_questions = [str(q) for q in (profile.open_questions or [])]
 
     # —— 全局依据合计（missing/simulated 已在解析与逐条统计中登记）——
@@ -259,6 +273,54 @@ def _raw_ref(item: Any, stability: str) -> RawItemRef:
     )
 
 
+def _dedupe_refs(refs: list[str]) -> list[str]:
+    """P8.2-C D5：证据引用去重保序——重复引用只贡献一次统计。"""
+    return list(dict.fromkeys(refs))
+
+
+def _register_evidence(ref: str, ev: Any, view: DistilledProfileView,
+                       failed: set[str], item_id: str, layer: str) -> bool:
+    """登记单条证据解析结果的问题与冲突指针；返回该证据是否可参与统计。
+
+    - lookup 返回 None：missing_evidence_ids（证据不存在，如实登记）；
+    - lookup 曾抛异常（ref ∈ failed）：failed_evidence_ids（查询故障，
+      **与"不存在"分列**，不静默降级——P8.2-C D3）；
+    - namespace=SIMULATED：simulated_evidence_ids（防御过滤，EV-V1 精神）；
+    - 证据带 conflict_ids：登记 ConflictPointer（按 evidence_id 全局去重——
+      多条目引用同一冲突只报一次，P8.2-C D1；A/B/C 三层统一收集）。
+    各登记列表均查重，同一 ID 不重复记录。
+    """
+    basis = view.confidence_basis
+    if ev is None:
+        target = basis.failed_evidence_ids if ref in failed \
+            else basis.missing_evidence_ids
+        if ref not in target:
+            target.append(ref)
+        return False
+    if str(_ev_field(ev, "namespace") or "").upper() == _SIMULATED:
+        if ref not in basis.simulated_evidence_ids:
+            basis.simulated_evidence_ids.append(ref)
+        return False
+    conflict_ids = [str(c) for c in (_ev_field(ev, "conflict_ids") or [])]
+    if conflict_ids and not any(p.evidence_id == ref
+                                for p in view.conflicts_visible):
+        view.conflicts_visible.append(ConflictPointer(
+            item_id=item_id, layer=layer, evidence_id=ref,
+            conflict_ids=conflict_ids))
+    return True
+
+
+def _c_item(item: Any, stability: str, resolved: dict[str, Any],
+            view: DistilledProfileView, failed: set[str]) -> RawItemRef:
+    """C 层条目：透传原文 + 问题登记 + 冲突收集（P8.2-C D1——C 层同样可见）。"""
+    raw = _raw_ref(item, stability)
+    raw.evidence_refs = _dedupe_refs(raw.evidence_refs)
+    for ref in raw.evidence_refs:
+        _register_evidence(ref, resolved.get(ref), view, failed,
+                           raw.item_id, LAYER_INSUFFICIENT)
+    return raw
+
+
 def _ev_field(ev: Any, name: str) -> Any:
     """EvidenceView 属性 / dict 键 两形状统一取值。"""
     if ev is None:
@@ -269,14 +331,15 @@ def _ev_field(ev: Any, name: str) -> Any:
 
 
 def _distill_item(item: Any, layer: str, resolved: dict[str, Any],
-                  view: DistilledProfileView) -> DistilledTrait:
+                  view: DistilledProfileView, failed: set[str]) -> DistilledTrait:
     """单条档案条目 → 蒸馏特征（tier 构成 / 时间跨度 / 冲突指针）。
 
-    证据解析失败的引用：计入 evidence_count（引用了就是引用了）、
-    记入 missing_evidence_ids，但**不计入任何构成统计**——不伪造。
+    引用先去重保序（D5）；无法参与统计的证据（missing/failed/SIMULATED）
+    统一登记并计入 `unresolved_evidence_count`（D2）——不伪造。
     """
     basis = view.confidence_basis
-    refs = [str(x) for x in (getattr(item, "evidence_refs", None) or [])]
+    refs = _dedupe_refs([str(x) for x in
+                         (getattr(item, "evidence_refs", None) or [])])
     trait = DistilledTrait(
         layer=layer,
         item_id=str(getattr(item, "item_id", "")),
@@ -292,17 +355,11 @@ def _distill_item(item: Any, layer: str, resolved: dict[str, Any],
     starts: set[str] = set()
     resolvable = 0
     for ref in refs:
-        ev = resolved.get(ref)
-        if ev is None:
-            if ref not in basis.missing_evidence_ids:
-                basis.missing_evidence_ids.append(ref)
-            continue
-        # 防御性二次过滤：SIMULATED 永远不参与人格统计（EV-V1 精神）
-        if str(_ev_field(ev, "namespace") or "").upper() == _SIMULATED:
-            if ref not in basis.simulated_evidence_ids:
-                basis.simulated_evidence_ids.append(ref)
+        if not _register_evidence(ref, resolved.get(ref), view, failed,
+                                  trait.item_id, layer):
             continue
         resolvable += 1
+        ev = resolved.get(ref)
         tier = str(_ev_field(ev, "tier") or "").upper()
         if tier:
             tier_counts[tier] = tier_counts.get(tier, 0) + 1
@@ -314,15 +371,11 @@ def _distill_item(item: Any, layer: str, resolved: dict[str, Any],
         start = _ev_field(stated, "start") if stated is not None else None
         if start:
             starts.add(str(start))
-        conflict_ids = [str(c) for c in (_ev_field(ev, "conflict_ids") or [])]
-        if conflict_ids:
-            view.conflicts_visible.append(ConflictPointer(
-                item_id=trait.item_id, layer=layer,
-                evidence_id=ref, conflict_ids=conflict_ids))
     trait.source_ids = sources
     trait.source_count = len(sources)
     trait.tier_composition = tier_counts
     basis.resolved_evidence_count += resolvable
+    trait.unresolved_evidence_count = trait.evidence_count - resolvable
     if resolvable:
         trait.third_party_ratio = round(
             tier_counts.get("THIRD_PARTY", 0) / resolvable, 4)
