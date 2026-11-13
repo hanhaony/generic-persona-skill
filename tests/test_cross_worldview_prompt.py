@@ -308,7 +308,7 @@ class CrossWorldviewPromptTest(unittest.TestCase):
 
     def test_prompt_version_bumped_for_era_block(self):
         """身份块改了 prompt 文本 ⇒ 版本必须 +1（幂等键由它参与生成）。"""
-        self.assertEqual(DIALOGUE_PROMPT_VERSION, "p8-crossuniverse-2026-11-04a")
+        self.assertEqual(DIALOGUE_PROMPT_VERSION, "p8-projection-2026-11-13a")
 
 
 if __name__ == "__main__":  # pragma: no cover

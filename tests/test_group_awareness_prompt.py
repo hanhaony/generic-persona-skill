@@ -333,7 +333,7 @@ class GroupPromptEndToEndTest(unittest.TestCase):
 
     def test_prompt_version_bumped_for_group_awareness(self):
         self.assertEqual(DIALOGUE_PROMPT_VERSION,
-                         "p8-crossuniverse-2026-11-04a")
+                         "p8-projection-2026-11-13a")
 
 
 class StaticGroupDynamicsTest(unittest.TestCase):

@@ -1948,7 +1948,9 @@ def _cmd_chat(args: Any) -> int:
         built = build_business_stack(
             settings, ctx, storage=storage,
             options=StackOptions(build_chat_provider=True,
-                                 build_search_provider=False),
+                                 build_search_provider=False,
+                                 # P8.3-B：只有 chat 会话需要结构化人格投影。
+                                 enable_persona_projection=True),
             allow_real=True,
         )
         if is_err(built):
@@ -2018,6 +2020,20 @@ def _cmd_chat(args: Any) -> int:
             yes=bool(getattr(args, "yes", False)),
         ):
             return 1
+
+        # P8.3-B：会话开始时**一次性**构建人格投影（按 entity_id 分键、
+        # 绑定 profile_version）。此后每轮 Dialogue 只读内存缓存：零证据
+        # 查询、零重投影。scope 每次会话唯一，跨会话 / Story 不共享缓存。
+        projections = stack.persona_projections
+        if projections is not None:
+            import uuid
+            projections.prime([pid for pid, _ in people],
+                              scope=f"chat-{uuid.uuid4().hex}")
+            pstatus = projections.status()
+            if pstatus["degraded"]:
+                # 降级状态明确、不静默吞异常；但绝不因此中断聊天。
+                print(f"提示：人格投影降级 {pstatus['degraded']}——"
+                      "受影响角色沿用原始档案桶，本次未使用结构化分层。")
 
         started = stack.dialogue.start_session(ctx, SessionDraft(
             participant_entity_ids=[pid for pid, _ in people],

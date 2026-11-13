@@ -54,13 +54,15 @@ from ..config.spec import (
 from ..core.context import CallContext
 from ..core.errors import ErrorCode, new_error
 from ..core.result import Err, Ok, Result, WarningNote, error_of, is_err, is_ok
-from ..core.types import SourceMaterial
+from ..core.types import MAX_QUERY_LIMIT, Query, SourceMaterial
 from ..core.usage_ledger import (
     ExternalUsageLedger,
     HydrationSummary,
     estimate_model_cost,
 )
+from ..modules.character import build_behavior_policy
 from ..modules.dialogue import DialogueDeps, DialogueService
+from ..modules.distill import distill_profile
 from ..modules.evidence import EvidenceService
 from ..modules.memory import MemoryService
 from ..modules.persona import PersonaService
@@ -170,6 +172,169 @@ class StackOptions:
     #: 为什么需要它：`init_schema` 会真的把表写进库文件，"只看一眼清单"
     #: 不该留下一个 80 KB 的空库；而没建表就不能 hydrate，两者必须一起关。
     initialize_schema: bool = True
+    #: P8.3-B：`True` = 给 Dialogue 注入会话级人格投影端口。
+    #: 默认 `False`——只有 `persona chat` 会在会话开始时 prime 投影；
+    #: `run` / 预览 / 全部既有装配路径保持原有 Dialogue 行为（逐字不变），
+    #: 避免"装配了端口却没 prime"被误当成已使用结构化人格投影。
+    enable_persona_projection: bool = False
+
+
+# --------------------------------------------------------------------------
+# P8.3-B：会话级人格投影缓存（纯内存，不落库、不发请求）
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class _ProjectionEntry:
+    """一个角色在**本次会话**里的一份投影快照。"""
+
+    entity_id: str
+    profile_version: int
+    projection: Any = None       # DistilledProfileView | None（None = 已降级）
+    policy: Any = None           # BehaviorPolicy | None（供 P8.3 后续行为层消费）
+    reason: str | None = None    # 降级原因（None = 正常结构化投影）
+
+
+class PersonaProjectionCache:
+    """把 `distill_profile()` 的产出按 entity_id 缓存在**会话级**。
+
+    纪律（P8.3-B §3.B）：
+    - 会话开始时 `prime(entity_ids, scope=...)` 构建一次；此后每轮 `get()`
+      **只读内存**，零证据查询、零重投影（计数器可验证）。
+    - `get()` 收到的 `profile_version` 与缓存不一致时才重算——旧版本绝不误用；
+      正常情况下一次会话每角色只构建一次。
+    - key = `project_id | scope | entity_id`：不同会话 / Story 不共享错误缓存；
+      `prime()` 会清空旧条目，同实例复用也不会串。
+    - 任何失败都登记 `reason` 并返回 None：聊天走原始档案桶降级路径，
+      **绝不因投影失败而整体失败**，也不静默吞掉（CLI/上下文/status 均可读）。
+    - 同时装配 `build_behavior_policy`（复用既有纯函数，不重建人格系统）；
+      本阶段 Dialogue 只消费投影，policy 留给后续 Character 行为层。
+    """
+
+    def __init__(self, *, ctx: CallContext, profiles: Any, evidence: Any,
+                 relationships: Any = None) -> None:
+        self._ctx = ctx
+        self._profiles = profiles
+        self._evidence = evidence
+        self._relationships = relationships
+        self._project_id = str(getattr(ctx, "project_id", "") or "")
+        self._scope = ""
+        self._entries: dict[str, _ProjectionEntry] = {}
+        self._degraded: dict[str, str] = {}
+        #: 供测试与运行报告验证"每轮零重查"的计数（纯内存，不落库）。
+        self.build_calls = 0
+        self.evidence_lookup_calls = 0
+
+    # ---------------------------------------------------------------- 公开接口
+
+    def prime(self, entity_ids: list[str], *, scope: str = "") -> None:
+        """会话开始时一次性构建（同一 entity_id 只构建一次）。"""
+        if scope:
+            self._scope = str(scope)
+        self._entries.clear()
+        self._degraded.clear()
+        seen: set[str] = set()
+        for raw in entity_ids:
+            eid = str(raw)
+            if eid in seen:
+                continue
+            seen.add(eid)
+            self._build_one(eid)
+
+    def get(self, entity_id: str, profile_version: int | None = None) -> Any:
+        """取投影；版本变化才重算。未 prime / 已降级 → None（不隐式查询）。"""
+        key = self._key(str(entity_id))
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        if entry.projection is None:          # 已降级：不重试，避免每轮重复失败
+            return None
+        if profile_version is not None and entry.profile_version != int(profile_version):
+            return self._build_one(str(entity_id), expected_version=int(profile_version))
+        return entry.projection
+
+    def degraded_for(self, entity_id: str) -> str | None:
+        """该角色的降级原因（None = 未降级/正常）。"""
+        return self._degraded.get(self._key(str(entity_id)))
+
+    def policy_for(self, entity_id: str) -> Any:
+        entry = self._entries.get(self._key(str(entity_id)))
+        return entry.policy if entry is not None else None
+
+    def status(self) -> dict[str, Any]:
+        """装配事实快照（降级状态**必须可读**，不伪装成已使用投影）。"""
+        return {
+            "project_id": self._project_id,
+            "scope": self._scope,
+            "primed_entity_ids": sorted(e.entity_id for e in self._entries.values()),
+            "degraded": {k.rsplit("|", 1)[-1]: v
+                         for k, v in self._degraded.items()},
+            "build_calls": self.build_calls,
+            "evidence_lookup_calls": self.evidence_lookup_calls,
+            "mode": ("structured" if any(e.projection is not None
+                                         for e in self._entries.values())
+                     else "degraded"),
+        }
+
+    # ---------------------------------------------------------------- 内部实现
+
+    def _key(self, entity_id: str) -> str:
+        return f"{self._project_id}|{self._scope}|{entity_id}"
+
+    def _build_one(self, entity_id: str,
+                   expected_version: int | None = None) -> Any:
+        key = self._key(entity_id)
+        self.build_calls += 1
+        try:
+            got = self._profiles.get_persona(self._ctx, entity_id)
+            if is_err(got):
+                return self._degrade(key, entity_id, "档案读取失败，人格投影降级")
+            prof = got.value
+            version = int(prof.version)
+            if expected_version is not None and version != expected_version:
+                return self._degrade(key, entity_id, "档案版本不一致，人格投影降级")
+
+            def lookup(ref: str) -> Any:
+                # 只走会话 ctx 的既有只读端口：project_id 天然隔离，不造旁路查询。
+                self.evidence_lookup_calls += 1
+                res = self._evidence.get_evidence(self._ctx, ref)
+                return None if is_err(res) else res.value
+
+            projected = distill_profile(prof, lookup)
+            if is_err(projected):
+                return self._degrade(key, entity_id, "人格投影未通过校验，已降级")
+            self._entries[key] = _ProjectionEntry(
+                entity_id=entity_id, profile_version=version,
+                projection=projected.value,
+                policy=self._build_policy(prof, entity_id))
+            self._degraded.pop(key, None)
+            return projected.value
+        except Exception as exc:                 # noqa: BLE001 —— 降级不阻塞聊天
+            # 只记异常类型，不输出堆栈 / 内部信息（P8.3-B §3.D）。
+            return self._degrade(
+                key, entity_id,
+                f"人格投影异常（{type(exc).__name__}），已降级")
+
+    def _build_policy(self, prof: Any, entity_id: str) -> Any:
+        """复用既有 `build_behavior_policy`；关系查询失败不拖垮投影。"""
+        rels: list[Any] = []
+        if self._relationships is not None:
+            try:
+                page = self._relationships.query_relationships(
+                    self._ctx, Query(limit=MAX_QUERY_LIMIT))
+                if not is_err(page):
+                    rels = [r for r in page.value.items
+                            if entity_id in (getattr(r, "participant_entity_ids", None) or [])]
+            except Exception:                    # noqa: BLE001 —— 关系侧留空，不吞主流程
+                rels = []
+        built = build_behavior_policy(prof, rels)
+        return None if is_err(built) else built.value
+
+    def _degrade(self, key: str, entity_id: str, reason: str) -> None:
+        self._entries[key] = _ProjectionEntry(
+            entity_id=entity_id, profile_version=-1, reason=reason)
+        self._degraded[key] = reason
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -197,6 +362,8 @@ class BusinessStack:
     hydration: HydrationSummary | None = None
     warnings: list[WarningNote] = field(default_factory=list)
     owns_storage: bool = False
+    #: P8.3-B：仅 `enable_persona_projection=True` 时构造（默认 None = 未接线）。
+    persona_projections: PersonaProjectionCache | None = None
 
     # ------------------------------------------------------------------ 展示
 
@@ -244,6 +411,10 @@ class BusinessStack:
                     self.hydration.currencies) if self.hydration else 0),
             },
             "warnings": [note.code for note in self.warnings],
+            # P8.3-B：接没接上、有没有降级，装配事实里必须一眼可读。
+            "persona_projection": (self.persona_projections.status()
+                                   if self.persona_projections is not None
+                                   else {"mode": "disabled"}),
         }
 
     def _currency_invariant(self, hydrated_currencies: int) -> str:
@@ -863,6 +1034,13 @@ def build_business_stack(
             message="对话阶段没有可用的聊天 Provider（未注入、也未构造真实 Provider）："
                     "已回落到 FakeProvider——它需要预先登记的 fixture，"
                     "真实运行会在 DIALOGUE_RUN 阶段失败"))
+    # P8.3-B：默认不接线（保持既有装配路径逐字不变）；只有 `persona chat`
+    # 显式开启，并在会话开始时 prime。缓存是纯内存的，不建表、不发请求。
+    persona_projections: PersonaProjectionCache | None = None
+    if options.enable_persona_projection:
+        persona_projections = PersonaProjectionCache(
+            ctx=ctx, profiles=persona, evidence=evidence,
+            relationships=relationship)
     dialogue = DialogueService(DialogueDeps(
         profiles=persona, relations=relationship, evidence=evidence,
         memory=memory, storage=storage,
@@ -877,7 +1055,9 @@ def build_business_stack(
         limits=shared_limits,
         usage_sink=storage,
         task_id=options.task_id,
-        model_hint=settings.model.model_id or DEFAULT_MODEL_ID))
+        model_hint=settings.model.model_id or DEFAULT_MODEL_ID,
+        # P8.3-B：结构化人格投影端口（默认 None = 沿用原始档案桶）。
+        persona_projection=persona_projections))
 
     # ---------------- 6. 关系分析器（D-D：默认装配，可关闭） ----------------
     analyzer = relationship_analyzer
@@ -923,4 +1103,5 @@ def build_business_stack(
         hydration=hydration,
         warnings=warnings,
         owns_storage=owns_storage,
+        persona_projections=persona_projections,
     ))

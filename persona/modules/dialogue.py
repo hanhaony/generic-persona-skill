@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from ..core.context import CallContext
 from ..core.enums import (
@@ -64,6 +64,7 @@ from ..core.usage_ledger import (
 )
 from ..providers.base import ChatRequest, Message, Provider
 from ..storage.sqlite import SqliteStorage
+from .character import STORY_ID_RE
 from .evidence import EvidenceReader
 from .memory import MemoryQuery, MemoryView
 from .memory_writeback import RULE_VERSION, derive_report
@@ -75,6 +76,9 @@ from .model_budget import (
 )
 from .persona import PersonaReader
 from .relationship import RelationshipReader
+
+if TYPE_CHECKING:                       # 运行时零耦合：投影 DTO 只在注解里出现
+    from .distill import DistilledProfileView
 
 
 # 会话中"用户（操作者）"的发言占位。它不是 PersonEntity 参与者，不会被纳入
@@ -183,7 +187,7 @@ DIALOGUE_MEASURED_COST_PER_CALL_USD = 0.0005
 #: 新增静态【群像法则】（性格决定话多话少 + 严禁复读他人问题）；多人会话
 #: 注入动态【在场认知】块（同作品=旧识免客套、跨作品/现实=陌生人、
 #: 现实演员遇自己演过的角色允许"我演过你"式吐槽）。
-DIALOGUE_PROMPT_VERSION = "p8-crossuniverse-2026-11-04a"
+DIALOGUE_PROMPT_VERSION = "p8-projection-2026-11-13a"
 
 # ---- 证据级引用（P6.0 N1）----
 #
@@ -497,12 +501,34 @@ def build_awareness_block(speaker: dict, others: list[dict]) -> str:
 #
 # `single_events` 的标签是**硬要求**：只有一份资料提到的行为，必须在 prompt 里就
 # 标成"不得说成一贯"，否则模型会把它当作风陈述（违反 AC-7 / D-012 / PF-V2）。
-LABEL_TRAITS = "稳定特质（多份资料支持，可作为一贯作风陈述）"
+# P8.3-C D-03：本标签在**降级路径**（无投影 / 已降级）生效，而该路径把
+# `prof.traits` 全量挂进同一个桶，里面可能混有 REPEATED 甚至异常 stability。
+# 原标签写死「稳定特质（多份资料支持，可作为一贯作风陈述）」——既与数据无关
+# （1 条证据也这么写），又会把暂定倾向说成稳定人格。改成中性标签：如实说明
+# 该路径不逐条展示稳定性标注，并保留「不得说成一贯作风」的纪律。
+# 只改常量文案，不改动原桶注入结构，也不改投影路径。
+LABEL_TRAITS = ("档案特征（不逐条展示稳定性标注；不得说成一贯作风，"
+                "不得声称多份资料支持）")
 LABEL_HABITS = "习惯"
 LABEL_EXPRESSION = "说话风格"
 LABEL_EXPERIENCES = "经历"
 LABEL_SINGLE_EVENTS = (
     "单次行为（只有一份资料提到，只发生过一次，**不得**说成一贯/总是/向来/从来）")
+
+# ---- P8.3-B：结构化人格投影的分层标签与状态标记 ----
+#
+# 与上面的静态桶标签**互斥生效**：注入 `persona_projection` 时由投影的
+# layer/tentative/证据构成驱动，下面的静态标签只在降级路径使用。这样
+# REPEATED 不会再拿到 PATTERN 的"稳定特质"措辞，也不会仅凭登记值
+# 声称"多份资料支持"（必须看 tier_composition / 来源数 / 可解析数）。
+LABEL_LAYER_A = "A 层·稳定人格依据（PATTERN；行为倾向参考，不是强制行为命令）"
+LABEL_LAYER_B = "B 层·暂定倾向（REPEATED / 习惯；尚未稳定，不得说成一贯/总是/向来）"
+LABEL_LAYER_C = "C 层·单次行为 / 待确认（不得作为稳定人格特征，不得说成一贯）"
+#: 只进 `safety_flags` 的普通上下文标记，不是 ErrorCode、不落库。
+FLAG_PROJECTION_DEGRADED = "PERSONA_PROJECTION_DEGRADED"
+FLAG_PROJECTION_CONFLICT = "PERSONA_CONFLICT_VISIBLE"
+FLAG_PROJECTION_UNRESOLVED = "PERSONA_EVIDENCE_UNRESOLVED"
+FLAG_PROJECTION_NEEDS_VERIFICATION = "PERSONA_TRAIT_NEEDS_VERIFICATION"
 
 # ---- traits 注入上限（P6.0 N3）----
 #
@@ -564,6 +590,44 @@ class MemoryWriterPort(Protocol):
         ...
 
 
+class PersonaProjectionPort(Protocol):
+    """P8.3-B：会话级人格投影的**只读**端口。
+
+    Dialogue 只拿得到 `get` 与 `degraded_for`，拿不到构建、写入或证据查询能力
+    ——"每轮不重新投影、不重新查证据"因此是结构性事实，不靠调用方自觉。
+    `profile_version` 由 Dialogue 用本轮读到的档案版本传入，端口自行判失效。
+    """
+
+    def get(self, entity_id: str,
+            profile_version: int | None = ...) -> "DistilledProfileView | None":
+        ...
+
+    def degraded_for(self, entity_id: str) -> str | None:
+        ...
+
+
+class KnowledgePort(Protocol):
+    """P8.4-B：故事知识**只读**端口（实现方：`StoryKnowledgeCache`）。
+
+    会话级快照语义：`prime_session` 在会话开启时调用一次（此后每轮
+    `knowledge_for` 命中内存快照，**零 CharacterInstance 全项目扫描**）。
+    实现方必须按 (project_id, story_id, character_id) 严格隔离——
+    绑定 story 之外的查询一律返回空，绝不泄漏其他故事的知识。
+    失效由写入方**显式**触发（CharacterService 知识写入口 → invalidate）；
+    本端口不做也不声称自动失效或跨进程一致性。
+    """
+
+    def prime_session(self, ctx: CallContext, story_id: str,
+                      entity_ids: list[str]) -> Result[None]:
+        """会话开启：为每个参与者加载一次知识快照。失败 → Err（不开会话）。"""
+        ...
+
+    def knowledge_for(self, ctx: CallContext, story_id: str,
+                      character_id: str) -> Result[list[dict]]:
+        """读本会话某角色在该 Story 下的 ACTIVE 知识条目。"""
+        ...
+
+
 @dataclass(frozen=True)
 class DialogueDeps:
     """Dialogue 的全部外部依赖（类型层面阻断误用，INTERFACES §8.1）。
@@ -597,6 +661,10 @@ class DialogueDeps:
     usage_sink: Any = None
     task_id: str | None = None
     model_hint: str | None = None
+    #: P8.3-B：可选的结构化人格投影端口。默认 `None` = 没有可用投影，
+    #: 沿用既有 `LABEL_*` 静态桶路径（逐字不变）；注入后由投影的 A/B/C 分层
+    #: 与证据构成作为**单一事实源**驱动角色档案块。
+    persona_projection: PersonaProjectionPort | None = None
 
 
 @dataclass
@@ -628,6 +696,10 @@ class SessionDraft:
     max_rounds: int | None = None
     # P3.6：记忆写入策略（默认 none —— 绝不自动把每轮对话写入长期记忆）。
     memory_write_policy: str = POLICY_MEMORY_WRITE_NONE
+    # P8.4-B：可选 Story 绑定（sty_ 引用型标识符，与 CharacterInstance 同一
+    # 契约）。None = 普通会话，行为与既有路径逐字一致；绑定只在 start_session
+    # 写入 payload 一次，会话创建后没有任何接口可以修改（结构上防覆盖）。
+    story_id: str | None = None
 
 
 @dataclass
@@ -642,6 +714,8 @@ class SessionView:
     turn_count: int
     status: str
     memory_write_policy: str = POLICY_MEMORY_WRITE_NONE
+    # P8.4-B：回读自 payload；旧记录（无该键）→ None，新记录 → 绑定值。
+    story_id: str | None = None
 
 
 @dataclass
@@ -848,6 +922,23 @@ class DialogueService:
                                  else temperature)
         #: 没有账本时的次数兜底（有账本时以账本为准，见 `count_chat_calls`）
         self._calls = 0
+        #: P8.4-B：故事知识端口。由装配层显式 `attach_knowledge_port` 注入；
+        #: None = 未接线，Story 会话（story_id 非 None）会被显式拒绝——
+        #: 绝不在无知识端口的情况下静默开启"角色没有知识"的故事会话。
+        self._knowledge: KnowledgePort | None = None
+
+    def attach_knowledge_port(self, port: KnowledgePort) -> None:
+        """P8.4-B：装配层注入故事知识端口（BusinessOrchestrator 接线时调用）。
+
+        重复注入以最后一次为准：端口是**会话级快照**（prime 即重建），
+        不携带任何需要跨装配保留的状态，替换无损失——这一点写明在案，
+        与 story 绑定无关（绑定在会话记录 payload 里，端口动不了它）。
+        """
+        self._knowledge = port
+
+    def knowledge_port(self) -> KnowledgePort | None:
+        """P8.4-B：当前注入的知识端口（装配断言测试用；未注入 → None）。"""
+        return self._knowledge
 
     # ------------------------------------------------------------ 会话
 
@@ -867,6 +958,15 @@ class DialogueService:
             return Err(new_error(
                 ErrorCode.VALIDATION_REQUIRED_FIELD,
                 "participant_entity_ids 含重复对象", trace_ref=ctx.trace_ref))
+
+        # P8.4-B：story_id 格式门禁（对齐 topic 门禁风格：显式给的坏值直接
+        # Err，不静默丢弃、不当作 None）。None = 普通会话，走既有路径。
+        story_id = draft.story_id
+        if story_id is not None and not STORY_ID_RE.match(str(story_id)):
+            return Err(new_error(
+                ErrorCode.VALIDATION_GATE_REJECTED,
+                f"story_id 必须是 sty_ 前缀标识符（sty_ + 32 位十六进制），"
+                f"得到 {story_id!r}", trace_ref=ctx.trace_ref))
 
         memory_scope = _coerce_enum(draft.memory_scope, MemoryScope)
         if memory_scope is None:
@@ -909,6 +1009,19 @@ class DialogueService:
             ctx, participants, draft)
 
         session_id = new_id("ConversationSession")
+        # P8.4-B：Story 会话在落库**之前**先 prime 知识快照——失败即不开会话，
+        # 不留半开状态。普通会话（story_id=None）不 prime、不读知识。
+        if story_id is not None:
+            if self._knowledge is None:
+                return Err(new_error(
+                    ErrorCode.VALIDATION_GATE_REJECTED,
+                    "story 会话需要知识端口：请先 attach_knowledge_port(...)；"
+                    "本服务不会在无知识端口时静默开启 Story 会话",
+                    trace_ref=ctx.trace_ref))
+            primed = self._knowledge.prime_session(ctx, str(story_id),
+                                                   participants)
+            if is_err(primed):
+                return primed
         payload = {
             "participant_entity_ids": participants,
             "topic": topic,
@@ -917,6 +1030,9 @@ class DialogueService:
             "speaker_selection_policy": str(draft.speaker_selection_policy),
             "memory_scope": str(memory_scope),
             "memory_write_policy": memory_write_policy,
+            # P8.4-B：Story 绑定随记录持久化（None = 普通会话）；绑定只在
+            # 这里写入一次，之后无任何修改接口（结构上防覆盖）。
+            "story_id": story_id,
             "turn_count": 0,
             "budget_used": {"requests": 0, "tokens_in": None,
                             "tokens_out": None, "latency_ms": 0},
@@ -1540,25 +1656,46 @@ class DialogueService:
                 f"- 角色 {pid}（状态 {prof.status}）："
                 f"{prof.background.text or '（无背景）'}"
                 + self._fmt_refs(prof.background, evidence_in_context)]
-            # P6.0 N2：此前**只注入 traits[:5]**，`single_events` / `habits` /
-            # `experiences` / `expression_style` 一个字都不进 prompt，于是模型
-            # 根本看不到"单次行为"，却会被问"TA 一贯如何"。现在全部注入，
-            # 并且**逐分区标注稳定性**——尤其 `single_events` 必须带着
-            # "不得说成一贯"的标签（AC-7 / D-012 / PF-V2）。
-            #
-            # P6.0 N3：traits 的 `[:5]` 也一并放开为全量（`TRAITS_INJECT_LIMIT`
-            # 为 `None` 时），理由见该常量处的注释——截断会造成评估假失败。
-            traits = (list(prof.traits) if TRAITS_INJECT_LIMIT is None
-                      else list(prof.traits[:TRAITS_INJECT_LIMIT]))
-            for label, items in (
-                (LABEL_TRAITS, traits),
-                (LABEL_HABITS, list(prof.habits)),
-                (LABEL_EXPERIENCES, list(prof.experiences)),
-                (LABEL_SINGLE_EVENTS, list(prof.single_events)),
-            ):
-                line = self._fmt_items(label, items, evidence_in_context)
-                if line:
-                    lines.append(line)
+            projection, degrade_reason = self._projection_for(
+                pid, prof, safety_flags)
+            if projection is None:
+                # P6.0 N2：此前**只注入 traits[:5]**，`single_events` / `habits` /
+                # `experiences` / `expression_style` 一个字都不进 prompt，于是模型
+                # 根本看不到"单次行为"，却会被问"TA 一贯如何"。现在全部注入，
+                # 并且**逐分区标注稳定性**——尤其 `single_events` 必须带着
+                # "不得说成一贯"的标签（AC-7 / D-012 / PF-V2）。
+                #
+                # P6.0 N3：traits 的 `[:5]` 也一并放开为全量（`TRAITS_INJECT_LIMIT`
+                # 为 `None` 时），理由见该常量处的注释——截断会造成评估假失败。
+                #
+                # P8.3-B：本分支 = 没有可用投影 / 已降级，**逐字保持原行为**。
+                traits = (list(prof.traits) if TRAITS_INJECT_LIMIT is None
+                          else list(prof.traits[:TRAITS_INJECT_LIMIT]))
+                for label, items in (
+                    (LABEL_TRAITS, traits),
+                    (LABEL_HABITS, list(prof.habits)),
+                    (LABEL_EXPERIENCES, list(prof.experiences)),
+                    (LABEL_SINGLE_EVENTS, list(prof.single_events)),
+                ):
+                    line = self._fmt_items(label, items, evidence_in_context)
+                    if line:
+                        lines.append(line)
+                if degrade_reason:
+                    # 降级状态必须明确，不得伪装成已使用结构化人格投影（§3.D）。
+                    lines.append(
+                        f"  【人格说明：{degrade_reason}；本角色沿用原始档案桶，"
+                        "未使用结构化人格投影】")
+            else:
+                # P8.3-B：投影是单一事实源——A/B/C 分层 + 证据构成 + 冲突 +
+                # 缺失/查询失败全部由投影驱动，静态桶标签不再并行生效。
+                lines.extend(self._fmt_projection(
+                    projection, evidence_in_context, safety_flags))
+                # experiences 不在 P8.2 投影范围，仍按原标签注入（不丢信息）。
+                exp_line = self._fmt_items(
+                    LABEL_EXPERIENCES, list(prof.experiences),
+                    evidence_in_context)
+                if exp_line:
+                    lines.append(exp_line)
             if _text(prof.expression_style.text):
                 lines.append(
                     f"  {LABEL_EXPRESSION}：{_text(prof.expression_style.text)}"
@@ -1601,6 +1738,30 @@ class DialogueService:
         memory_briefs = [
             f"- [{v.namespace}/{v.source_type}] {v.content}" for v in memory_views
         ]
+
+        # P8.4-B：读取发言人在本 Story 的知识（只读端口，命中会话级快照，
+        # **不触发** CharacterInstance 全项目扫描）。本阶段知识**不进 prompt**
+        # （不改提示词 / 不 bump DIALOGUE_PROMPT_VERSION），只写审计留痕，
+        # 供验收核对"每轮读取走缓存、无重复扫描"与后续接线使用。
+        story_id = session_row.get("story_id")
+        if story_id:
+            if self._knowledge is None:
+                return Err(new_error(
+                    ErrorCode.VALIDATION_GATE_REJECTED,
+                    f"会话 {session_row.get('id')} 绑定了 story 但知识端口已丢失"
+                    "（装配不一致，拒绝继续）", trace_ref=ctx.trace_ref))
+            got = self._knowledge.knowledge_for(
+                ctx, str(story_id), speaker_entity_id)
+            if is_err(got):
+                return got
+            entries = got.value
+            known_ids = [str(e.get("id")) for e in entries]
+            self.deps.storage.append_audit(
+                ctx, "INFO", "dialogue.knowledge_read",
+                detail=(f"session={session_row.get('id')}"
+                        f" speaker={speaker_entity_id} story={story_id}"
+                        f" entries={len(entries)} ids_sample={known_ids[:3]}"
+                        "（本阶段只读不进 prompt，P8.4-B）"))
 
         turns = self._load_session_turns(ctx, str(session_row.get("id")))
         # P8.1（2026-10-28）：transcript 从 entity_id（pe_xxx）改用**显示名**标注。
@@ -1717,6 +1878,175 @@ class DialogueService:
         if not parts:
             return ""
         return f"  {label}：" + "；".join(parts)
+
+    # --------------------------------------- P8.3-B：结构化人格投影消费
+
+    def _projection_for(
+        self, entity_id: str, prof: Any, safety_flags: list[str]
+    ) -> tuple[Any, str]:
+        """取本角色的会话级投影，返回 `(projection, 降级原因)`。
+
+        - 端口未注入 → `(None, "")`：原有 Dialogue 行为逐字不变，不写说明；
+        - 端口返回 None 或抛异常 → `(None, 明确原因)` + 降级 safety flag；
+        - 端口是**只读**的，不带构建/查询能力，故每轮零重投影、零证据查询。
+        """
+        port = self.deps.persona_projection
+        if port is None:
+            return None, ""
+        try:
+            projection = port.get(entity_id, int(prof.version))
+            reason = port.degraded_for(entity_id) or ""
+        except Exception as exc:                 # noqa: BLE001 —— 降级不炸轮次
+            projection = None
+            reason = f"人格投影端口异常（{type(exc).__name__}），已降级"
+            safety_flags.append(FLAG_PROJECTION_DEGRADED)
+        if projection is None:
+            if not reason:
+                reason = "人格投影不可用，已降级"
+            if FLAG_PROJECTION_DEGRADED not in safety_flags:
+                safety_flags.append(FLAG_PROJECTION_DEGRADED)
+        return projection, reason
+
+    def _fmt_projection(
+        self, proj: Any, sink: list[str], safety_flags: list[str]
+    ) -> list[str]:
+        """把投影渲染成角色档案块——八个结构化字段都在这里被实际读取。
+
+        只展示、不裁决：A 层是行为依据不是命令；B 层恒暂定；C 层绝不进
+        稳定人格描述；冲突/缺失/查询失败如实保留并打 safety flag。
+        """
+        out = [f"  【人格投影 v{proj.profile_version}，按证据强度分层，只作行为参考】"]
+        stable = list(proj.stable_traits or [])
+        tentative = list(proj.tentative_patterns or [])
+        if stable:
+            out.append(f"  {LABEL_LAYER_A}：")
+            out.extend("    · " + self._fmt_distilled(t, sink, safety_flags)
+                       for t in stable)
+        if tentative:
+            out.append(f"  {LABEL_LAYER_B}：")
+            out.extend("    · " + self._fmt_distilled(t, sink, safety_flags)
+                       for t in tentative)
+        block = proj.insufficient
+        c_lines: list[str] = []
+        for r in (block.single_events or []):
+            c_lines.append("    · " + self._fmt_raw_ref(r, sink) + "（单次行为）")
+        for r in (block.anomalous_traits or []):
+            c_lines.append("    · " + self._fmt_raw_ref(r, sink)
+                           + "（异常 trait，稳定性未达 A/B）")
+        for q in (block.open_questions or []):
+            c_lines.append(f"    · 待确认问题：{_text(q)}")
+        if block.status_note:
+            c_lines.append(f"    · {_text(block.status_note)}")
+        if c_lines:
+            out.append(f"  {LABEL_LAYER_C}：")
+            out.extend(c_lines)
+
+        conflicts = list(proj.conflicts_visible or [])
+        if conflicts:
+            safety_flags.append(FLAG_PROJECTION_CONFLICT)
+            out.append("  冲突证据（保留不裁决，不得静默丢弃；角色行为须能识别反例）：")
+            for p in conflicts:
+                out.append(
+                    f"    · [{p.layer} 层 / 条目 {p.item_id}] 证据 {p.evidence_id}"
+                    f" ↔ 反例 {', '.join(str(x) for x in p.conflict_ids)}")
+
+        basis = proj.confidence_basis
+        problems: list[str] = []
+        if basis.missing_evidence_ids:
+            problems.append("证据不存在（无法核验）："
+                            + ", ".join(basis.missing_evidence_ids))
+        if basis.failed_evidence_ids:
+            problems.append("证据查询失败（lookup 异常，**不是**证据缺失）："
+                            + ", ".join(basis.failed_evidence_ids))
+        if basis.simulated_evidence_ids:
+            problems.append("模拟证据已排除（不参与人格统计）："
+                            + ", ".join(basis.simulated_evidence_ids))
+        if problems:
+            safety_flags.append(FLAG_PROJECTION_UNRESOLVED)
+            out.append("  证据问题（下列内容不得当作已核实事实）：")
+            out.extend(f"    · {p}" for p in problems)
+        totals = dict(getattr(basis, "tier_totals", {}) or {})
+        if totals:
+            ratio = getattr(basis, "third_party_ratio", None)
+            tail = (f"；第三方评价占比 {float(ratio):.0%}（评价不等于客观事实）"
+                    if ratio is not None else "")
+            out.append("  证据层级合计："
+                       + "、".join(f"{k}:{v}" for k, v in sorted(totals.items()))
+                       + tail)
+        return out
+
+    @staticmethod
+    def _fmt_distilled(t: Any, sink: list[str], safety_flags: list[str]) -> str:
+        """单条 A/B 层特征：文本 + 稳定性 + 构成 + 来源 + 时间 + 状态。
+
+        证据强度判定必须由 `tier_composition` / 来源数 / 可解析数参与，
+        **不允许**仅凭 `stability=PATTERN` 就声称"多份资料支持"。
+        """
+        refs = [r for r in _str_list(getattr(t, "evidence_refs", [])) if r]
+        for r in refs:
+            if r not in sink:
+                sink.append(r)
+        tail = f"（证据 {', '.join(refs)}）" if refs else "（无证据锚点）"
+        comp = dict(getattr(t, "tier_composition", {}) or {})
+        comp_text = ("、".join(f"{k}:{v}" for k, v in sorted(comp.items()))
+                     or "无可解析证据构成")
+        total = int(getattr(t, "evidence_count", len(refs)) or 0)
+        unresolved = int(getattr(t, "unresolved_evidence_count", 0) or 0)
+        resolved = max(0, total - unresolved)
+        sources = int(getattr(
+            t, "source_count", len(getattr(t, "source_ids", []) or [])) or 0)
+        third = int(comp.get("THIRD_PARTY", 0) or 0)
+        meta = [
+            f"{_text(t.text)}{tail}",
+            f"层级 {t.layer} / 稳定性 {t.stability}"
+            + ("（暂定 tentative）" if getattr(t, "tentative", False) else ""),
+            f"证据构成 {comp_text}",
+            f"可解析 {resolved}/{total}（不可核 {unresolved}）",
+            f"独立来源数 {sources}",
+        ]
+        ratio = getattr(t, "third_party_ratio", None)
+        if ratio is not None:
+            meta.append(f"第三方评价占比 {float(ratio):.0%}"
+                        f"（第三方 {third} 条，评价不等于客观事实）")
+        span = getattr(t, "time_span", None)
+        if span:
+            meta.append(f"证据时间跨度 {span[0]}~{span[1]}"
+                        "（跨时间出现相反行为时须显式说明变化）")
+        note = _text(getattr(t, "uncertainty_note", ""))
+        if note:
+            meta.append(f"存疑说明：{note}")
+        # P8.3-C D-01：把「证据是否可靠」与「稳定性是否达到 PATTERN」拆成两件事。
+        # 此前 strong 把 PATTERN 当必要条件，B 层恒走 else，于是证据完整
+        # （3 条可解析 / 3 独立来源 / 无缺失）的暂定倾向也被写死成
+        # 「证据构成不足或存在缺失/查询失败」——对外文案说谎。现在：
+        #   证据完整 + PATTERN      → 证据充分（可声称多份独立资料支持）
+        #   证据完整 + 非 PATTERN   → 如实说「暂定倾向」，不谎称证据有问题
+        #   证据确有缺口（任意层）  → 保留「需核验」+ safety flag
+        evidence_sound = (unresolved == 0 and resolved >= 2 and sources >= 2
+                          and third < resolved and bool(comp))
+        is_pattern = str(t.stability).upper() == "PATTERN"
+        if evidence_sound and is_pattern:
+            meta.append("状态：证据充分（多份独立资料支持，可作一贯作风参考）")
+        elif evidence_sound:
+            meta.append(
+                f"状态：证据完整，但稳定性 {t.stability} 仅为暂定倾向，"
+                "尚未达到稳定人格层级；不得表述为既定长期性格，"
+                "特殊情境下允许不同表现")
+        else:
+            safety_flags.append(FLAG_PROJECTION_NEEDS_VERIFICATION)
+            meta.append("状态：需核验（证据构成不足或存在缺失/查询失败；"
+                        "不得当作可靠事实）")
+        return "；".join(meta)
+
+    @staticmethod
+    def _fmt_raw_ref(r: Any, sink: list[str]) -> str:
+        """C 层条目：原文 + 可追溯引用 + 稳定性，绝不包装成稳定人格。"""
+        refs = [x for x in _str_list(getattr(r, "evidence_refs", [])) if x]
+        for x in refs:
+            if x not in sink:
+                sink.append(x)
+        tail = f"（证据 {', '.join(refs)}）" if refs else "（无证据锚点）"
+        return f"{_text(r.text)}{tail}；稳定性 {r.stability}"
 
     def _retrieve_memories(
         self, ctx: CallContext, session_row: dict
@@ -1981,6 +2311,8 @@ class DialogueService:
             status=str(row.get("status", "")),
             memory_write_policy=str(
                 row.get("memory_write_policy", POLICY_MEMORY_WRITE_NONE)),
+            # P8.4-B：旧记录无该键 → None；新记录 → 绑定值。
+            story_id=row.get("story_id"),
         )
 
     def _turn_view(self, row: dict) -> TurnView:

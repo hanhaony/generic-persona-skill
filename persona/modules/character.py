@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from ..core.context import CallContext
 from ..core.enums import ProvenanceNamespace, Stability
@@ -47,7 +47,7 @@ from ..core.result import Err, Ok, Result, is_err
 from ..core.temporal import to_iso, utc_now
 from ..core.types import Query
 from ..storage.sqlite import SqliteStorage
-from .persona import PersonaProfileView
+from .persona import PersonaProfileView, PersonaReader
 from .relationship import RelationshipView
 
 # --------------------------------------------------------------------------
@@ -427,8 +427,22 @@ class CharacterService:
     ⚠️ 装配层教训：本服务不接 CLI/app（P8.3 接线）；`--mock` 绿 ≠ 产品路径能跑。
     """
 
-    def __init__(self, storage: SqliteStorage) -> None:
+    def __init__(self, storage: SqliteStorage,
+                 persona_reader: PersonaReader | None = None) -> None:
         self.storage = storage
+        #: P8.4-B：档案关联校验依赖。None = 跳过校验（直接构造的既有测试/
+        #: 脚本保持兼容）；**生产装配（BusinessOrchestrator）必须注入**，
+        #: 装配断言测试盯着这条线，防止生产路径静默跳过校验。
+        self.persona_reader = persona_reader
+        #: P8.4-B：知识写入成功后的显式失效回调（参数 = character_id）。
+        #: 由装配层接到 StoryKnowledgeCache.invalidate——写后失效是**显式**
+        #: 的，本模块不做也不声称自动失效。
+        self._knowledge_write_listener: Callable[[str], None] | None = None
+
+    def set_knowledge_write_listener(
+            self, listener: Callable[[str], None] | None) -> None:
+        """P8.4-B：注册知识写入成功后的失效回调（显式注入；传 None 注销）。"""
+        self._knowledge_write_listener = listener
 
     # ------------------------------------------------------------ 创建/读取
 
@@ -449,6 +463,16 @@ class CharacterService:
             return Err(new_error(
                 ErrorCode.VALIDATION_GATE_REJECTED, "profile_version 必须是 ≥1 的整数",
                 trace_ref=ctx.trace_ref))
+        # P8.4-B：档案关联校验（注入 PersonaReader 时）。一次调用同时覆盖两条：
+        #   - 实体根本没有档案 → NOT_FOUND_ENTITY（"没有人格档案"）
+        #   - 有档案但指定版本不存在 → NOT_FOUND_VERSION（附现有版本清单）
+        # 只验证**指定版本存在**，不强制最新——实例绑开档时的版本是历史关联
+        # 语义；identity 字段（含 profile_version）依旧不可修订。
+        if self.persona_reader is not None:
+            prof = self.persona_reader.get_persona(
+                ctx, draft.character_id, version=draft.profile_version)
+            if is_err(prof):
+                return prof
         dup = self._find_by_story_and_character(ctx, draft.story_id,
                                                 draft.character_id, project_id)
         if is_err(dup):
@@ -493,6 +517,9 @@ class CharacterService:
                                namespace=ProvenanceNamespace.SIMULATED)
         if is_err(put):
             return Err(put.error)
+        # P8.4-B：实例携带知识开档 = 一次知识写入，显式通知失效监听器。
+        if draft.knowledge and self._knowledge_write_listener is not None:
+            self._knowledge_write_listener(draft.character_id)
         return self.get_instance(ctx, put.value)
 
     def get_instance(self, ctx: CallContext, instance_id: str
@@ -618,6 +645,10 @@ class CharacterService:
                                       expected_rev=expected_rev)
         if is_err(updated):
             return Err(updated.error)
+        # P8.4-B：知识补丁写入成功 = 一次知识写入，显式通知失效监听器
+        # （add_knowledge / correct_knowledge 都走本路径，天然被覆盖）。
+        if "knowledge" in patch and self._knowledge_write_listener is not None:
+            self._knowledge_write_listener(current.value.character_id)
         return Ok(_row_to_view(updated.value))
 
     # ------------------------------------------------------------ 知识操作

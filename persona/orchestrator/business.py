@@ -43,6 +43,7 @@
 from __future__ import annotations
 
 import hashlib
+import uuid
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -61,6 +62,7 @@ from ..core.enums import (
 from ..core.errors import AppError, ErrorCode, new_error
 from ..core.result import Err, Ok, Result, UsageDelta, WarningNote, error_of, is_err, is_ok
 from ..core.types import MAX_QUERY_LIMIT, BudgetUsage, Query, SourceMaterial
+from ..modules.character import CharacterService
 from ..modules.dialogue import DialogueService, SessionDraft
 from ..modules.evidence import EvidenceDraft, EvidenceService, InferenceDraft
 from ..modules.extract_quality import (
@@ -519,6 +521,84 @@ def _merge_key(item: Any) -> tuple:
 # --------------------------------------------------------------------------
 
 
+# --------------------------------------------------------------------------
+# 故事知识会话缓存（P8.4-B：G7 全项目扫描的会话级规避）
+# --------------------------------------------------------------------------
+
+
+class StoryKnowledgeCache:
+    """会话级 KnowledgeState 快照；实现 `dialogue.KnowledgePort` 协议。
+
+    纪律（P8.4-B0 §5 / P8.4-B 任务书 §二.C）：
+    - **key = project_id | scope | character_id**：scope 每次 prime 重新生成
+      （uuid4），结构上杜绝跨会话复用；缓存实例同一时刻只持有一个会话的数据。
+    - **绑定单一 story**：`knowledge_for` 收到与绑定 story 不一致的查询一律
+      返回空列表——严格隔离，绝不泄漏其他故事的知识。
+    - **prime 一次**：会话开启时对每个参与者恰好调用一次 `load_knowledge`
+      （这是该会话内仅有的 CharacterInstance 全项目扫描）；此后每轮读缓存，
+      零扫描。
+    - **显式失效**：`invalidate(character_id)` 丢弃条目，下一次读取重新加载
+      （惰性重取，"空列表"也被缓存——无知识角色不会每轮反复扫描）。由
+      CharacterService 的知识写入监听器自动触发（见 BusinessOrchestrator
+      接线）；**不声称自动失效，不声称跨进程一致性**。
+    - prime 失败清空已加载的半份快照并传播 Err（Dialogue 侧会话不开）。
+    """
+
+    def __init__(self, character_service: CharacterService) -> None:
+        self._svc = character_service
+        self._scope = ""
+        self._project_id = ""
+        self._story_id = ""
+        self._entries: dict[str, list[dict]] = {}
+
+    # ------------------------------------------------ KnowledgePort 协议 --
+
+    def prime_session(self, ctx: CallContext, story_id: str,
+                      entity_ids: list[str]) -> Result[None]:
+        """会话开启：重建快照（每个参与者恰好一次底层查询）。"""
+        self._scope = f"kb-{uuid.uuid4().hex}"
+        self._project_id = str(ctx.project_id)
+        self._story_id = str(story_id)
+        self._entries = {}
+        for eid in entity_ids:
+            loaded = self._load(ctx, str(eid))
+            if is_err(loaded):
+                self._entries = {}          # 失败不留半份快照
+                return loaded
+            self._entries[str(eid)] = loaded.value
+        return Ok(None)
+
+    def knowledge_for(self, ctx: CallContext, story_id: str,
+                      character_id: str) -> Result[list[dict]]:
+        """读本会话某角色在该 Story 的 ACTIVE 知识（缓存命中零查询）。
+
+        story 不匹配 → 空列表（严格隔离）；未加载过的角色 → 惰性加载一次
+        并缓存（含空结果）。查询错误传播 Err，不吞。
+        """
+        if str(story_id) != self._story_id:
+            return Ok([])
+        cid = str(character_id)
+        if cid not in self._entries:
+            loaded = self._load(ctx, cid)
+            if is_err(loaded):
+                return loaded
+            self._entries[cid] = loaded.value
+        return Ok(list(self._entries[cid]))
+
+    # ------------------------------------------------ 显式失效 ------------
+
+    def invalidate(self, character_id: str) -> None:
+        """丢弃某角色的缓存条目；下一次 `knowledge_for` 重新从存储加载。"""
+        self._entries.pop(str(character_id), None)
+
+    # ------------------------------------------------ 内部 ------------------
+
+    def _load(self, ctx: CallContext, character_id: str) -> Result[list[dict]]:
+        """底层查询：严格按 (project_id, story_id, character_id) 三元隔离。"""
+        return self._svc.load_knowledge(ctx, self._story_id, character_id,
+                                        self._project_id)
+
+
 class BusinessOrchestrator:
     """业务编排器：串起五个业务模块，并把任务生命周期交给既有 `TaskRunner`。
 
@@ -545,6 +625,21 @@ class BusinessOrchestrator:
         self._task_id: str = ""
         self._steps: dict[str, BusinessStepResult] = {}
         self._materials: dict[str, list[SourceMaterial]] = {}
+
+        # P8.4-B：故事知识接线。CharacterService 在这里进入生产装配——
+        # PersonaReader 就是 BusinessDeps.persona（与 Dialogue 同一份档案读
+        # 端口）。装配断言测试（test_p8_4_story_knowledge_wiring）盯着下面
+        # 三处引用关系：任何"静默跳过注入/接线"的改动都会让测试失败。
+        self.character_service = CharacterService(
+            deps.storage, persona_reader=deps.persona)
+        self.story_knowledge = StoryKnowledgeCache(self.character_service)
+        # 知识写入口（create_instance 携带知识 / revise / add / correct）
+        # 成功之后 → 显式 invalidate，下一次读取拿到新状态。
+        self.character_service.set_knowledge_write_listener(
+            self.story_knowledge.invalidate)
+        # 会话级知识端口注入 Dialogue：prime 由 start_session 在 Story 会话
+        # 开启时调用；普通会话（story_id=None）完全不走这条路径。
+        self.deps.dialogue.attach_knowledge_port(self.story_knowledge)
 
     # ================================================================ 入口
 
